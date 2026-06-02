@@ -26,6 +26,72 @@ var app = builder.Build();
 app.UseDefaultFiles();
 app.UseStaticFiles();
 
+// ----- auth (App Service Easy Auth, Microsoft IdP, federated to Google) --
+// When AUTH_REQUIRED=1 every non-public request must carry the
+// X-MS-CLIENT-PRINCIPAL-* headers injected by the Easy Auth sidecar.
+// Optionally also enforce membership in ALLOWED_GROUP_ID via the `groups`
+// claim in X-MS-CLIENT-PRINCIPAL (defense-in-depth on top of Entra's
+// "Assignment required" gate). When AUTH_REQUIRED is unset/0 the middleware
+// is a no-op so the app keeps working through the portal-config window.
+var _authRequired = string.Equals(app.Configuration["AUTH_REQUIRED"], "1", StringComparison.Ordinal)
+                  || string.Equals(app.Configuration["AUTH_REQUIRED"], "true", StringComparison.OrdinalIgnoreCase);
+var _allowedGroupId = app.Configuration["ALLOWED_GROUP_ID"];
+static bool IsPublicAuthPath(PathString p) =>
+    p.StartsWithSegments("/health") ||
+    p.StartsWithSegments("/.auth") ||
+    p.Equals("/sw.js", StringComparison.OrdinalIgnoreCase) ||
+    p.Equals("/favicon.ico", StringComparison.OrdinalIgnoreCase) ||
+    p.Equals("/api/push/vapid-public-key", StringComparison.OrdinalIgnoreCase);
+if (_authRequired)
+{
+    app.Use(async (ctx, next) =>
+    {
+        if (IsPublicAuthPath(ctx.Request.Path)) { await next(); return; }
+        var oid = ctx.Request.Headers["X-MS-CLIENT-PRINCIPAL-ID"].ToString();
+        if (string.IsNullOrEmpty(oid))
+        {
+            ctx.Response.StatusCode = 401;
+            ctx.Response.Headers["WWW-Authenticate"] = "Bearer";
+            await ctx.Response.WriteAsJsonAsync(new { error = "auth required" });
+            return;
+        }
+        if (!string.IsNullOrEmpty(_allowedGroupId))
+        {
+            var b64 = ctx.Request.Headers["X-MS-CLIENT-PRINCIPAL"].ToString();
+            var ok = false;
+            if (!string.IsNullOrEmpty(b64))
+            {
+                try
+                {
+                    var json = Encoding.UTF8.GetString(Convert.FromBase64String(b64));
+                    using var doc = JsonDocument.Parse(json);
+                    if (doc.RootElement.TryGetProperty("claims", out var cl))
+                    {
+                        foreach (var c in cl.EnumerateArray())
+                        {
+                            if (c.TryGetProperty("typ", out var t) && c.TryGetProperty("val", out var v))
+                            {
+                                var typ = t.GetString();
+                                if ((typ == "groups" || typ == "http://schemas.microsoft.com/ws/2008/06/identity/claims/groupsid")
+                                    && string.Equals(v.GetString(), _allowedGroupId, StringComparison.OrdinalIgnoreCase))
+                                { ok = true; break; }
+                            }
+                        }
+                    }
+                }
+                catch { /* malformed -> reject */ }
+            }
+            if (!ok)
+            {
+                ctx.Response.StatusCode = 403;
+                await ctx.Response.WriteAsJsonAsync(new { error = "not in allowed group" });
+                return;
+            }
+        }
+        await next();
+    });
+}
+
 // ----- helpers -----------------------------------------------------------
 
 static string Cfg(IConfiguration c, string k) =>
@@ -70,6 +136,21 @@ static async Task<string> UploadAndSign(
 // ----- routes ------------------------------------------------------------
 
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
+
+// /api/me — identity probe for the frontend. When AUTH_REQUIRED=1 and the
+// user isn't signed in, the auth middleware short-circuits with 401 before
+// reaching this handler (which is exactly what the frontend uses to trigger
+// its login redirect). When AUTH_REQUIRED is off, returns devMode=true so
+// the UI hides the sign-in chrome.
+app.MapGet("/api/me", (HttpRequest http) =>
+{
+    var oid = http.Headers["X-MS-CLIENT-PRINCIPAL-ID"].ToString();
+    if (string.IsNullOrEmpty(oid))
+        return Results.Ok(new { authenticated = false, devMode = !_authRequired });
+    var name = http.Headers["X-MS-CLIENT-PRINCIPAL-NAME"].ToString();
+    var idp = http.Headers["X-MS-CLIENT-PRINCIPAL-IDP"].ToString();
+    return Results.Ok(new { authenticated = true, objectId = oid, email = name, idp });
+});
 
 // 1. Submit a video job. Multipart so an optional reference image/video can ride along.
 app.MapPost("/api/jobs", async (HttpRequest http, IHttpClientFactory hf, IConfiguration cfg, CancellationToken ct) =>

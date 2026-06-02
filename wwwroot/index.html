@@ -335,7 +335,23 @@ if (typeof document !== "undefined") {
   window.addEventListener("pageshow", wakeAllSleeps);
 }
 
+// Module-level latch so we only redirect to login once even if many fetches
+// race a 401 simultaneously (every API call funnels through jsonOrThrow).
+let _loginRedirecting = false;
+function redirectToLogin() {
+  if (_loginRedirecting) return;
+  _loginRedirecting = true;
+  const back = encodeURIComponent(location.pathname + location.search + location.hash);
+  location.href = "/.auth/login/aad?post_login_redirect_url=" + back;
+}
 async function jsonOrThrow(r) {
+  if (r.status === 401) {
+    // Easy Auth says the session is missing/expired. Hand off to the IdP;
+    // throw so the caller's error path doesn't run anything destructive
+    // before navigation (caller will be unmounted within ms anyway).
+    redirectToLogin();
+    throw new Error("redirecting to login");
+  }
   const txt = await r.text();
   if (!r.ok) throw new Error(txt.slice(0, 400) || `HTTP ${r.status}`);
   try { return JSON.parse(txt); } catch { return txt; }
@@ -443,6 +459,25 @@ function App() {
   const [craftProgress, setCraftProgress] = useState(null);
   const craftJobIdRef = useRef(null);
   const [running, setRunning] = useState(false);
+
+  // Identity: who is signed in (when AUTH_REQUIRED=1 on the server).
+  // me === null         -> not yet probed
+  // me.authenticated    -> signed in; show email + sign-out
+  // me.devMode          -> AUTH_REQUIRED off; hide auth chrome entirely
+  const [me, setMe] = useState(null);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await fetch("/api/me");
+        if (r.status === 401) { redirectToLogin(); return; }
+        if (!r.ok) return;
+        const j = await r.json();
+        if (!cancelled) setMe(j);
+      } catch { /* offline; the next real API call will retrigger */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   // Wake Lock: keep the screen on during generation so mobile browsers don't
   // suspend the tab when the user puts the phone down. The lock auto-releases
@@ -1192,6 +1227,10 @@ function App() {
       <button class="ghost" onClick=${() => setDrawerOpen(o => !o)} title="Debug log">
         debug${dbgLines.length > 0 ? html` <span class="pill">${dbgLines.length}</span>` : ""}
       </button>
+      ${me && me.authenticated ? html`
+        <span class="badge" title=${"object id: " + (me.objectId || "")}>${me.email || "signed in"}</span>
+        <a class="ghost" href="/.auth/logout?post_logout_redirect_url=/" title="Sign out" style=${{textDecoration:"none",padding:"6px 10px"}}>sign out</a>
+      ` : ""}
     </header>
 
     <main>
