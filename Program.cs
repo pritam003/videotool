@@ -303,11 +303,20 @@ app.MapPost("/api/enhance", async (EnhanceRequest req, IHttpClientFactory hf,
     var langPrefix = localeMatch.Success ? localeMatch.Groups[1].Value : "en";
     var langName = langPrefix switch { "hi" => "Hindi", "bn" => "Bengali", "en" => "English", _ => langPrefix };
 
-    var seconds = req.Seconds ?? 8;
+    var totalSeconds = req.Seconds ?? 8;
     var size = req.Size ?? "1280x720";
 
-    // Beat count scales with duration: ~1 beat per 2 seconds, capped to a sensible range.
-    var beatCount = Math.Clamp(seconds / 2, 3, 6);
+    // Sora-2 renders in 4/8/12s chunks; longer durations are stitched. The prompt
+    // describes ONE chunk (so beat timestamps line up with what Sora actually renders),
+    // while the LLM is told the total duration + segment count so it can plan the arc.
+    var chunkSeconds = Math.Min(totalSeconds, 12);
+    var segmentCount = (int)Math.Ceiling(totalSeconds / (double)chunkSeconds);
+    // Beat count: ~1 beat per 1.5s within the chunk, scaled up a bit when the overall
+    // story is longer so each segment carries more visible action density.
+    var baseBeats = Math.Clamp(chunkSeconds / 2, 3, 6);
+    var bonusBeats = totalSeconds >= 36 ? 2 : (totalSeconds >= 24 ? 1 : 0);
+    var beatCount = Math.Min(8, baseBeats + bonusBeats);
+    var seconds = chunkSeconds;
 
     var translatedNarration = req.Narration ?? "";
     if (!string.IsNullOrWhiteSpace(req.Narration) && langPrefix != "en")
@@ -372,12 +381,14 @@ Hard rules:
 - Keep total length under ~280 words.";
 
     var userMsg = $@"User idea: {req.Prompt}
-Target duration: {seconds} seconds
+Total story duration: {totalSeconds} seconds (rendered as {segmentCount} × {chunkSeconds}s segment{(segmentCount > 1 ? "s" : "")} that stitch together).
+This prompt describes ONE {chunkSeconds}s segment. Beat timestamps must fit within {chunkSeconds}s.
 Aspect: {size}
 Narration language: {langName}
 Speaker gender: {gender}
-Voice persona: {voiceShort}
+Voice persona: {voiceShort} (use this name to inform the speaker's vocal character — pitch, age, accent — but do NOT mention it on-screen).
 Narration line to embed verbatim (already in {langName}): {translatedNarration}
+{(segmentCount > 1 ? $"Plan the visible action so a {totalSeconds}s arc unfolds across {segmentCount} segments with the SAME character/wardrobe/environment/lighting/voice in every segment. This segment is one continuous beat of that arc." : "")}
 
 Compose the final Sora-2 prompt now.";
 

@@ -130,7 +130,8 @@
 
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px; }
   .clip { background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
-    overflow: hidden; cursor: pointer; transition: transform .12s, border-color .12s; }
+    overflow: hidden; cursor: pointer; transition: transform .12s, border-color .12s;
+    padding: 0; text-align: left; font: inherit; color: inherit; }
   .clip:hover { border-color: var(--accent); transform: translateY(-1px); }
   .clip video { width: 100%; aspect-ratio: 16/9; object-fit: cover; display: block; background: #000; }
   .clip .name { font-size: 11px; padding: 6px 8px; color: var(--muted);
@@ -270,7 +271,7 @@ function Accordion({ title, children, defaultOpen }) {
   `;
 }
 
-function Library({ refreshKey }) {
+function Library({ refreshKey, onSelect }) {
   const [videos, setVideos] = useState([]);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
@@ -296,10 +297,17 @@ function Library({ refreshKey }) {
       ${!loading && videos.length === 0 && html`<div class="muted small">No videos yet. Generate one above.</div>`}
       <div class="grid">
         ${videos.map(v => html`
-          <a class="clip" key=${v.name} href=${v.url} target="_blank" rel="noopener" title=${v.name}>
-            <video src=${v.url} muted preload="metadata" onMouseEnter=${e => { try { e.currentTarget.currentTime = 0.1; e.currentTarget.play(); } catch{} }} onMouseLeave=${e => { e.currentTarget.pause(); }}></video>
+          <button
+            type="button"
+            class="clip"
+            key=${v.name}
+            title=${v.name + " — click to load in preview"}
+            onClick=${() => onSelect && onSelect(v)}>
+            <video src=${v.url} muted preload="metadata"
+              onMouseEnter=${e => { try { e.currentTarget.currentTime = 0.1; e.currentTarget.play(); } catch{} }}
+              onMouseLeave=${e => { e.currentTarget.pause(); }}></video>
             <div class="name">${new Date(v.createdOn || v.lastModified).toLocaleString()}</div>
-          </a>
+          </button>
         `)}
       </div>
     </div>
@@ -335,8 +343,18 @@ function App() {
     (async () => {
       try {
         const r = await fetch("/api/voices");
-        const j = await jsonOrThrow(r);
-        setVoices(j.voices || []);
+        const raw = await jsonOrThrow(r);
+        // /api/voices returns a flat array with PascalCase keys from the Speech REST API.
+        const arr = Array.isArray(raw) ? raw : (raw.voices || []);
+        const mapped = arr.map(v => ({
+          shortName: v.shortName || v.ShortName,
+          localName: v.localName || v.LocalName || v.DisplayName,
+          gender: (v.gender || v.Gender || "").toLowerCase(),
+          locale: v.locale || v.Locale || "",
+          localeName: v.localeName || v.LocaleName || "",
+        })).filter(v => v.shortName);
+        setVoices(mapped);
+        dbg("info", `voices loaded: ${mapped.length}`);
       } catch (e) { dbg("warn", "voices load failed", e.message); }
     })();
   }, []);
@@ -367,6 +385,29 @@ function App() {
       toast("Final prompt generated. You can edit it before running.");
     } catch (e) { toast("Enhance failed: " + e.message, true); }
     finally { setEnhancing(false); }
+  }
+
+  // Auto re-enhance when duration / aspect / voice change AFTER the user has
+  // already generated a prompt at least once. Debounced; skips if user is editing.
+  const enhanceSig = `${seconds}|${size}|${voice}`;
+  const lastEnhanceSig = useRef("");
+  const everEnhanced = useRef(false);
+  useEffect(() => {
+    if (!finalPrompt.trim()) return;          // never enhanced or cleared
+    if (!everEnhanced.current) return;        // only after user clicked once
+    if (lastEnhanceSig.current === enhanceSig) return;
+    const handle = setTimeout(() => {
+      lastEnhanceSig.current = enhanceSig;
+      enhance();
+    }, 700);
+    return () => clearTimeout(handle);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [enhanceSig]);
+  // wrap the click handler so we mark first-enhance done
+  async function enhanceClick() {
+    everEnhanced.current = true;
+    lastEnhanceSig.current = enhanceSig;
+    await enhance();
   }
 
   async function submitChunk(thePrompt, chunkSeconds, refOverride) {
@@ -505,10 +546,10 @@ function App() {
                 value=${narration} onInput=${e => setNarration(e.target.value)}></textarea>
             </div>
             <div style=${{display:"flex",gap:8,alignItems:"center"}}>
-              <button class="primary" onClick=${enhance} disabled=${enhancing || !prompt.trim()}>
+              <button class="primary" onClick=${enhanceClick} disabled=${enhancing || !prompt.trim()}>
                 ${enhancing ? "Enhancing…" : "✨ Generate cinematic prompt"}
               </button>
-              <span class="muted small">Frame-by-frame, lip-sync, environment</span>
+              <span class="muted small">Frame-by-frame, scales with duration & voice</span>
             </div>
             ${finalPrompt && html`
               <div>
@@ -579,7 +620,7 @@ function App() {
             </div>
           `}
         </div>
-        <${Library} refreshKey=${refreshLib} />
+        <${Library} refreshKey=${refreshLib} onSelect=${v => { setOuts([{ url: v.url, name: v.name, seconds, size }]); toast("Loaded " + v.name); }} />
       </div>
     </main>
 
