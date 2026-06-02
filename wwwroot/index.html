@@ -293,7 +293,21 @@ async function run() {
   setStatus("queued", "submitting…", 2);
 
   const t0 = Date.now();
-  const tick = setInterval(() => $("#elapsed").textContent = Math.round((Date.now()-t0)/1000) + "s", 500);
+  // Sora typically takes ~25s per second of output. Use that as the curve target.
+  const seconds = Number($("#seconds").value || 4);
+  const expected = Math.max(20, seconds * 22); // seconds, soft target
+
+  // Smooth elapsed-time estimator: asymptotically approaches 92%
+  const fakePct = () => {
+    const t = (Date.now() - t0) / 1000;
+    return Math.min(92, 92 * (1 - Math.exp(-t / expected)));
+  };
+  const tick = setInterval(() => {
+    const t = Math.round((Date.now()-t0)/1000);
+    $("#elapsed").textContent = t + "s";
+    // Only override the bar while we're still rendering, not after completion
+    if (!run._done) $("#barFill").style.width = Math.max(2, fakePct()).toFixed(1) + "%";
+  }, 250);
 
   try {
     // 1) Submit
@@ -306,6 +320,7 @@ async function run() {
     const submitText = await submit.text();
     if (!submit.ok) throw new Error(submitText);
     const job = JSON.parse(submitText);
+    setStatus("in_progress", "rendering with Sora…");
 
     // 2) Kick off TTS in parallel if narration present
     const narration = $("#narration").value.trim();
@@ -318,22 +333,25 @@ async function run() {
       }).then(async r => { const t = await r.text(); if (!r.ok) throw new Error(t); return JSON.parse(t); });
     }
 
-    // 3) Poll
+    // 3) Poll (fast cadence so we detect completion the moment it lands)
     let last = job;
     while (true) {
-      const pct = Math.max(5, Number(last.progress || 0));
-      setStatus(last.status, last.status.replace("_"," "), pct);
       if (last.status === "completed") break;
       if (last.status === "failed" || last.status === "cancelled") {
         throw new Error("Job " + last.status + ": " + JSON.stringify(last.error || last));
       }
-      await new Promise(r => setTimeout(r, 2500));
+      // Adaptive: poll every 1.2s for first 20s, then 2.5s
+      const delay = (Date.now() - t0) < 20000 ? 1200 : 2500;
+      await new Promise(r => setTimeout(r, delay));
       const r = await fetch(`/api/jobs/${job.id}`);
       const txt = await r.text();
       if (!r.ok) throw new Error(txt);
       last = JSON.parse(txt);
+      setStatus(last.status, last.status.replace("_"," "));
     }
-    setStatus("completed", "rendering blob…", 96);
+    run._done = true;
+    setStatus("completed", "saving to storage…", 96);
+    $("#barFill").style.width = "96%";
 
     // 4) Finalize: download from Sora -> blob -> SAS URL
     const fin = await fetch(`/api/jobs/${job.id}/finalize`, { method: "POST" });
@@ -349,6 +367,7 @@ async function run() {
     }
 
     setStatus("completed", "ready", 100);
+    $("#barFill").style.width = "100%";
     renderPlayer(out, narr, last);
   } catch (e) {
     setStatus("failed", "error", 100);
@@ -357,6 +376,7 @@ async function run() {
     console.error(e);
   } finally {
     clearInterval(tick);
+    run._done = false;
     btn.disabled = false;
   }
 }
