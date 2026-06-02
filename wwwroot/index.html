@@ -1,87 +1,409 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <title>videotool — text to video</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <style>
-    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
-    h1 { margin-bottom: .25rem; }
-    .sub { color: #666; margin-top: 0; }
-    textarea { width: 100%; min-height: 6rem; padding: .6rem; font: inherit; }
-    .row { display: flex; gap: .75rem; margin: .75rem 0; }
-    .row > label { display: flex; flex-direction: column; font-size: .85rem; }
-    select, input { padding: .4rem; font: inherit; }
-    button { padding: .6rem 1.2rem; font: inherit; cursor: pointer; }
-    button[disabled] { opacity: .6; cursor: progress; }
-    #status { margin-top: 1rem; color: #444; min-height: 1.5rem; }
-    video { width: 100%; margin-top: 1rem; border-radius: 8px; background: #000; }
-    pre { background: #f4f4f4; padding: .6rem; overflow: auto; font-size: .8rem; }
-  </style>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>VideoTool · Sora 2 Studio</title>
+<style>
+  :root {
+    --bg-0: #0a0b14;
+    --bg-1: #111327;
+    --bg-2: #181b35;
+    --line: #262a4a;
+    --text: #e7e9ff;
+    --muted: #8a90b8;
+    --accent: #7c5cff;
+    --accent-2: #22d3ee;
+    --ok: #22c55e;
+    --err: #ef4444;
+    --warn: #f59e0b;
+  }
+  * { box-sizing: border-box }
+  html, body { margin: 0; padding: 0; height: 100%; }
+  body {
+    background:
+      radial-gradient(1200px 600px at 10% -10%, rgba(124,92,255,.25), transparent 60%),
+      radial-gradient(900px 500px at 100% 0%, rgba(34,211,238,.18), transparent 60%),
+      var(--bg-0);
+    color: var(--text);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+    min-height: 100vh;
+  }
+  header {
+    padding: 22px 28px;
+    display: flex; align-items: center; justify-content: space-between;
+    border-bottom: 1px solid var(--line);
+    backdrop-filter: blur(8px);
+    position: sticky; top: 0; z-index: 10;
+    background: rgba(10,11,20,.7);
+  }
+  .brand { display: flex; align-items: center; gap: 12px; font-weight: 700; letter-spacing: .2px; }
+  .logo {
+    width: 32px; height: 32px; border-radius: 8px;
+    background: conic-gradient(from 200deg, var(--accent), var(--accent-2), var(--accent));
+    box-shadow: 0 0 24px rgba(124,92,255,.45);
+  }
+  .pill { font-size: 12px; color: var(--muted); padding: 4px 10px; border: 1px solid var(--line); border-radius: 999px; }
+  main {
+    max-width: 1200px; margin: 28px auto; padding: 0 24px;
+    display: grid; grid-template-columns: 1.1fr 1fr; gap: 24px;
+  }
+  @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+  .card {
+    background: linear-gradient(180deg, var(--bg-1), var(--bg-2));
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    padding: 22px;
+    box-shadow: 0 20px 60px rgba(0,0,0,.35);
+  }
+  h2 { margin: 0 0 14px; font-size: 16px; letter-spacing: .3px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 14px 0 6px; text-transform: uppercase; letter-spacing: .8px; }
+  textarea, input, select {
+    width: 100%;
+    background: #0d1024; color: var(--text);
+    border: 1px solid var(--line); border-radius: 10px;
+    padding: 12px 14px; font: inherit;
+    transition: border .15s, box-shadow .15s;
+  }
+  textarea { resize: vertical; min-height: 110px; }
+  textarea:focus, input:focus, select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(124,92,255,.25); }
+  .row { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+  .row3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .drop {
+    border: 1.5px dashed var(--line); border-radius: 12px;
+    padding: 18px; text-align: center; color: var(--muted);
+    cursor: pointer; transition: border-color .15s, background .15s;
+    background: rgba(255,255,255,.02);
+  }
+  .drop:hover, .drop.drag { border-color: var(--accent); background: rgba(124,92,255,.08); color: var(--text); }
+  .drop input { display: none; }
+  .drop .preview { display: flex; align-items: center; gap: 10px; justify-content: center; margin-top: 10px; }
+  .drop img, .drop video { max-height: 80px; border-radius: 8px; border: 1px solid var(--line); }
+  button.primary {
+    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+    width: 100%; margin-top: 16px;
+    padding: 14px 16px; font: 600 15px/1 inherit; color: #0b0c1a;
+    background: linear-gradient(135deg, var(--accent-2), var(--accent));
+    border: 0; border-radius: 12px; cursor: pointer;
+    transition: transform .1s, filter .15s, opacity .15s;
+    box-shadow: 0 10px 30px rgba(124,92,255,.35);
+  }
+  button.primary:hover { filter: brightness(1.06); }
+  button.primary:active { transform: translateY(1px); }
+  button.primary[disabled] { opacity: .55; cursor: not-allowed; box-shadow: none; }
+  button.ghost {
+    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+    padding: 10px 14px; font: 600 13px/1 inherit; color: var(--text);
+    background: transparent; border: 1px solid var(--line); border-radius: 10px; cursor: pointer;
+  }
+  button.ghost:hover { border-color: var(--accent); }
+
+  .progress { margin-top: 18px; }
+  .bar { height: 8px; background: #0d1024; border-radius: 999px; border: 1px solid var(--line); overflow: hidden; }
+  .bar > i {
+    display: block; height: 100%; width: 0;
+    background: linear-gradient(90deg, var(--accent-2), var(--accent));
+    transition: width .4s ease;
+  }
+  .status {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-top: 8px; font-size: 12px; color: var(--muted);
+  }
+  .status .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; }
+  .status.queued .dot { background: var(--warn); }
+  .status.in_progress .dot { background: var(--accent-2); animation: pulse 1.2s infinite; }
+  .status.completed .dot { background: var(--ok); }
+  .status.failed .dot, .status.cancelled .dot { background: var(--err); }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .35 } }
+
+  .player {
+    background: #000; border-radius: 12px; overflow: hidden; position: relative;
+    aspect-ratio: 16/9; display: flex; align-items: center; justify-content: center;
+    border: 1px solid var(--line);
+  }
+  .player video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+  .player .empty { color: var(--muted); font-size: 14px; }
+  .meta { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+  .meta a, .meta span {
+    font-size: 12px; color: var(--muted);
+    border: 1px solid var(--line); padding: 6px 10px; border-radius: 999px;
+    text-decoration: none;
+  }
+  .meta a:hover { color: var(--text); border-color: var(--accent); }
+
+  .toast {
+    position: fixed; right: 20px; bottom: 20px; max-width: 360px;
+    background: var(--bg-2); border: 1px solid var(--line); border-radius: 10px;
+    padding: 12px 14px; font-size: 13px; color: var(--text);
+    box-shadow: 0 16px 50px rgba(0,0,0,.5);
+    transform: translateY(20px); opacity: 0; pointer-events: none;
+    transition: opacity .2s, transform .2s;
+  }
+  .toast.show { transform: translateY(0); opacity: 1; }
+  .toast.err { border-color: rgba(239,68,68,.6); }
+  .help { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .row-flex { display: flex; gap: 10px; align-items: center; }
+  .row-flex > * { flex: 1; }
+</style>
 </head>
 <body>
-  <h1>videotool</h1>
-  <p class="sub">Text → video, powered by Azure OpenAI Sora-2.</p>
+<header>
+  <div class="brand">
+    <div class="logo"></div>
+    <div>VideoTool <span class="pill">Sora 2 · Azure</span></div>
+  </div>
+  <div class="pill" id="health">checking…</div>
+</header>
 
-  <form id="f">
-    <textarea id="prompt" placeholder="A cinematic shot of a paper boat sailing down a rainy city street at night, neon reflections..." required></textarea>
-    <div class="row">
-      <label>seconds
+<main>
+  <!-- LEFT: composer -->
+  <section class="card">
+    <h2>Compose</h2>
+
+    <label for="prompt">Prompt</label>
+    <textarea id="prompt" placeholder="A serene timelapse of clouds drifting over snow-capped mountains at golden hour, cinematic"></textarea>
+
+    <div class="row3">
+      <div>
+        <label>Duration</label>
         <select id="seconds">
-          <option>4</option><option>8</option><option>12</option>
+          <option value="4" selected>4s</option>
+          <option value="8">8s</option>
+          <option value="12">12s</option>
         </select>
-      </label>
-      <label>size
+      </div>
+      <div>
+        <label>Aspect</label>
         <select id="size">
-          <option>720x1280</option>
-          <option>1280x720</option>
-          <option>1024x1024</option>
+          <option value="1280x720" selected>16:9 · 1280×720</option>
+          <option value="720x1280">9:16 · 720×1280</option>
+          <option value="1024x1024">1:1 · 1024×1024</option>
         </select>
-      </label>
-      <label>&nbsp;
-        <button id="go" type="submit">Generate</button>
-      </label>
+      </div>
+      <div>
+        <label>Voice</label>
+        <select id="voice">
+          <option value="en-US-AvaMultilingualNeural">Ava (US, female)</option>
+          <option value="en-US-AndrewMultilingualNeural">Andrew (US, male)</option>
+          <option value="en-US-EmmaMultilingualNeural">Emma (US, female)</option>
+          <option value="en-US-AdamMultilingualNeural">Adam (US, male)</option>
+          <option value="en-US-PhoebeMultilingualNeural">Phoebe (US, female)</option>
+          <option value="en-US-AlloyTurboMultilingualNeural">Alloy</option>
+          <option value="en-US-EchoTurboMultilingualNeural">Echo</option>
+        </select>
+      </div>
     </div>
-  </form>
 
-  <div id="status"></div>
-  <video id="player" controls hidden></video>
-  <pre id="meta" hidden></pre>
+    <label>Reference image / video <span style="text-transform:none;color:var(--muted)">(optional · drives style or motion)</span></label>
+    <label class="drop" id="drop">
+      <input id="file" type="file" accept="image/*,video/*" />
+      <div id="dropText">Click or drop an image or short video here</div>
+      <div class="preview" id="preview" hidden></div>
+    </label>
 
-  <script>
-    const f = document.getElementById('f');
-    const status = document.getElementById('status');
-    const player = document.getElementById('player');
-    const meta = document.getElementById('meta');
-    const go = document.getElementById('go');
+    <label>Narration script <span style="text-transform:none;color:var(--muted)">(optional · spoken alongside the video)</span></label>
+    <textarea id="narration" placeholder="What the video should say while it plays. e.g. 'Above the clouds, time slows. Each peak holds its breath as the sun lights the world on fire.'"></textarea>
 
-    f.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      go.disabled = true;
-      player.hidden = true; meta.hidden = true;
-      status.textContent = 'Generating video — this typically takes 30–90 seconds...';
-      const body = {
-        prompt: document.getElementById('prompt').value,
-        seconds: parseInt(document.getElementById('seconds').value, 10),
-        size: document.getElementById('size').value
-      };
-      try {
-        const r = await fetch('/api/generate', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(body)
-        });
-        const data = await r.json();
-        if (!r.ok) throw new Error(data?.detail || data?.error || r.statusText);
-        status.textContent = 'Done.';
-        player.src = data.url; player.hidden = false; player.play().catch(()=>{});
-        meta.textContent = JSON.stringify(data, null, 2); meta.hidden = false;
-      } catch (err) {
-        status.textContent = 'Error: ' + err.message;
-      } finally {
-        go.disabled = false;
+    <button id="go" class="primary">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+      Generate video
+    </button>
+
+    <div class="progress" id="progress" hidden>
+      <div class="bar"><i id="barFill"></i></div>
+      <div class="status" id="statusLine"><span><span class="dot"></span><span id="statusText">queued</span></span><span id="elapsed">0s</span></div>
+    </div>
+  </section>
+
+  <!-- RIGHT: player -->
+  <section class="card">
+    <h2>Preview</h2>
+    <div class="player" id="player">
+      <div class="empty">Your video will appear here.</div>
+    </div>
+    <audio id="audio" preload="auto" hidden></audio>
+    <div class="meta" id="meta"></div>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const toast = (msg, err) => {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.classList.toggle("err", !!err);
+  t.classList.add("show");
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => t.classList.remove("show"), 4000);
+};
+
+// Health badge
+fetch("/health").then(r => r.json()).then(d => {
+  $("#health").textContent = d.status === "ok" ? "● online" : "offline";
+}).catch(() => $("#health").textContent = "offline");
+
+// Drag/drop file
+const drop = $("#drop"), fileInput = $("#file"), preview = $("#preview"), dropText = $("#dropText");
+let pickedFile = null;
+function showPreview(f) {
+  pickedFile = f || null;
+  preview.innerHTML = "";
+  if (!f) { preview.hidden = true; dropText.textContent = "Click or drop an image or short video here"; return; }
+  preview.hidden = false;
+  const isVid = f.type.startsWith("video/");
+  const el = document.createElement(isVid ? "video" : "img");
+  el.src = URL.createObjectURL(f);
+  if (isVid) { el.muted = true; el.autoplay = true; el.loop = true; el.playsInline = true; }
+  preview.appendChild(el);
+  const meta = document.createElement("span");
+  meta.textContent = `${f.name} · ${(f.size/1024).toFixed(0)} KB`;
+  meta.style.color = "var(--muted)";
+  preview.appendChild(meta);
+  dropText.textContent = "Replace file";
+}
+fileInput.addEventListener("change", e => showPreview(e.target.files[0]));
+["dragenter","dragover"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add("drag"); }));
+["dragleave","drop"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove("drag"); }));
+drop.addEventListener("drop", e => {
+  const f = e.dataTransfer.files[0];
+  if (f) { fileInput.files = e.dataTransfer.files; showPreview(f); }
+});
+
+// Generate
+const btn = $("#go");
+btn.addEventListener("click", run);
+
+function setStatus(state, text, pct) {
+  const sl = $("#statusLine");
+  sl.classList.remove("queued","in_progress","completed","failed","cancelled");
+  if (state) sl.classList.add(state);
+  $("#statusText").textContent = text || state || "";
+  if (typeof pct === "number") $("#barFill").style.width = Math.max(0, Math.min(100, pct)) + "%";
+}
+
+async function run() {
+  const prompt = $("#prompt").value.trim();
+  if (!prompt) { toast("Enter a prompt first.", true); return; }
+  btn.disabled = true;
+  $("#progress").hidden = false;
+  $("#meta").innerHTML = "";
+  $("#player").innerHTML = `<div class="empty">Working…</div>`;
+  setStatus("queued", "submitting…", 2);
+
+  const t0 = Date.now();
+  const tick = setInterval(() => $("#elapsed").textContent = Math.round((Date.now()-t0)/1000) + "s", 500);
+
+  try {
+    // 1) Submit
+    const fd = new FormData();
+    fd.append("prompt", prompt);
+    fd.append("seconds", $("#seconds").value);
+    fd.append("size", $("#size").value);
+    if (pickedFile) fd.append("inputReference", pickedFile);
+    const submit = await fetch("/api/jobs", { method: "POST", body: fd });
+    const submitText = await submit.text();
+    if (!submit.ok) throw new Error(submitText);
+    const job = JSON.parse(submitText);
+
+    // 2) Kick off TTS in parallel if narration present
+    const narration = $("#narration").value.trim();
+    let narrationPromise = null;
+    if (narration) {
+      narrationPromise = fetch("/api/narrate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: narration, voice: $("#voice").value })
+      }).then(async r => { const t = await r.text(); if (!r.ok) throw new Error(t); return JSON.parse(t); });
+    }
+
+    // 3) Poll
+    let last = job;
+    while (true) {
+      const pct = Math.max(5, Number(last.progress || 0));
+      setStatus(last.status, last.status.replace("_"," "), pct);
+      if (last.status === "completed") break;
+      if (last.status === "failed" || last.status === "cancelled") {
+        throw new Error("Job " + last.status + ": " + JSON.stringify(last.error || last));
       }
-    });
-  </script>
+      await new Promise(r => setTimeout(r, 2500));
+      const r = await fetch(`/api/jobs/${job.id}`);
+      const txt = await r.text();
+      if (!r.ok) throw new Error(txt);
+      last = JSON.parse(txt);
+    }
+    setStatus("completed", "rendering blob…", 96);
+
+    // 4) Finalize: download from Sora -> blob -> SAS URL
+    const fin = await fetch(`/api/jobs/${job.id}/finalize`, { method: "POST" });
+    const finText = await fin.text();
+    if (!fin.ok) throw new Error(finText);
+    const out = JSON.parse(finText);
+
+    // 5) Resolve narration
+    let narr = null;
+    if (narrationPromise) {
+      try { narr = await narrationPromise; }
+      catch (e) { toast("Narration failed: " + e.message, true); }
+    }
+
+    setStatus("completed", "ready", 100);
+    renderPlayer(out, narr, last);
+  } catch (e) {
+    setStatus("failed", "error", 100);
+    $("#player").innerHTML = `<div class="empty">Failed.</div>`;
+    toast(e.message.slice(0, 240), true);
+    console.error(e);
+  } finally {
+    clearInterval(tick);
+    btn.disabled = false;
+  }
+}
+
+function renderPlayer(out, narr, last) {
+  const player = $("#player");
+  player.innerHTML = "";
+  const v = document.createElement("video");
+  v.src = out.url;
+  v.controls = true;
+  v.preload = "auto";
+  v.playsInline = true;
+  player.appendChild(v);
+
+  const audio = $("#audio");
+  if (narr && narr.url) {
+    audio.src = narr.url;
+    audio.hidden = false;
+    // Sync narration with video playback
+    v.addEventListener("play", () => { audio.currentTime = v.currentTime; audio.play().catch(()=>{}); });
+    v.addEventListener("pause", () => audio.pause());
+    v.addEventListener("seeked", () => { audio.currentTime = v.currentTime; });
+    v.addEventListener("ended", () => audio.pause());
+    // Mute video so narration is the only audio (Sora can have ambient)
+    v.muted = true;
+  } else {
+    audio.removeAttribute("src");
+    audio.hidden = true;
+  }
+
+  const meta = $("#meta");
+  meta.innerHTML = "";
+  const m = (label, value, href) => {
+    const el = document.createElement(href ? "a" : "span");
+    if (href) { el.href = href; el.target = "_blank"; el.rel = "noopener"; }
+    el.textContent = `${label}: ${value}`;
+    meta.appendChild(el);
+  };
+  m("video", "open ↗", out.url);
+  if (narr) m("narration", "open ↗", narr.url);
+  m("seconds", last.seconds || "4");
+  m("size", last.size || "");
+  m("id", out.videoId);
+
+  // Auto-play (muted video is allowed by browsers)
+  v.play().catch(()=>{});
+}
+</script>
 </body>
 </html>

@@ -4,6 +4,7 @@ using System.Text.Json;
 using Azure.Core;
 using Azure.Identity;
 using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
 using Azure.Storage.Sas;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -14,111 +15,185 @@ var app = builder.Build();
 app.UseDefaultFiles();
 app.UseStaticFiles();
 
-app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
+// ----- helpers -----------------------------------------------------------
 
-// POST /api/generate { prompt, seconds?, size? }
-app.MapPost("/api/generate", async (GenerateRequest req,
-    IHttpClientFactory httpFactory,
-    TokenCredential credential,
-    IConfiguration cfg,
-    CancellationToken ct) =>
+static string Cfg(IConfiguration c, string k) =>
+    c[k] ?? throw new InvalidOperationException($"{k} not set");
+
+static (string baseUrl, string apiKey, string deployment) AoaiCfg(IConfiguration c) =>
+    (Cfg(c, "AOAI_ENDPOINT").TrimEnd('/'), Cfg(c, "AOAI_KEY"), c["AOAI_DEPLOYMENT"] ?? "sora-2");
+
+static BlobContainerClient Container(IConfiguration c, TokenCredential cred)
 {
-    if (string.IsNullOrWhiteSpace(req.Prompt))
-        return Results.BadRequest(new { error = "prompt is required" });
+    var account = Cfg(c, "STORAGE_ACCOUNT");
+    var name = c["STORAGE_CONTAINER"] ?? "videos";
+    var svc = new BlobServiceClient(new Uri($"https://{account}.blob.core.windows.net"), cred);
+    return svc.GetBlobContainerClient(name);
+}
 
-    var endpoint = cfg["AOAI_ENDPOINT"]?.TrimEnd('/')
-        ?? throw new InvalidOperationException("AOAI_ENDPOINT not set");
-    var apiKey = cfg["AOAI_KEY"]
-        ?? throw new InvalidOperationException("AOAI_KEY not set");
-    var deployment = cfg["AOAI_DEPLOYMENT"] ?? "sora-2";
-    var storageAccount = cfg["STORAGE_ACCOUNT"]
-        ?? throw new InvalidOperationException("STORAGE_ACCOUNT not set");
-    var container = cfg["STORAGE_CONTAINER"] ?? "videos";
-
-    // Sora 2 requires seconds as a string ("4" | "8" | "12")
-    var secondsInt = req.Seconds is > 0 and <= 20 ? req.Seconds.Value : 4;
-    var seconds = secondsInt.ToString();
-    var size = string.IsNullOrWhiteSpace(req.Size) ? "1280x720" : req.Size!;
-
-    var http = httpFactory.CreateClient();
-    http.Timeout = TimeSpan.FromMinutes(10);
-    http.DefaultRequestHeaders.Add("api-key", apiKey);
-
-    // 1. Submit video generation
-    var submitUrl = $"{endpoint}/openai/v1/videos";
-    var submitBody = JsonSerializer.Serialize(new
-    {
-        model = deployment,
-        prompt = req.Prompt,
-        seconds,
-        size
-    });
-    using var submit = await http.PostAsync(submitUrl,
-        new StringContent(submitBody, Encoding.UTF8, "application/json"), ct);
-    var submitJson = await submit.Content.ReadAsStringAsync(ct);
-    if (!submit.IsSuccessStatusCode)
-        return Results.Problem($"Submit failed ({(int)submit.StatusCode}): {submitJson}");
-
-    using var submitDoc = JsonDocument.Parse(submitJson);
-    var videoId = submitDoc.RootElement.GetProperty("id").GetString()!;
-
-    // 2. Poll until terminal state
-    string status = "queued";
-    var deadline = DateTime.UtcNow.AddMinutes(8);
-    while (DateTime.UtcNow < deadline)
-    {
-        await Task.Delay(TimeSpan.FromSeconds(5), ct);
-        using var poll = await http.GetAsync($"{endpoint}/openai/v1/videos/{videoId}", ct);
-        var pollJson = await poll.Content.ReadAsStringAsync(ct);
-        if (!poll.IsSuccessStatusCode)
-            return Results.Problem($"Poll failed ({(int)poll.StatusCode}): {pollJson}");
-        using var pollDoc = JsonDocument.Parse(pollJson);
-        status = pollDoc.RootElement.GetProperty("status").GetString() ?? "unknown";
-        if (status == "completed") break;
-        if (status is "failed" or "cancelled")
-            return Results.Problem($"Job {status}: {pollJson}");
-    }
-    if (status != "completed")
-        return Results.Problem($"Timed out waiting for video (last status: {status})");
-
-    // 3. Download MP4
-    using var videoResp = await http.GetAsync(
-        $"{endpoint}/openai/v1/videos/{videoId}/content?variant=video", ct);
-    if (!videoResp.IsSuccessStatusCode)
-    {
-        var err = await videoResp.Content.ReadAsStringAsync(ct);
-        return Results.Problem($"Video download failed ({(int)videoResp.StatusCode}): {err}");
-    }
-    var mp4 = await videoResp.Content.ReadAsByteArrayAsync(ct);
-
-    // 4. Upload to blob storage (managed identity)
-    var blobService = new BlobServiceClient(
-        new Uri($"https://{storageAccount}.blob.core.windows.net"), credential);
-    var containerClient = blobService.GetBlobContainerClient(container);
-    var blobName = $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{videoId}.mp4";
-    var blob = containerClient.GetBlobClient(blobName);
-    using (var ms = new MemoryStream(mp4))
-    {
-        await blob.UploadAsync(ms, overwrite: true, ct);
-    }
-
-    // 5. Issue user-delegation SAS (1 hour)
-    var udk = await blobService.GetUserDelegationKeyAsync(
-        DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddHours(1), ct);
+static async Task<string> UploadAndSign(
+    BlobContainerClient container, string blobName, byte[] data, string contentType,
+    BlobServiceClient svc, string account, CancellationToken ct)
+{
+    var blob = container.GetBlobClient(blobName);
+    var opts = new BlobUploadOptions { HttpHeaders = new BlobHttpHeaders { ContentType = contentType } };
+    using (var ms = new MemoryStream(data))
+        await blob.UploadAsync(ms, opts, ct);
+    var udk = await svc.GetUserDelegationKeyAsync(
+        DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddHours(2), ct);
     var sas = new BlobSasBuilder
     {
-        BlobContainerName = container,
+        BlobContainerName = container.Name,
         BlobName = blobName,
         Resource = "b",
-        ExpiresOn = DateTimeOffset.UtcNow.AddHours(1)
+        ExpiresOn = DateTimeOffset.UtcNow.AddHours(2)
     };
     sas.SetPermissions(BlobSasPermissions.Read);
-    var sasToken = sas.ToSasQueryParameters(udk.Value, storageAccount).ToString();
-    var url = $"{blob.Uri}?{sasToken}";
+    var token = sas.ToSasQueryParameters(udk.Value, account).ToString();
+    return $"{blob.Uri}?{token}";
+}
 
-    return Results.Ok(new { url, blob = blobName, videoId, seconds, size });
+// ----- routes ------------------------------------------------------------
+
+app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
+
+// 1. Submit a video job. Multipart so an optional reference image/video can ride along.
+app.MapPost("/api/jobs", async (HttpRequest http, IHttpClientFactory hf, IConfiguration cfg, CancellationToken ct) =>
+{
+    if (!http.HasFormContentType)
+        return Results.BadRequest(new { error = "multipart/form-data required" });
+    var form = await http.ReadFormAsync(ct);
+
+    var prompt = form["prompt"].ToString();
+    if (string.IsNullOrWhiteSpace(prompt))
+        return Results.BadRequest(new { error = "prompt is required" });
+
+    var seconds = form["seconds"].ToString();
+    if (string.IsNullOrWhiteSpace(seconds)) seconds = "4";
+    var size = form["size"].ToString();
+    if (string.IsNullOrWhiteSpace(size)) size = "1280x720";
+
+    var (baseUrl, apiKey, deployment) = AoaiCfg(cfg);
+
+    using var multipart = new MultipartFormDataContent();
+    multipart.Add(new StringContent(deployment), "model");
+    multipart.Add(new StringContent(prompt), "prompt");
+    multipart.Add(new StringContent(seconds), "seconds");
+    multipart.Add(new StringContent(size), "size");
+
+    var refFile = form.Files["inputReference"];
+    if (refFile is { Length: > 0 })
+    {
+        var ms = new MemoryStream();
+        await refFile.CopyToAsync(ms, ct);
+        ms.Position = 0;
+        var sc = new StreamContent(ms);
+        sc.Headers.ContentType = new MediaTypeHeaderValue(
+            string.IsNullOrWhiteSpace(refFile.ContentType) ? "application/octet-stream" : refFile.ContentType);
+        multipart.Add(sc, "input_reference", refFile.FileName);
+    }
+
+    var client = hf.CreateClient();
+    client.Timeout = TimeSpan.FromMinutes(2);
+    using var req = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/openai/v1/videos");
+    req.Headers.Add("api-key", apiKey);
+    req.Content = multipart;
+    using var resp = await client.SendAsync(req, ct);
+    var body = await resp.Content.ReadAsStringAsync(ct);
+    if (!resp.IsSuccessStatusCode)
+        return Results.Problem($"Submit failed ({(int)resp.StatusCode}): {body}");
+    return Results.Content(body, "application/json");
+});
+
+// 2. Poll job status. Returns Sora's response verbatim (id, status, progress, ...).
+app.MapGet("/api/jobs/{id}", async (string id, IHttpClientFactory hf, IConfiguration cfg, CancellationToken ct) =>
+{
+    var (baseUrl, apiKey, _) = AoaiCfg(cfg);
+    var client = hf.CreateClient();
+    client.DefaultRequestHeaders.Add("api-key", apiKey);
+    using var resp = await client.GetAsync($"{baseUrl}/openai/v1/videos/{id}", ct);
+    var body = await resp.Content.ReadAsStringAsync(ct);
+    return Results.Content(body, "application/json", statusCode: (int)resp.StatusCode);
+});
+
+// 3. Finalize: download MP4 from Sora, upload to blob, return SAS URL.
+app.MapPost("/api/jobs/{id}/finalize", async (
+    string id, IHttpClientFactory hf, IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
+{
+    var (baseUrl, apiKey, _) = AoaiCfg(cfg);
+    var client = hf.CreateClient();
+    client.Timeout = TimeSpan.FromMinutes(5);
+    client.DefaultRequestHeaders.Add("api-key", apiKey);
+
+    using var v = await client.GetAsync($"{baseUrl}/openai/v1/videos/{id}/content?variant=video", ct);
+    if (!v.IsSuccessStatusCode)
+    {
+        var err = await v.Content.ReadAsStringAsync(ct);
+        return Results.Problem($"Download failed ({(int)v.StatusCode}): {err}");
+    }
+    var mp4 = await v.Content.ReadAsByteArrayAsync(ct);
+
+    var account = Cfg(cfg, "STORAGE_ACCOUNT");
+    var svc = new BlobServiceClient(new Uri($"https://{account}.blob.core.windows.net"), cred);
+    var container = svc.GetBlobContainerClient(cfg["STORAGE_CONTAINER"] ?? "videos");
+    var name = $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{id}.mp4";
+    var url = await UploadAndSign(container, name, mp4, "video/mp4", svc, account, ct);
+    return Results.Ok(new { url, blob = name, videoId = id });
+});
+
+// 4. Narrate: synthesize speech via Azure Speech, upload MP3, return SAS URL.
+app.MapPost("/api/narrate", async (NarrateRequest req, IHttpClientFactory hf,
+    IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
+{
+    if (string.IsNullOrWhiteSpace(req.Text))
+        return Results.BadRequest(new { error = "text is required" });
+
+    var key = Cfg(cfg, "AOAI_KEY"); // multi-service AIServices key works for Speech
+    var region = Cfg(cfg, "SPEECH_REGION");
+    var voice = string.IsNullOrWhiteSpace(req.Voice) ? "en-US-AvaMultilingualNeural" : req.Voice!;
+
+    var ssml = $@"<speak version='1.0' xml:lang='en-US'>
+<voice name='{voice}'>{System.Security.SecurityElement.Escape(req.Text)}</voice>
+</speak>";
+
+    var client = hf.CreateClient();
+    client.Timeout = TimeSpan.FromMinutes(2);
+    using var msg = new HttpRequestMessage(HttpMethod.Post,
+        $"https://{region}.tts.speech.microsoft.com/cognitiveservices/v1");
+    msg.Headers.Add("Ocp-Apim-Subscription-Key", key);
+    msg.Headers.Add("X-Microsoft-OutputFormat", "audio-24khz-48kbitrate-mono-mp3");
+    msg.Headers.Add("User-Agent", "videotool");
+    msg.Content = new StringContent(ssml, Encoding.UTF8, "application/ssml+xml");
+
+    using var resp = await client.SendAsync(msg, ct);
+    if (!resp.IsSuccessStatusCode)
+    {
+        var err = await resp.Content.ReadAsStringAsync(ct);
+        return Results.Problem($"TTS failed ({(int)resp.StatusCode}): {err}");
+    }
+    var mp3 = await resp.Content.ReadAsByteArrayAsync(ct);
+
+    var account = Cfg(cfg, "STORAGE_ACCOUNT");
+    var svc = new BlobServiceClient(new Uri($"https://{account}.blob.core.windows.net"), cred);
+    var container = svc.GetBlobContainerClient(cfg["STORAGE_CONTAINER"] ?? "videos");
+    var name = $"narration/{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}.mp3";
+    var url = await UploadAndSign(container, name, mp3, "audio/mpeg", svc, account, ct);
+    return Results.Ok(new { url, voice, length = mp3.Length });
+});
+
+app.MapGet("/api/voices", async (IHttpClientFactory hf, IConfiguration cfg, CancellationToken ct) =>
+{
+    var key = Cfg(cfg, "AOAI_KEY");
+    var region = Cfg(cfg, "SPEECH_REGION");
+    var client = hf.CreateClient();
+    using var msg = new HttpRequestMessage(HttpMethod.Get,
+        $"https://{region}.tts.speech.microsoft.com/cognitiveservices/voices/list");
+    msg.Headers.Add("Ocp-Apim-Subscription-Key", key);
+    using var resp = await client.SendAsync(msg, ct);
+    var body = await resp.Content.ReadAsStringAsync(ct);
+    return Results.Content(body, "application/json", statusCode: (int)resp.StatusCode);
 });
 
 app.Run();
 
-public record GenerateRequest(string Prompt, int? Seconds, string? Size);
+public record NarrateRequest(string Text, string? Voice);
