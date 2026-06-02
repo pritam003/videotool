@@ -452,13 +452,19 @@ function App() {
     throw new Error("Sora rate limit: too many running tasks. Try again in a minute.");
   }
 
-  async function poll(id) {
+  // Sora-2 typically takes 90–180s per 12s clip. Start with longer poll intervals
+  // to avoid wasting round trips, then tighten as render approaches completion.
+  async function poll(id, onProgress) {
+    let elapsed = 0;
     while (true) {
-      await sleep(2500);
+      const wait = elapsed < 60_000 ? 6000 : elapsed < 120_000 ? 4000 : 3000;
+      await sleep(wait);
+      elapsed += wait;
       const r = await fetch(`/api/jobs/${id}`);
       const j = await jsonOrThrow(r);
       const st = j.status;
-      setStatus(s => ({ ...s, label: st }));
+      if (onProgress) onProgress(st, elapsed);
+      else setStatus(s => ({ ...s, label: st }));
       if (st === "succeeded" || st === "completed") return j;
       if (st === "failed" || st === "cancelled") throw new Error("Job " + st);
     }
@@ -509,7 +515,8 @@ function App() {
   }
 
   // Extract last frame of a video URL as a JPEG File for use as Sora input_reference.
-  // Storage account must have CORS GET allowed for this origin (already configured).
+  // Fail-fast: single seek attempt with tight budget. The structured plan already
+  // provides strong textual continuity, so a missing image anchor is not fatal.
   async function extractLastFrame(url, w, h) {
     const v = document.createElement("video");
     v.crossOrigin = "anonymous";
@@ -518,24 +525,17 @@ function App() {
     v.preload = "auto";
     v.src = url;
     await new Promise((res, rej) => {
-      const t = setTimeout(() => rej(new Error("video load timeout")), 25000);
+      const t = setTimeout(() => rej(new Error("video load timeout")), 8000);
       v.onloadedmetadata = () => { clearTimeout(t); res(); };
       v.onerror = () => { clearTimeout(t); rej(new Error("video load failed (CORS?)")); };
     });
     const dur = v.duration || 0;
-    const seekTo = (target) => new Promise((res, rej) => {
-      const t = setTimeout(() => rej(new Error("video seek timeout")), 20000);
+    await new Promise((res, rej) => {
+      const t = setTimeout(() => rej(new Error("video seek timeout")), 6000);
       v.onseeked = () => { clearTimeout(t); res(); };
       v.onerror = () => { clearTimeout(t); rej(new Error("video seek failed")); };
-      try { v.currentTime = target; } catch (e) { clearTimeout(t); rej(e); }
+      try { v.currentTime = Math.max(0, dur * 0.95); } catch (e) { clearTimeout(t); rej(e); }
     });
-    // Try near-end; if that times out fall back to 95% then 90%.
-    let lastErr = null;
-    for (const frac of [0.985, 0.95, 0.9]) {
-      try { await seekTo(Math.max(0, dur * frac)); lastErr = null; break; }
-      catch (e) { lastErr = e; }
-    }
-    if (lastErr) throw lastErr;
     const canvas = document.createElement("canvas");
     canvas.width = w || v.videoWidth;
     canvas.height = h || v.videoHeight;
@@ -546,11 +546,17 @@ function App() {
   }
 
   // One Sora attempt: submit + poll + finalize. Returns finalized clip object.
-  async function runOneClip(thePrompt, chunkSec, ref, label) {
-    setStatus(s => ({ ...s, label: `${label}: ${ref ? "with last-frame anchor, " : ""}submitting` }));
+  async function runOneClip(thePrompt, chunkSec, ref, label, basePct, spanPct) {
+    setStatus(s => ({ ...s, label: `${label}: ${ref ? "with anchor, " : ""}submitting`, pct: basePct }));
     const job = await submitChunk(thePrompt, chunkSec, ref);
-    setStatus(s => ({ ...s, label: `${label}: rendering` }));
-    await poll(job.id);
+    // ETA: Sora-2 takes ~10s/sec of output. 12s clip ≈ 120s. Use 15s/sec as conservative ceiling.
+    const etaMs = chunkSec * 15_000;
+    await poll(job.id, (st, elapsed) => {
+      const frac = Math.min(0.98, elapsed / etaMs);
+      const ss = Math.round(elapsed / 1000);
+      setStatus(s => ({ ...s, label: `${label}: ${st} (${ss}s)`, pct: basePct + spanPct * frac }));
+    });
+    setStatus(s => ({ ...s, label: `${label}: finalizing`, pct: basePct + spanPct }));
     const fr = await fetch(`/api/jobs/${job.id}/finalize`, { method: "POST" });
     return await jsonOrThrow(fr);
   }
@@ -558,7 +564,7 @@ function App() {
   async function run() {
     const finalText = finalPrompt.trim() || prompt.trim();
     if (!finalText) { toast("Enter a prompt first.", true); return; }
-    setRunning(true); setOuts([]); setSegSummaries([]); setStatus({ phase: "running", pct: 5, label: "submitting" });
+    setRunning(true); setOuts([]); setSegSummaries([]); setStatus({ phase: "running", pct: 2, label: "submitting" });
     try {
       const usePlan = plan && Array.isArray(plan.segments) && plan.segments.length > 0;
       const chunkSize = Math.min(seconds, 12);
@@ -567,6 +573,10 @@ function App() {
       const finals = [];
       const priorSummaries = [];
       let prevFrame = null;
+      // Show ETA up front so the wait is expected, not surprising.
+      const etaSec = chunks * (chunkSize <= 4 ? 60 : chunkSize <= 8 ? 100 : 150);
+      const etaMin = Math.ceil(etaSec / 60);
+      toast(`Rendering ${chunks} clip${chunks > 1 ? "s" : ""} · est. ~${etaMin} min on Sora-2 (sequential, 1 task/deployment)`);
       for (let i = 0; i < chunks; i++) {
         // Per-segment chunk size: in plan mode, derive from the segment's own span (clamped to 4/8/12).
         let segSec = chunkSize;
@@ -578,15 +588,16 @@ function App() {
           ? buildSegmentPrompt(plan, i, priorSummaries)
           : finalText + (i === 0 ? "" : `\n\n[Segment ${i+1}/${chunks} — DIRECT CONTINUATION of the previous segment. Same character, environment, lighting, lens, color grade. SAME voice timbre, accent, pitch, pace. Same diegetic background sound bed continues uninterrupted. First frame matches previous segment's last frame; motion and audio pick up immediately with no cut, no fade, no recap.]`);
         const label = `clip ${i+1}/${chunks}`;
-        setStatus(s => ({ ...s, pct: 5 + (i / chunks) * 80 }));
+        const basePct = 2 + (i / chunks) * 95;
+        const spanPct = (1 / chunks) * 90;
         let fj;
         try {
-          fj = await runOneClip(thePrompt, segSec, prevFrame, label);
+          fj = await runOneClip(thePrompt, segSec, prevFrame, label, basePct, spanPct);
         } catch (e) {
           // One retry without input_reference if Sora rejects the anchor ("Job failed" right after submit).
           if (prevFrame && /Job (failed|cancelled)/i.test(e.message)) {
             dbg("warn", `${label} failed with anchor — retrying without input_reference`);
-            fj = await runOneClip(thePrompt, segSec, null, `${label} (retry)`);
+            fj = await runOneClip(thePrompt, segSec, null, `${label} (retry)`, basePct, spanPct);
           } else {
             throw e;
           }
@@ -600,11 +611,11 @@ function App() {
         }
         if (i < chunks - 1) {
           try {
-            setStatus(s => ({ ...s, label: `${label}: capturing last frame for continuity`, pct: 5 + ((i+1) / chunks) * 80 }));
+            setStatus(s => ({ ...s, label: `${label}: capturing anchor frame` }));
             prevFrame = await extractLastFrame(fj.url, W, H);
             dbg("ok", `last-frame captured (${prevFrame.size} bytes) for clip ${i+2} anchor`);
           } catch (e) {
-            dbg("warn", "last-frame extraction failed; continuing without anchor", e.message);
+            dbg("warn", "last-frame extraction failed; continuing with plan-based continuity only", e.message);
             prevFrame = null;
           }
         }
