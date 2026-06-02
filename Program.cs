@@ -971,7 +971,22 @@ app.MapPost("/api/promptcraft", (PromptCraftRequest req, IHttpClientFactory hf,
                     if (content.EndsWith("```")) content = content[..^3];
                     content = content.Trim();
                 }
-                return JsonDocument.Parse(content).RootElement.Clone();
+                // Surface a useful error if the model's JSON got truncated by
+                // the token budget — without this the parse error is opaque.
+                try
+                {
+                    return JsonDocument.Parse(content).RootElement.Clone();
+                }
+                catch (JsonException ex)
+                {
+                    var finishReason = "unknown";
+                    try { finishReason = doc.RootElement.GetProperty("choices")[0].GetProperty("finish_reason").GetString() ?? "unknown"; } catch { }
+                    var len = content.Length;
+                    var tail = content.Length > 200 ? content[^200..] : content;
+                    throw new InvalidOperationException(
+                        $"Reasoner JSON parse failed (finish_reason={finishReason}, content_len={len}, max_completion_tokens={maxOut}). " +
+                        $"Likely truncated — increase maxOut. Tail: …{tail}", ex);
+                }
             }
 
             const string LOCKS = @"
@@ -1106,7 +1121,7 @@ Output JSON only.";
 
 Compile the {segmentCount} segment prompts now. Output JSON only.";
 
-            var compiled = await CallReasoner(compileSys, compileUser, 6000);
+            var compiled = await CallReasoner(compileSys, compileUser, 12000);
 
             // Layer 3: CRITIC LOOP
             var iterations = new List<object>();
@@ -1158,7 +1173,7 @@ CURRENT SEGMENTS:
 
 Score, list deviations, and emit refinedSegments now. Output JSON only.";
 
-                var critique = await CallReasoner(criticSys, criticUser, 6000);
+                var critique = await CallReasoner(criticSys, criticUser, 12000);
                 var scores = critique.GetProperty("scores");
                 int faith = scores.GetProperty("faithfulness").GetInt32();
                 int real = scores.GetProperty("realism").GetInt32();
