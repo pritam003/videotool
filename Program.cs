@@ -1013,7 +1013,7 @@ app.MapPost("/api/promptcraft", (PromptCraftRequest req, IHttpClientFactory hf,
 
     var endpoint = Cfg(cfg, "AOAI_ENDPOINT").TrimEnd('/');
     var key = Cfg(cfg, "AOAI_KEY");
-    var deployment = cfg["REASONING_DEPLOYMENT"] ?? "gpt-5_4";
+    var deployment = cfg["REASONING_DEPLOYMENT"] ?? "gpt-5-mini";
     var apiVersion = "2024-12-01-preview";
     var totalSeconds = Math.Clamp(req.TotalSeconds ?? 8, 4, 60);
     var size = req.Size ?? "1280x720";
