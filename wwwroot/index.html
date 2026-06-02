@@ -294,7 +294,7 @@ function Library({ refreshKey, onSelect }) {
   const load = useCallback(async () => {
     setLoading(true); setErr("");
     try {
-      const r = await fetch("/api/videos?limit=60");
+      const r = await fetch("/api/videos?limit=10");
       const j = await jsonOrThrow(r);
       setVideos(j.videos || []);
     } catch (e) { setErr(e.message); }
@@ -344,7 +344,6 @@ function App() {
   const [segSummaries, setSegSummaries] = useState([]);
   const [identityBible, setIdentityBible] = useState(null); // { characterDescriptor, wardrobe, sceneDescriptor, palette, lensLightingNotes, distinctiveTraits }
   const [useRemix, setUseRemix] = useState(true); // #1: clips 2..N remix-from-clip-1 (native identity preservation)
-  const [provider, setProvider] = useState("sora"); // "sora" | "wan22" — model backend selector
   const [enhancing, setEnhancing] = useState(false);
   const [running, setRunning] = useState(false);
   const [status, setStatus] = useState({ phase: "idle", pct: 0, label: "ready" });
@@ -354,6 +353,11 @@ function App() {
   const [crossfade, setCrossfade] = useState(0); // seconds; 0 = lossless hard cut
   const [refreshLib, setRefreshLib] = useState(0);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  // Cancellation: cancelRef.current=true asks the run() loop to stop after the
+  // current step. currentJobIdRef holds the in-flight Sora videoId so we can
+  // POST /api/jobs/{id}/cancel to stop server-side billing immediately.
+  const cancelRef = useRef(false);
+  const currentJobIdRef = useRef(null);
   const [, force] = useState(0);
 
   useEffect(() => {
@@ -460,20 +464,46 @@ function App() {
 
   // Sora-2 typically takes 90–180s per 12s clip. Start with longer poll intervals
   // to avoid wasting round trips, then tighten as render approaches completion.
+  // Bails out promptly if cancelRef is set (and tells Sora to cancel server-side).
   async function poll(id, onProgress) {
+    currentJobIdRef.current = id;
     let elapsed = 0;
-    while (true) {
-      const wait = elapsed < 60_000 ? 6000 : elapsed < 120_000 ? 4000 : 3000;
-      await sleep(wait);
-      elapsed += wait;
-      const r = await fetch(`/api/jobs/${id}`);
-      const j = await jsonOrThrow(r);
-      const st = j.status;
-      if (onProgress) onProgress(st, elapsed);
-      else setStatus(s => ({ ...s, label: st }));
-      if (st === "succeeded" || st === "completed") return j;
-      if (st === "failed" || st === "cancelled") throw new Error("Job " + st);
+    try {
+      while (true) {
+        if (cancelRef.current) throw new Error("Cancelled by user");
+        const wait = elapsed < 60_000 ? 6000 : elapsed < 120_000 ? 4000 : 3000;
+        await sleep(wait);
+        elapsed += wait;
+        if (cancelRef.current) throw new Error("Cancelled by user");
+        const r = await fetch(`/api/jobs/${id}`);
+        const j = await jsonOrThrow(r);
+        const st = j.status;
+        if (onProgress) onProgress(st, elapsed);
+        else setStatus(s => ({ ...s, label: st }));
+        if (st === "succeeded" || st === "completed") return j;
+        if (st === "failed" || st === "cancelled") throw new Error("Job " + st);
+      }
+    } finally {
+      currentJobIdRef.current = null;
     }
+  }
+
+  // User-initiated cancellation. Sets the cancel flag, tells Sora to stop the
+  // active job (saves billing), then lets run()'s loop exit on its next check.
+  async function cancelRun() {
+    if (!running) return;
+    cancelRef.current = true;
+    setStatus(s => ({ ...s, label: "cancelling…" }));
+    const id = currentJobIdRef.current;
+    if (id) {
+      try {
+        await fetch(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" });
+        dbg("info", `cancel signal sent to Sora for ${id}`);
+      } catch (e) {
+        dbg("warn", `failed to signal Sora cancel: ${e.message}`);
+      }
+    }
+    toast("Cancelling generation…");
   }
 
   // Build the prompt for a single segment using the structured plan + memory of
@@ -613,33 +643,6 @@ function App() {
     return await jsonOrThrow(fr);
   }
 
-  // One Wan 2.2 (self-hosted) attempt: synchronous /api/jobs/local. Returns clip-shaped object.
-  // No remix, no anchor — local model is text-to-video only. Identity consistency relies on the
-  // identity-bible / IDENTITY LOCK delimiters in the prompt itself.
-  async function runOneClipViaLocal(thePrompt, chunkSec, label, basePct, spanPct) {
-    setStatus(s => ({ ...s, label: `${label}: Wan 2.2 inferring (~9 min)`, pct: basePct }));
-    const startedAt = Date.now();
-    // Tick the progress bar while we wait for the synchronous /api/jobs/local call.
-    const etaMs = chunkSec * 110_000; // ~110s/output-second on A100 for Wan TI2V-5B
-    const tick = setInterval(() => {
-      const elapsed = Date.now() - startedAt;
-      const frac = Math.min(0.97, elapsed / etaMs);
-      const ss = Math.round(elapsed / 1000);
-      setStatus(s => ({ ...s, label: `${label}: Wan 2.2 inferring (${ss}s)`, pct: basePct + spanPct * frac }));
-    }, 2000);
-    try {
-      const r = await fetch("/api/jobs/local", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: thePrompt, seconds: chunkSec, size })
-      });
-      const j = await jsonOrThrow(r);
-      return { url: j.url, videoId: null, provider: j.provider, seconds: j.seconds };
-    } finally {
-      clearInterval(tick);
-    }
-  }
-
   // Manual re-stitch with a chosen crossfade. Used by the "Re-stitch with crossfade" button.
   async function restitch(cfSec) {
     if (outs.length < 2) { toast("Need at least 2 clips to stitch.", true); return; }
@@ -662,6 +665,8 @@ function App() {
   async function run() {
     const finalText = finalPrompt.trim() || prompt.trim();
     if (!finalText) { toast("Enter a prompt first.", true); return; }
+    cancelRef.current = false;
+    currentJobIdRef.current = null;
     setRunning(true); setOuts([]); setStitched(null); setSegSummaries([]); setIdentityBible(null); setStatus({ phase: "running", pct: 2, label: "submitting" });
     try {
       const usePlan = plan && Array.isArray(plan.segments) && plan.segments.length > 0;
@@ -678,6 +683,7 @@ function App() {
       const etaMin = Math.ceil(etaSec / 60);
       toast(`Rendering ${chunks} clip${chunks > 1 ? "s" : ""} · est. ~${etaMin} min on Sora-2 (sequential, 1 task/deployment)`);
       for (let i = 0; i < chunks; i++) {
+        if (cancelRef.current) throw new Error("Cancelled by user");
         // Per-segment chunk size: in plan mode, derive from the segment's own span (clamped to 4/8/12).
         let segSec = chunkSize;
         if (usePlan) {
@@ -696,11 +702,7 @@ function App() {
         //   2. On remix failure, fall back to fresh job with 4s tail anchor.
         //   3. On anchor rejection, retry without anchor.
         const tryRemix = i >= 1 && usePlan && firstClipVideoId && useRemix;
-        if (provider === "wan22") {
-          // Self-hosted Wan 2.2 — single backend, text-to-video only, no remix/anchor.
-          fj = await runOneClipViaLocal(thePrompt, segSec, label, basePct, spanPct);
-          dbg("ok", `${label} rendered via Wan 2.2 (self-hosted, ${fj.seconds}s)`);
-        } else if (tryRemix) {
+        if (tryRemix) {
           try {
             fj = await runOneClipViaRemix(firstClipVideoId, thePrompt, segSec, label, basePct, spanPct);
             dbg("ok", `${label} rendered via remix from clip 1 (${firstClipVideoId})`);
@@ -792,9 +794,14 @@ function App() {
         } finally { setStitching(false); }
       }
     } catch (e) {
-      setStatus({ phase: "failed", pct: 0, label: "error" });
-      toast(e.message.slice(0, 200), true);
-    } finally { setRunning(false); }
+      const cancelled = cancelRef.current || /Cancelled by user/i.test(e.message || "");
+      setStatus({ phase: cancelled ? "idle" : "failed", pct: 0, label: cancelled ? "cancelled" : "error" });
+      toast(cancelled ? "Generation cancelled" : e.message.slice(0, 200), !cancelled);
+    } finally {
+      cancelRef.current = false;
+      currentJobIdRef.current = null;
+      setRunning(false);
+    }
   }
 
   const recentLines = dbgLines.slice(-200);
@@ -904,19 +911,6 @@ function App() {
                 <div class="muted small">Clips 2..N are generated as remix-edits of clip 1 (native identity preservation). Falls back to fresh + 4s tail anchor if remix fails.</div>
               </label>
             </div>
-            <div style=${{marginTop:12}}>
-              <label class="muted small" style=${{display:"block",marginBottom:4}}>Model backend</label>
-              <div style=${{display:"flex",gap:14,flexWrap:"wrap"}}>
-                <label style=${{cursor:"pointer"}}>
-                  <input type="radio" name="provider" value="sora" checked=${provider==="sora"} onChange=${() => setProvider("sora")} />
-                  &nbsp;<strong>Sora-2</strong> <span class="muted small">(hosted, ~$0.50/5s, face-block)</span>
-                </label>
-                <label style=${{cursor:"pointer"}}>
-                  <input type="radio" name="provider" value="wan22" checked=${provider==="wan22"} onChange=${() => setProvider("wan22")} />
-                  &nbsp;<strong>Wan 2.2</strong> <span class="muted small">(self-hosted, ~9 min/5s, no face-block)</span>
-                </label>
-              </div>
-            </div>
           </Accordion>
           <Accordion title="Reference image (optional)">
             <input type="file" accept="image/*" onChange=${e => setRefFile(e.target.files[0] || null)} />
@@ -929,6 +923,7 @@ function App() {
             <button class="primary" onClick=${run} disabled=${running || (!prompt.trim() && !finalPrompt.trim())}>
               ${running ? "Generating…" : "▶ Generate video"}
             </button>
+            ${running && html`<button onClick=${cancelRun} title="Stop generation and tell Sora to cancel the active job">✕ Cancel</button>`}
             <span class="pill ${status.phase === "failed" ? "err" : status.phase === "done" ? "ok" : ""}">${status.label}</span>
           </div>
           ${(running || status.pct > 0) && html`<div class="progress"><div style=${{width: status.pct + "%"}}></div></div>`}
