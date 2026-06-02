@@ -231,6 +231,19 @@
     <label>Narration script <span style="text-transform:none;color:var(--muted)">(optional · Sora speaks this inside the video, in the language of the chosen voice)</span></label>
     <textarea id="narration" placeholder="Type what should be said. e.g. 'Help me, the crabs are everywhere!' — pick a Bengali voice and Sora will translate and speak it in Bengali with natural emotion."></textarea>
 
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button id="enhance" type="button" style="background:#1f2742;color:#e6e9f5;border:1px solid #2b355c;padding:10px 14px;border-radius:10px;cursor:pointer;font-weight:600;display:inline-flex;align-items:center;gap:6px">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v3M12 18v3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M3 12h3M18 12h3M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1"/></svg>
+        Enhance prompt
+      </button>
+      <span id="enhanceStatus" style="color:var(--muted);font-size:13px;align-self:center"></span>
+    </div>
+
+    <details id="finalPromptWrap" style="margin-top:8px" open>
+      <summary style="cursor:pointer;color:var(--muted);font-size:13px;text-transform:uppercase;letter-spacing:.04em">Final prompt sent to Sora <span style="color:#9ea3b5">(editable)</span></summary>
+      <textarea id="finalPrompt" placeholder="Click 'Enhance prompt' to auto-generate a Sora-2-optimized prompt with translated narration embedded. You can edit it here before generating." style="margin-top:8px;min-height:140px"></textarea>
+    </details>
+
     <button id="go" class="primary">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
       Generate video
@@ -302,6 +315,39 @@ drop.addEventListener("drop", e => {
 const btn = $("#go");
 btn.addEventListener("click", run);
 
+// Enhance prompt (server-side LLM rewrites + translates narration)
+$("#enhance").addEventListener("click", async () => {
+  const raw = $("#prompt").value.trim();
+  if (!raw) { toast("Type a prompt first.", true); return; }
+  const status = $("#enhanceStatus");
+  const eb = $("#enhance");
+  eb.disabled = true; status.textContent = "thinking…";
+  try {
+    const r = await fetch("/api/enhance", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        prompt: raw,
+        narration: $("#narration").value.trim() || null,
+        voice: $("#voice").value,
+        seconds: Number($("#seconds").value || 8),
+        size: $("#size").value
+      })
+    });
+    const txt = await r.text();
+    if (!r.ok) throw new Error(txt);
+    const j = JSON.parse(txt);
+    $("#finalPrompt").value = j.enhanced || raw;
+    $("#finalPromptWrap").open = true;
+    status.textContent = j.langName ? `enhanced · narration in ${j.langName}` : "enhanced";
+  } catch (e) {
+    status.textContent = "failed: " + e.message;
+    toast("Enhance failed: " + e.message, true);
+  } finally {
+    eb.disabled = false;
+  }
+});
+
 function setStatus(state, text, pct) {
   const sl = $("#statusLine");
   sl.classList.remove("queued","in_progress","completed","failed","cancelled");
@@ -311,8 +357,11 @@ function setStatus(state, text, pct) {
 }
 
 async function run() {
-  const prompt = $("#prompt").value.trim();
+  const rawPrompt = $("#prompt").value.trim();
+  const finalOverride = $("#finalPrompt").value.trim();
+  const prompt = finalOverride || rawPrompt;
   if (!prompt) { toast("Enter a prompt first.", true); return; }
+  const usingEnhanced = !!finalOverride;
   btn.disabled = true;
   $("#progress").hidden = false;
   $("#meta").innerHTML = "";
@@ -345,6 +394,7 @@ async function run() {
       stitched ? `rendering ${chunks.length} clips sequentially (Sora-2 allows 1 at a time)…` : "submitting…");
 
     // Narration is spoken by Sora itself. Translate if voice locale is non-English.
+    // Skip this if the user already enhanced the prompt server-side (it bakes the voiceover in).
     const narrationRaw = $("#narration").value.trim();
     const voiceVal = $("#voice").value;
     const localeMatch = voiceVal.match(/^([a-z]{2})-([A-Z]{2})/);
@@ -354,7 +404,7 @@ async function run() {
     const voiceGender = /(male|kunal|aarav|prabhat|madhur|rehaan|arjun|adam|andrew|alloy|echo|bashkar)/i.test(voiceVal) ? "male" : "female";
 
     let spokenLine = "";
-    if (narrationRaw) {
+    if (narrationRaw && !usingEnhanced) {
       let toSpeak = narrationRaw;
       if (langPrefix !== "en") {
         setStatus("in_progress", `translating narration to ${langName}…`);
