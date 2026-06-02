@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>videotool — text to video</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { margin-bottom: .25rem; }
+    .sub { color: #666; margin-top: 0; }
+    textarea { width: 100%; min-height: 6rem; padding: .6rem; font: inherit; }
+    .row { display: flex; gap: .75rem; margin: .75rem 0; }
+    .row > label { display: flex; flex-direction: column; font-size: .85rem; }
+    select, input { padding: .4rem; font: inherit; }
+    button { padding: .6rem 1.2rem; font: inherit; cursor: pointer; }
+    button[disabled] { opacity: .6; cursor: progress; }
+    #status { margin-top: 1rem; color: #444; min-height: 1.5rem; }
+    video { width: 100%; margin-top: 1rem; border-radius: 8px; background: #000; }
+    pre { background: #f4f4f4; padding: .6rem; overflow: auto; font-size: .8rem; }
+  </style>
+</head>
+<body>
+  <h1>videotool</h1>
+  <p class="sub">Text → video, powered by Azure OpenAI Sora-2.</p>
+
+  <form id="f">
+    <textarea id="prompt" placeholder="A cinematic shot of a paper boat sailing down a rainy city street at night, neon reflections..." required></textarea>
+    <div class="row">
+      <label>seconds
+        <select id="seconds">
+          <option>4</option><option>8</option><option>12</option>
+        </select>
+      </label>
+      <label>size
+        <select id="size">
+          <option>720x1280</option>
+          <option>1280x720</option>
+          <option>1024x1024</option>
+        </select>
+      </label>
+      <label>&nbsp;
+        <button id="go" type="submit">Generate</button>
+      </label>
+    </div>
+  </form>
+
+  <div id="status"></div>
+  <video id="player" controls hidden></video>
+  <pre id="meta" hidden></pre>
+
+  <script>
+    const f = document.getElementById('f');
+    const status = document.getElementById('status');
+    const player = document.getElementById('player');
+    const meta = document.getElementById('meta');
+    const go = document.getElementById('go');
+
+    f.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      go.disabled = true;
+      player.hidden = true; meta.hidden = true;
+      status.textContent = 'Generating video — this typically takes 30–90 seconds...';
+      const body = {
+        prompt: document.getElementById('prompt').value,
+        seconds: parseInt(document.getElementById('seconds').value, 10),
+        size: document.getElementById('size').value
+      };
+      try {
+        const r = await fetch('/api/generate', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data?.detail || data?.error || r.statusText);
+        status.textContent = 'Done.';
+        player.src = data.url; player.hidden = false; player.play().catch(()=>{});
+        meta.textContent = JSON.stringify(data, null, 2); meta.hidden = false;
+      } catch (err) {
+        status.textContent = 'Error: ' + err.message;
+      } finally {
+        go.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

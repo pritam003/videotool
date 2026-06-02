@@ -67,6 +67,14 @@ Deployments are driven by Git — never by uploading zips or editing in the port
 | Web App | `videotool-pritam003-23209` |
 | Runtime | `DOTNETCORE:8.0` |
 | Public URL | https://videotool-pritam003-23209.azurewebsites.net |
+| AI Services account | `videotool-aoai` (kind `AIServices`, S0, eastus2) |
+| AOAI endpoint | `https://videotool-aoai.cognitiveservices.azure.com/` |
+| Model deployment | `sora-2` (model `sora-2`, version `2025-12-08`, GlobalStandard, capacity 1) |
+| Storage account | `videotoolstor6085` (StandardLRS, blob public access disabled) |
+| Blob container | `videos` |
+| App Service identity | system-assigned managed identity |
+| MI roles | `Cognitive Services OpenAI User` on `videotool-aoai`; `Storage Blob Data Contributor` on `videotoolstor6085` |
+| App settings | `AOAI_ENDPOINT`, `AOAI_DEPLOYMENT=sora-2`, `STORAGE_ACCOUNT`, `STORAGE_CONTAINER=videos` |
 
 ### GitHub repo
 
