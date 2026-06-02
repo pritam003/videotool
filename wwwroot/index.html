@@ -268,8 +268,83 @@
 
 <div class="toast" id="toast"></div>
 
+<div id="dbg" style="position:fixed;right:12px;bottom:12px;width:min(560px,calc(100vw - 24px));max-height:50vh;background:#0b0e1a;border:1px solid #2b355c;border-radius:10px;font:12px/1.45 ui-monospace,Menlo,Consolas,monospace;color:#cfd3e1;box-shadow:0 12px 40px rgba(0,0,0,.45);z-index:9999;display:flex;flex-direction:column">
+  <div style="padding:8px 10px;display:flex;align-items:center;gap:8px;border-bottom:1px solid #2b355c;background:#121733;border-radius:10px 10px 0 0">
+    <strong style="font:600 12px system-ui;letter-spacing:.04em;text-transform:uppercase;color:#e6e9f5">Debug log</strong>
+    <span id="dbgCount" style="background:#2b355c;color:#e6e9f5;padding:1px 8px;border-radius:999px;font-size:11px">0</span>
+    <span style="flex:1"></span>
+    <button id="dbgCopy" type="button" style="background:#1f2742;color:#e6e9f5;border:1px solid #2b355c;border-radius:6px;padding:3px 8px;cursor:pointer;font-size:11px">Copy</button>
+    <button id="dbgClear" type="button" style="background:#1f2742;color:#e6e9f5;border:1px solid #2b355c;border-radius:6px;padding:3px 8px;cursor:pointer;font-size:11px">Clear</button>
+    <button id="dbgToggle" type="button" style="background:#1f2742;color:#e6e9f5;border:1px solid #2b355c;border-radius:6px;padding:3px 8px;cursor:pointer;font-size:11px">Hide</button>
+  </div>
+  <div id="dbgBody" style="overflow:auto;padding:8px 10px;flex:1"></div>
+</div>
+
 <script>
 const $ = s => document.querySelector(s);
+
+// ---------- Debug log panel ----------
+const dbg = (() => {
+  const body = document.getElementById("dbgBody");
+  const count = document.getElementById("dbgCount");
+  let n = 0;
+  const colors = { error:"#ff7a90", warn:"#ffd166", info:"#9ad7ff", net:"#a5f3a5", ok:"#9ad7ff" };
+  function add(level, label, detail) {
+    n++; count.textContent = n;
+    const el = document.createElement("div");
+    el.style.cssText = "padding:4px 0;border-bottom:1px dashed #1f2742;white-space:pre-wrap;word-break:break-word";
+    const t = new Date().toISOString().substring(11, 23);
+    const c = colors[level] || "#cfd3e1";
+    let d = detail;
+    if (d && typeof d === "object") {
+      try { d = JSON.stringify(d, null, 2); } catch { d = String(d); }
+    }
+    el.innerHTML = `<span style="color:#7a82a3">${t}</span> <span style="color:${c};font-weight:600">[${level.toUpperCase()}]</span> <span style="color:#e6e9f5">${label}</span>` + (d ? `<div style="color:#9ea3b5;margin-top:2px">${(d+"").replace(/[<&>]/g,s=>({"<":"&lt;",">":"&gt;","&":"&amp;"}[s]))}</div>` : "");
+    body.appendChild(el);
+    body.scrollTop = body.scrollHeight;
+  }
+  document.getElementById("dbgClear").onclick = () => { body.innerHTML=""; n=0; count.textContent="0"; };
+  document.getElementById("dbgCopy").onclick = async () => {
+    try { await navigator.clipboard.writeText(body.innerText); add("info","copied debug log to clipboard"); }
+    catch (e) { add("warn","copy failed", e.message); }
+  };
+  document.getElementById("dbgToggle").onclick = () => {
+    const panel = document.getElementById("dbg");
+    const hidden = body.style.display === "none";
+    body.style.display = hidden ? "block" : "none";
+    document.getElementById("dbgToggle").textContent = hidden ? "Hide" : "Show";
+    panel.style.maxHeight = hidden ? "50vh" : "44px";
+  };
+  return { add };
+})();
+
+window.addEventListener("error", e => dbg.add("error", "uncaught: " + (e.message || "error"), (e.error && e.error.stack) || (e.filename + ":" + e.lineno + ":" + e.colno)));
+window.addEventListener("unhandledrejection", e => dbg.add("error", "unhandled promise rejection", (e.reason && (e.reason.stack || e.reason.message)) || String(e.reason)));
+
+// Wrap fetch to log every request and any non-2xx response.
+const _origFetch = window.fetch.bind(window);
+window.fetch = async function(input, init) {
+  const url = (typeof input === "string") ? input : (input && input.url) || "";
+  const method = (init && init.method) || (typeof input === "object" && input.method) || "GET";
+  const t0 = performance.now();
+  try {
+    const r = await _origFetch(input, init);
+    const ms = Math.round(performance.now() - t0);
+    if (!r.ok) {
+      const clone = r.clone();
+      let body = ""; try { body = await clone.text(); } catch {}
+      dbg.add("error", `${method} ${url} → ${r.status} (${ms}ms)`, body.substring(0, 1500));
+    } else {
+      dbg.add("net", `${method} ${url} → ${r.status} (${ms}ms)`);
+    }
+    return r;
+  } catch (err) {
+    const ms = Math.round(performance.now() - t0);
+    dbg.add("error", `${method} ${url} → network error (${ms}ms)`, err.message);
+    throw err;
+  }
+};
+
 const toast = (msg, err) => {
   const t = $("#toast");
   t.textContent = msg;
@@ -277,6 +352,7 @@ const toast = (msg, err) => {
   t.classList.add("show");
   clearTimeout(toast._t);
   toast._t = setTimeout(() => t.classList.remove("show"), 4000);
+  dbg.add(err ? "error" : "info", msg);
 };
 
 // Health badge
