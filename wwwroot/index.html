@@ -167,9 +167,12 @@
       <div>
         <label>Duration</label>
         <select id="seconds">
-          <option value="4" selected>4s</option>
-          <option value="8">8s</option>
-          <option value="12">12s</option>
+          <option value="4">4s</option>
+          <option value="8" selected>8s</option>
+          <option value="12">12s · max single clip</option>
+          <option value="24">24s · stitched ×2</option>
+          <option value="36">36s · stitched ×3</option>
+          <option value="48">48s · stitched ×4</option>
         </select>
       </div>
       <div>
@@ -293,12 +296,17 @@ async function run() {
   $("#player").innerHTML = `<div class="empty">Working…</div>`;
   setStatus("queued", "submitting…", 2);
 
-  const t0 = Date.now();
-  // Sora typically takes ~25s per second of output. Use that as the curve target.
-  const seconds = Number($("#seconds").value || 4);
-  const expected = Math.max(20, seconds * 22); // seconds, soft target
+  const totalSeconds = Number($("#seconds").value || 8);
+  // Sora-2 hard caps at 12s per clip; stitch multiple back-to-back for longer.
+  const chunks = [];
+  let remaining = totalSeconds;
+  while (remaining > 0) { const c = Math.min(12, remaining); chunks.push(c); remaining -= c; }
+  const stitched = chunks.length > 1;
 
-  // Smooth elapsed-time estimator: asymptotically approaches 92%
+  const t0 = Date.now();
+  // ~22s of generation per second of output, in parallel across chunks
+  const expected = Math.max(20, Math.max(...chunks) * 22);
+
   const fakePct = () => {
     const t = (Date.now() - t0) / 1000;
     return Math.min(92, 92 * (1 - Math.exp(-t / expected)));
@@ -306,22 +314,32 @@ async function run() {
   const tick = setInterval(() => {
     const t = Math.round((Date.now()-t0)/1000);
     $("#elapsed").textContent = t + "s";
-    // Only override the bar while we're still rendering, not after completion
     if (!run._done) $("#barFill").style.width = Math.max(2, fakePct()).toFixed(1) + "%";
   }, 250);
 
   try {
-    // 1) Submit
-    const fd = new FormData();
-    fd.append("prompt", prompt);
-    fd.append("seconds", $("#seconds").value);
-    fd.append("size", $("#size").value);
-    if (pickedFile) fd.append("inputReference", pickedFile);
-    const submit = await fetch("/api/jobs", { method: "POST", body: fd });
-    const submitText = await submit.text();
-    if (!submit.ok) throw new Error(submitText);
-    const job = JSON.parse(submitText);
-    setStatus("in_progress", "rendering with Sora…");
+    setStatus("in_progress",
+      stitched ? `submitting ${chunks.length} clips (×${chunks[0]}s) in parallel…` : "submitting…");
+
+    // 1) Submit all chunks in parallel, with continuity hints for stitched runs
+    const submitOne = async (sec, idx) => {
+      const fd = new FormData();
+      const promptForChunk = stitched
+        ? `${prompt}\n\nThis is shot ${idx+1} of ${chunks.length} in one continuous scene. ` +
+          (idx === 0 ? "Establish the scene and camera framing."
+                     : "Continue seamlessly from the previous shot — same characters, lighting, palette, camera motion. Do not reset the scene.")
+        : prompt;
+      fd.append("prompt", promptForChunk);
+      fd.append("seconds", String(sec));
+      fd.append("size", $("#size").value);
+      // Reference file applies to the first clip only (Sora limit)
+      if (idx === 0 && pickedFile) fd.append("inputReference", pickedFile);
+      const r = await fetch("/api/jobs", { method: "POST", body: fd });
+      const txt = await r.text();
+      if (!r.ok) throw new Error(`Clip ${idx+1}: ${txt}`);
+      return JSON.parse(txt);
+    };
+    const jobs = await Promise.all(chunks.map((s, i) => submitOne(s, i)));
 
     // 2) Kick off TTS in parallel if narration present
     const narration = $("#narration").value.trim();
@@ -334,31 +352,40 @@ async function run() {
       }).then(async r => { const t = await r.text(); if (!r.ok) throw new Error(t); return JSON.parse(t); });
     }
 
-    // 3) Poll (fast cadence so we detect completion the moment it lands)
-    let last = job;
-    while (true) {
-      if (last.status === "completed") break;
-      if (last.status === "failed" || last.status === "cancelled") {
-        throw new Error("Job " + last.status + ": " + JSON.stringify(last.error || last));
+    // 3) Poll all jobs until each is terminal
+    const pollOne = async (job) => {
+      let last = job;
+      while (true) {
+        if (last.status === "completed") return last;
+        if (last.status === "failed" || last.status === "cancelled")
+          throw new Error("Job " + last.status + ": " + JSON.stringify(last.error || last));
+        const delay = (Date.now() - t0) < 20000 ? 1500 : 2500;
+        await new Promise(r => setTimeout(r, delay));
+        const r = await fetch(`/api/jobs/${job.id}`);
+        const txt = await r.text();
+        if (!r.ok) throw new Error(txt);
+        last = JSON.parse(txt);
       }
-      // Adaptive: poll every 1.2s for first 20s, then 2.5s
-      const delay = (Date.now() - t0) < 20000 ? 1200 : 2500;
-      await new Promise(r => setTimeout(r, delay));
-      const r = await fetch(`/api/jobs/${job.id}`);
-      const txt = await r.text();
-      if (!r.ok) throw new Error(txt);
-      last = JSON.parse(txt);
-      setStatus(last.status, last.status.replace("_"," "));
-    }
+    };
+    let completedCount = 0;
+    const polls = jobs.map(j => pollOne(j).then(r => {
+      completedCount++;
+      setStatus("in_progress", `rendered ${completedCount}/${jobs.length} clip(s)…`);
+      return r;
+    }));
+    const finals = await Promise.all(polls);
+
     run._done = true;
     setStatus("completed", "saving to storage…", 96);
     $("#barFill").style.width = "96%";
 
-    // 4) Finalize: download from Sora -> blob -> SAS URL
-    const fin = await fetch(`/api/jobs/${job.id}/finalize`, { method: "POST" });
-    const finText = await fin.text();
-    if (!fin.ok) throw new Error(finText);
-    const out = JSON.parse(finText);
+    // 4) Finalize all clips in parallel (download from Sora -> blob -> SAS URL)
+    const outs = await Promise.all(jobs.map(async j => {
+      const r = await fetch(`/api/jobs/${j.id}/finalize`, { method: "POST" });
+      const txt = await r.text();
+      if (!r.ok) throw new Error(txt);
+      return JSON.parse(txt);
+    }));
 
     // 5) Resolve narration
     let narr = null;
@@ -369,7 +396,7 @@ async function run() {
 
     setStatus("completed", "ready", 100);
     $("#barFill").style.width = "100%";
-    renderPlayer(out, narr, last);
+    renderPlayer(outs, narr, finals[0], totalSeconds);
   } catch (e) {
     setStatus("failed", "error", 100);
     $("#player").innerHTML = `<div class="empty">Failed.</div>`;
@@ -382,27 +409,55 @@ async function run() {
   }
 }
 
-function renderPlayer(out, narr, last) {
+function renderPlayer(outs, narr, last, totalSeconds) {
+  // outs may be a single object (legacy) or an array of clip outputs
+  const clips = Array.isArray(outs) ? outs : [outs];
   const player = $("#player");
   player.innerHTML = "";
   const v = document.createElement("video");
-  v.src = out.url;
+  v.src = clips[0].url;
   v.controls = true;
   v.preload = "auto";
   v.playsInline = true;
   player.appendChild(v);
 
+  // Sequential stitched playback — when one clip ends, switch src to the next.
+  let idx = 0;
+  if (clips.length > 1) {
+    // Preload next clips in hidden link tags to warm CDN cache
+    clips.slice(1).forEach(c => {
+      const l = document.createElement("link");
+      l.rel = "preload"; l.as = "video"; l.href = c.url;
+      document.head.appendChild(l);
+    });
+    v.addEventListener("ended", () => {
+      idx++;
+      if (idx < clips.length) {
+        v.src = clips[idx].url;
+        v.play().catch(()=>{});
+        if (narr && narr.url) {
+          // keep narration running across clips — don't reset it
+        }
+      } else {
+        // Loop entire stitched sequence from clip 0
+        idx = 0;
+        v.src = clips[0].url;
+      }
+    });
+  }
+
   const audio = $("#audio");
   if (narr && narr.url) {
     audio.src = narr.url;
     audio.hidden = false;
-    // Sync narration with video playback
-    v.addEventListener("play", () => { audio.currentTime = v.currentTime; audio.play().catch(()=>{}); });
-    v.addEventListener("pause", () => audio.pause());
-    v.addEventListener("seeked", () => { audio.currentTime = v.currentTime; });
-    v.addEventListener("ended", () => audio.pause());
-    // Mute video so narration is the only audio (Sora can have ambient)
+    // Mute video; narration drives audio across all stitched clips
     v.muted = true;
+    v.addEventListener("play", () => {
+      // Resume narration where it left off, but never restart on clip change
+      if (audio.paused) audio.play().catch(()=>{});
+    });
+    v.addEventListener("pause", () => audio.pause());
+    v.addEventListener("ended", () => {/* let our handler above continue narration */});
   } else {
     audio.removeAttribute("src");
     audio.hidden = true;
@@ -416,13 +471,16 @@ function renderPlayer(out, narr, last) {
     el.textContent = `${label}: ${value}`;
     meta.appendChild(el);
   };
-  m("video", "open ↗", out.url);
+  if (clips.length === 1) {
+    m("video", "open ↗", clips[0].url);
+  } else {
+    clips.forEach((c, i) => m(`clip ${i+1}/${clips.length}`, "open ↗", c.url));
+  }
   if (narr) m("narration", "open ↗", narr.url);
-  m("seconds", last.seconds || "4");
+  m("duration", (totalSeconds || last.seconds || "?") + "s" + (clips.length > 1 ? ` (×${clips.length})` : ""));
   m("size", last.size || "");
-  m("id", out.videoId);
+  m("id", clips[0].videoId);
 
-  // Auto-play (muted video is allowed by browsers)
   v.play().catch(()=>{});
 }
 </script>
