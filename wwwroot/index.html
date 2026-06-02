@@ -346,6 +346,9 @@ function App() {
   const [running, setRunning] = useState(false);
   const [status, setStatus] = useState({ phase: "idle", pct: 0, label: "ready" });
   const [outs, setOuts] = useState([]);
+  const [stitched, setStitched] = useState(null); // { url, clips, crossfade } or null
+  const [stitching, setStitching] = useState(false);
+  const [crossfade, setCrossfade] = useState(0); // seconds; 0 = lossless hard cut
   const [refreshLib, setRefreshLib] = useState(0);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [, force] = useState(0);
@@ -561,10 +564,29 @@ function App() {
     return await jsonOrThrow(fr);
   }
 
+  // Manual re-stitch with a chosen crossfade. Used by the "Re-stitch with crossfade" button.
+  async function restitch(cfSec) {
+    if (outs.length < 2) { toast("Need at least 2 clips to stitch.", true); return; }
+    setStitching(true);
+    try {
+      const r = await fetch("/api/stitch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ urls: outs.map(o => o.url), crossfade: cfSec })
+      });
+      const j = await jsonOrThrow(r);
+      setStitched({ url: j.url, clips: j.clips, crossfade: j.crossfade, bytes: j.bytes });
+      setCrossfade(cfSec);
+      toast(cfSec > 0 ? `Re-stitched with ${cfSec}s crossfade` : "Re-stitched (hard cuts)");
+      setRefreshLib(x => x + 1);
+    } catch (e) { toast("Stitch failed: " + e.message, true); }
+    finally { setStitching(false); }
+  }
+
   async function run() {
     const finalText = finalPrompt.trim() || prompt.trim();
     if (!finalText) { toast("Enter a prompt first.", true); return; }
-    setRunning(true); setOuts([]); setSegSummaries([]); setStatus({ phase: "running", pct: 2, label: "submitting" });
+    setRunning(true); setOuts([]); setStitched(null); setSegSummaries([]); setStatus({ phase: "running", pct: 2, label: "submitting" });
     try {
       const usePlan = plan && Array.isArray(plan.segments) && plan.segments.length > 0;
       const chunkSize = Math.min(seconds, 12);
@@ -623,6 +645,26 @@ function App() {
       setStatus({ phase: "done", pct: 100, label: "ready" });
       setRefreshLib(x => x + 1);
       toast("Video ready");
+      // Auto-stitch if we have multiple clips. Lossless concat by default; user can re-stitch with crossfade later.
+      if (finals.length >= 2) {
+        try {
+          setStitching(true);
+          setStatus({ phase: "running", pct: 95, label: `stitching ${finals.length} clips into one…` });
+          const r = await fetch("/api/stitch", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ urls: finals.map(f => f.url), crossfade })
+          });
+          const j = await jsonOrThrow(r);
+          setStitched({ url: j.url, clips: j.clips, crossfade: j.crossfade, bytes: j.bytes });
+          setStatus({ phase: "done", pct: 100, label: "ready (stitched)" });
+          dbg("ok", `stitched ${j.clips} clips → ${(j.bytes/1024/1024).toFixed(1)}MB combined`);
+          toast("Combined video ready");
+        } catch (e) {
+          dbg("warn", "stitch failed; individual clips still available", e.message);
+          toast("Stitch failed — clips are still available individually", true);
+        } finally { setStitching(false); }
+      }
     } catch (e) {
       setStatus({ phase: "failed", pct: 0, label: "error" });
       toast(e.message.slice(0, 200), true);
@@ -751,10 +793,27 @@ function App() {
         <div class="card">
           <h3>Preview</h3>
           <div class="preview">
-            ${outs.length === 0
-              ? html`<div class="empty">Your video will appear here.</div>`
-              : html`<video src=${outs[outs.length-1].url} controls autoplay loop></video>`}
+            ${(() => {
+              const headline = stitched?.url || (outs.length > 0 ? outs[outs.length-1].url : null);
+              if (!headline) return html`<div class="empty">Your video will appear here.</div>`;
+              return html`<video src=${headline} controls autoplay loop></video>`;
+            })()}
           </div>
+          ${stitched && html`
+            <div class="meta" style=${{flexWrap:"wrap"}}>
+              <span class="pill ok">combined · ${stitched.clips} clips · ${stitched.crossfade > 0 ? stitched.crossfade + "s crossfade" : "hard cuts"} · ${(stitched.bytes/1024/1024).toFixed(1)}MB</span>
+              <a href=${stitched.url} target="_blank" rel="noopener">download ↗</a>
+            </div>
+          `}
+          ${outs.length >= 2 && html`
+            <div class="meta" style=${{flexWrap:"wrap",gap:6}}>
+              <span style=${{opacity:.7,marginRight:6}}>Transition:</span>
+              <button class="ghost" disabled=${stitching} onClick=${() => restitch(0)} title="Lossless concat, ~1s. Best when last-frame anchor worked.">hard cut</button>
+              <button class="ghost" disabled=${stitching} onClick=${() => restitch(0.3)} title="Re-encodes the whole video. ~30s on F1.">0.3s xfade</button>
+              <button class="ghost" disabled=${stitching} onClick=${() => restitch(0.5)} title="Re-encodes the whole video. ~30s on F1.">0.5s xfade</button>
+              ${stitching && html`<span class="pill">stitching…</span>`}
+            </div>
+          `}
           ${outs.length > 0 && html`
             <div class="meta">
               ${outs.map((o, i) => html`<a href=${o.url} target="_blank" rel="noopener" key=${i}>clip ${i+1}/${outs.length} ↗</a>`)}
@@ -762,7 +821,7 @@ function App() {
             </div>
           `}
         </div>
-        <${Library} refreshKey=${refreshLib} onSelect=${v => { setOuts([{ url: v.url, name: v.name, seconds, size }]); toast("Loaded " + v.name); }} />
+        <${Library} refreshKey=${refreshLib} onSelect=${v => { setOuts([{ url: v.url, name: v.name, seconds, size }]); setStitched(null); toast("Loaded " + v.name); }} />
       </div>
     </main>
 

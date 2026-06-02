@@ -33,6 +33,18 @@ jobs:
       - name: Publish
         run: dotnet publish -c Release -o ${{ github.workspace }}/publish --no-build
 
+      - name: Bundle ffmpeg static binary (Linux x64)
+        run: |
+          set -e
+          mkdir -p ${{ github.workspace }}/publish/bin
+          cd /tmp
+          curl -sSL https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz -o ffmpeg.tar.xz
+          tar -xf ffmpeg.tar.xz
+          DIR=$(ls -d ffmpeg-*-amd64-static | head -1)
+          cp "$DIR/ffmpeg" ${{ github.workspace }}/publish/bin/ffmpeg
+          chmod +x ${{ github.workspace }}/publish/bin/ffmpeg
+          ${{ github.workspace }}/publish/bin/ffmpeg -version | head -2
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

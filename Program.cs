@@ -183,6 +183,152 @@ app.MapGet("/api/videos", async (IConfiguration cfg, TokenCredential cred, Cance
     return Results.Ok(new { count = sorted.Count, videos = sorted });
 });
 
+// 3b. Stitch: concatenate N MP4 clips into a single combined MP4 with optional crossfade.
+//     Body: { urls: string[], crossfade?: number /* seconds, 0 = hard cut, 0.3-0.5 typical */ }
+//     Strategy:
+//       - crossfade<=0: lossless concat-demuxer (fast, no re-encode). Hard cut, but our
+//         last-frame anchor + plan-based continuity make these near-invisible.
+//       - crossfade>0 : ffmpeg xfade for video + acrossfade for audio. Re-encode required.
+app.MapPost("/api/stitch", async (StitchRequest req, IHttpClientFactory hf,
+    IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
+{
+    if (req?.Urls is null || req.Urls.Length < 2)
+        return Results.BadRequest(new { error = "Provide at least 2 URLs to stitch." });
+
+    var ffmpeg = LocateFfmpeg();
+    if (ffmpeg is null)
+        return Results.Problem("ffmpeg binary not found. Expected at ./bin/ffmpeg (bundled by CI).");
+
+    var crossfade = Math.Clamp(req.Crossfade ?? 0.0, 0.0, 1.0);
+    var work = Path.Combine(Path.GetTempPath(), $"stitch-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(work);
+    try
+    {
+        // 1. Download each clip to local temp.
+        var http = hf.CreateClient();
+        http.Timeout = TimeSpan.FromMinutes(3);
+        var locals = new List<string>();
+        for (int i = 0; i < req.Urls.Length; i++)
+        {
+            var local = Path.Combine(work, $"in{i:D3}.mp4");
+            using var s = await http.GetStreamAsync(req.Urls[i], ct);
+            await using var f = File.Create(local);
+            await s.CopyToAsync(f, ct);
+            locals.Add(local);
+        }
+
+        var outPath = Path.Combine(work, "out.mp4");
+        string args;
+        if (crossfade <= 0.0)
+        {
+            // Lossless concat-demuxer. All inputs must share codec/resolution/timebase
+            // (true for clips from the same Sora deployment with the same size param).
+            var listPath = Path.Combine(work, "list.txt");
+            await File.WriteAllLinesAsync(listPath,
+                locals.Select(p => $"file '{p.Replace("'", "'\\''")}'"), ct);
+            args = $"-y -f concat -safe 0 -i \"{listPath}\" -c copy -movflags +faststart \"{outPath}\"";
+        }
+        else
+        {
+            // Probe each input duration so xfade offsets align.
+            var durations = new List<double>();
+            foreach (var p in locals) durations.Add(await ProbeDurationAsync(ffmpeg, p, ct));
+
+            var sb = new StringBuilder();
+            sb.Append("-y ");
+            for (int i = 0; i < locals.Count; i++) sb.Append($"-i \"{locals[i]}\" ");
+
+            // Build filter_complex: chain xfade and acrossfade through inputs.
+            //   v0,v1 -> xfade=offset=d0-cf : vx1 ; vx1,v2 -> xfade=offset=(d0+d1-2cf)-cf : vx2 ...
+            var fc = new StringBuilder();
+            double cumulative = 0;
+            string prevV = "[0:v]"; string prevA = "[0:a]";
+            for (int i = 1; i < locals.Count; i++)
+            {
+                var offset = cumulative + durations[i - 1] - crossfade;
+                var vTag = $"[vx{i}]";
+                var aTag = $"[ax{i}]";
+                fc.Append($"{prevV}[{i}:v]xfade=transition=fade:duration={crossfade.ToString("0.000", System.Globalization.CultureInfo.InvariantCulture)}:offset={offset.ToString("0.000", System.Globalization.CultureInfo.InvariantCulture)}{vTag};");
+                fc.Append($"{prevA}[{i}:a]acrossfade=d={crossfade.ToString("0.000", System.Globalization.CultureInfo.InvariantCulture)}{aTag};");
+                prevV = vTag; prevA = aTag;
+                cumulative += durations[i - 1] - crossfade;
+            }
+            // Trim trailing semicolon.
+            var fcStr = fc.ToString().TrimEnd(';');
+            sb.Append($"-filter_complex \"{fcStr}\" ");
+            sb.Append($"-map \"{prevV}\" -map \"{prevA}\" ");
+            sb.Append("-c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p ");
+            sb.Append("-c:a aac -b:a 160k -movflags +faststart ");
+            sb.Append($"\"{outPath}\"");
+            args = sb.ToString();
+        }
+
+        var (ec, stderr) = await RunProcessAsync(ffmpeg, args, ct);
+        if (ec != 0 || !File.Exists(outPath))
+            return Results.Problem($"ffmpeg failed (exit {ec}): {stderr.Substring(0, Math.Min(stderr.Length, 1500))}");
+
+        var mp4 = await File.ReadAllBytesAsync(outPath, ct);
+        var account = Cfg(cfg, "STORAGE_ACCOUNT");
+        var svc = new BlobServiceClient(new Uri($"https://{account}.blob.core.windows.net"), cred);
+        var container = svc.GetBlobContainerClient(cfg["STORAGE_CONTAINER"] ?? "videos");
+        var name = $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-stitched-{req.Urls.Length}clips.mp4";
+        var url = await UploadAndSign(container, name, mp4, "video/mp4", svc, account, ct);
+        return Results.Ok(new { url, blob = name, clips = req.Urls.Length, crossfade, bytes = mp4.Length });
+    }
+    finally
+    {
+        try { Directory.Delete(work, recursive: true); } catch { }
+    }
+});
+
+static string? LocateFfmpeg()
+{
+    // 1. Bundled ./bin/ffmpeg next to the app DLL.
+    var local = Path.Combine(AppContext.BaseDirectory, "bin", "ffmpeg");
+    if (File.Exists(local)) return local;
+    // 2. PATH (handy for local dev with apt-installed ffmpeg).
+    var path = Environment.GetEnvironmentVariable("PATH") ?? "";
+    foreach (var dir in path.Split(Path.PathSeparator))
+    {
+        try
+        {
+            var cand = Path.Combine(dir, OperatingSystem.IsWindows() ? "ffmpeg.exe" : "ffmpeg");
+            if (File.Exists(cand)) return cand;
+        }
+        catch { }
+    }
+    return null;
+}
+
+static async Task<(int exitCode, string stderr)> RunProcessAsync(string exe, string args, CancellationToken ct)
+{
+    var psi = new System.Diagnostics.ProcessStartInfo
+    {
+        FileName = exe,
+        Arguments = args,
+        RedirectStandardError = true,
+        RedirectStandardOutput = true,
+        UseShellExecute = false,
+        CreateNoWindow = true
+    };
+    using var p = System.Diagnostics.Process.Start(psi)!;
+    var errTask = p.StandardError.ReadToEndAsync(ct);
+    var outTask = p.StandardOutput.ReadToEndAsync(ct);
+    await p.WaitForExitAsync(ct);
+    return (p.ExitCode, await errTask + "\n" + await outTask);
+}
+
+static async Task<double> ProbeDurationAsync(string ffmpeg, string file, CancellationToken ct)
+{
+    // Use ffmpeg itself (we don't ship ffprobe). Parse "Duration: HH:MM:SS.xx" from stderr.
+    var (_, err) = await RunProcessAsync(ffmpeg, $"-i \"{file}\" -hide_banner", ct);
+    var m = System.Text.RegularExpressions.Regex.Match(err, @"Duration:\s*(\d+):(\d+):(\d+\.\d+)");
+    if (!m.Success) return 12.0; // sane fallback
+    return int.Parse(m.Groups[1].Value) * 3600
+         + int.Parse(m.Groups[2].Value) * 60
+         + double.Parse(m.Groups[3].Value, System.Globalization.CultureInfo.InvariantCulture);
+}
+
 // 4. Narrate: synthesize speech via Azure Speech, upload MP3, return SAS URL.
 app.MapPost("/api/narrate", async (NarrateRequest req, IHttpClientFactory hf,
     IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
@@ -475,3 +621,4 @@ app.Run();
 public record NarrateRequest(string Text, string? Voice);
 public record TranslateRequest(string Text, string? To);
 public record EnhanceRequest(string Prompt, string? Narration, string? Voice, int? Seconds, string? Size);
+public record StitchRequest(string[] Urls, double? Crossfade);
