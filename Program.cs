@@ -393,6 +393,7 @@ Return ONE JSON object, no prose, no markdown, exactly this shape:
 {
   ""characterDescriptor"": ""<2-3 sentences. Concrete nouns only. Pin: apparent gender, age range, ethnicity if visually evident, face shape, eye color, eyebrow shape, hair (length, texture, color, parting/style), skin tone, build, height impression, any visible marks/jewellery. NO names, NO emotion, NO action verbs.>"",
   ""wardrobe"": ""<1-2 sentences listing every visible garment and accessory with colour and texture, top-to-bottom. e.g. 'Faded indigo denim shorts mid-thigh; tan ribbed cotton crop top; bare feet; thin gold ankle bracelet on left ankle.'>"",
+  ""distinctiveTraits"": ""<3-5 NON-FACE visual signatures that let a viewer spot identity drift in later clips. Comma-separated. Each must be a concrete redrawable element: a high-contrast saturated colour item, a unique accessory, a prop, a scar/birthmark/tattoo with location, a hair ornament. e.g. 'bright cobalt-blue bandana wrapped on right wrist; small crescent scar above left eyebrow; faded denim jacket with embroidered yellow sun on left chest pocket.' Avoid traits that depend on face geometry alone.>"",
   ""sceneDescriptor"": ""<2-3 sentences. Environment, time of day, weather, geometry, prominent props. Concrete nouns only.>"",
   ""palette"": [""<hex or named anchor color 1>"", ""<...>"", ""<...3-5 total>""],
   ""lensLightingNotes"": ""<one sentence: lens look (focal length feel, DOF), key light direction and quality, color grade.>""
@@ -401,6 +402,7 @@ Return ONE JSON object, no prose, no markdown, exactly this shape:
 Rules:
 - Use only what is visibly present in the stills. Do NOT invent details.
 - If a detail is ambiguous across the three stills (e.g. hair length partially obscured), pick the clearest still and note nothing about the others.
+- distinctiveTraits is the CONSISTENCY LIFELINE: pick traits that survive small drift and are easy to verify visually.
 - Output JSON only. No markdown, no commentary.";
 
         var payload = new
@@ -440,12 +442,27 @@ Rules:
     }
 });
 
-// 3c. Tail: cut last N seconds (default 4) of a finalized clip, re-encoded at the
-//     requested size, and upload to blob. The SAS URL can be downloaded by the
-//     browser and passed as `input_reference` to the next Sora-2 job — Sora accepts
-//     up to 5s of video as a continuity anchor (per Sora-2 v1 API docs).
+// 3c. Tail: cut last N seconds (default 4) of a finalized clip — special case of /api/slice
+//     wired to the EOF. Kept as a thin wrapper for clarity at call sites.
 app.MapPost("/api/tail", async (TailRequest req, IHttpClientFactory hf,
     IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
+{
+    var seconds = Math.Clamp(req.Seconds ?? 4.0, 1.0, 5.0);
+    var slice = new SliceRequest(req.VideoUrl, null, seconds, req.Size, true);
+    return await SliceImpl(slice, hf, cfg, cred, ct);
+});
+
+// 3c2. Slice: cut an arbitrary [startSec, startSec+durationSec) window from a finalized
+//      clip, re-encoded at the requested size, and upload to blob. Used for the
+//      master-reel approach (#2): generate one establishing 20s reel of the character,
+//      then slice multiple 4s windows as input_reference anchors for each follow-up clip.
+//      Sora-2 caps input_reference video at 5s, so durationSec is clamped to [1, 5].
+app.MapPost("/api/slice", async (SliceRequest req, IHttpClientFactory hf,
+    IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
+    await SliceImpl(req, hf, cfg, cred, ct));
+
+static async Task<IResult> SliceImpl(SliceRequest req, IHttpClientFactory hf,
+    IConfiguration cfg, TokenCredential cred, CancellationToken ct)
 {
     if (string.IsNullOrWhiteSpace(req.VideoUrl))
         return Results.BadRequest(new { error = "videoUrl is required" });
@@ -453,14 +470,14 @@ app.MapPost("/api/tail", async (TailRequest req, IHttpClientFactory hf,
     var ffmpeg = LocateFfmpeg();
     if (ffmpeg is null) return Results.Problem("ffmpeg binary not found.");
 
-    var seconds = Math.Clamp(req.Seconds ?? 4.0, 1.0, 5.0);
+    var dur = Math.Clamp(req.DurationSec ?? 4.0, 1.0, 5.0);
     var size = string.IsNullOrWhiteSpace(req.Size) ? "1280x720" : req.Size!;
     var sizeMatch = System.Text.RegularExpressions.Regex.Match(size, @"^(\d+)x(\d+)$");
     if (!sizeMatch.Success) return Results.BadRequest(new { error = "size must be WxH" });
     var W = int.Parse(sizeMatch.Groups[1].Value);
     var H = int.Parse(sizeMatch.Groups[2].Value);
 
-    var work = Path.Combine(Path.GetTempPath(), $"tail-{Guid.NewGuid():N}");
+    var work = Path.Combine(Path.GetTempPath(), $"slice-{Guid.NewGuid():N}");
     Directory.CreateDirectory(work);
     try
     {
@@ -471,30 +488,81 @@ app.MapPost("/api/tail", async (TailRequest req, IHttpClientFactory hf,
         await using (var f = File.Create(local))
             await s.CopyToAsync(f, ct);
 
-        var outPath = Path.Combine(work, "tail.mp4");
-        // -sseof -N seeks N seconds before EOF. Re-encode to lock size and clean keyframes.
-        var s2 = seconds.ToString("0.000", System.Globalization.CultureInfo.InvariantCulture);
+        var outPath = Path.Combine(work, "slice.mp4");
+        var d2 = dur.ToString("0.000", System.Globalization.CultureInfo.InvariantCulture);
+        string seekArgs;
+        if (req.FromEnd == true || req.StartSec is null)
+        {
+            // Seek N seconds before EOF.
+            seekArgs = $"-sseof -{d2}";
+        }
+        else
+        {
+            var s2 = Math.Max(0, req.StartSec.Value).ToString("0.000", System.Globalization.CultureInfo.InvariantCulture);
+            seekArgs = $"-ss {s2}";
+        }
         var args =
-            $"-y -sseof -{s2} -i \"{local}\" -t {s2} " +
+            $"-y {seekArgs} -i \"{local}\" -t {d2} " +
             $"-vf \"scale={W}:{H}:force_original_aspect_ratio=decrease,pad={W}:{H}:(ow-iw)/2:(oh-ih)/2\" " +
             $"-c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p " +
             $"-c:a aac -b:a 128k -movflags +faststart \"{outPath}\"";
         var (ec, err) = await RunProcessAsync(ffmpeg, args, ct);
         if (ec != 0 || !File.Exists(outPath))
-            return Results.Problem($"ffmpeg tail failed (exit {ec}): {err.Substring(0, Math.Min(err.Length, 1500))}");
+            return Results.Problem($"ffmpeg slice failed (exit {ec}): {err.Substring(0, Math.Min(err.Length, 1500))}");
 
         var mp4 = await File.ReadAllBytesAsync(outPath, ct);
         var account = Cfg(cfg, "STORAGE_ACCOUNT");
         var svc = new BlobServiceClient(new Uri($"https://{account}.blob.core.windows.net"), cred);
         var container = svc.GetBlobContainerClient(cfg["STORAGE_CONTAINER"] ?? "videos");
-        var name = $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-tail-{Guid.NewGuid():N}.mp4";
+        var tag = req.FromEnd == true ? "tail" : "slice";
+        var name = $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{tag}-{Guid.NewGuid():N}.mp4";
         var url = await UploadAndSign(container, name, mp4, "video/mp4", svc, account, ct);
-        return Results.Ok(new { url, blob = name, seconds, bytes = mp4.Length });
+        return Results.Ok(new { url, blob = name, seconds = dur, startSec = req.StartSec, fromEnd = req.FromEnd ?? (req.StartSec is null), bytes = mp4.Length });
     }
     finally
     {
         try { Directory.Delete(work, recursive: true); } catch { }
     }
+}
+
+// 3d. Remix: invoke Sora-2's native remix endpoint — generates a NEW video that
+//     preserves the framework (subject identity, lighting, lens) of an existing
+//     finished video while applying narrow textual edits. Strongest single lever
+//     for cross-clip character consistency: clip 2..N "remix from clip 1" inherit
+//     the rendered character pixel-natively rather than via prompt re-description.
+//
+//     Body: { videoId: "video_xxx", prompt: "...", seconds?: 4|8|12, size?: "WxH" }
+//     Returns the Sora job object verbatim (id, status, ...) — frontend polls/finalizes
+//     identically to /api/jobs.
+app.MapPost("/api/remix", async (RemixRequest req, IHttpClientFactory hf,
+    IConfiguration cfg, CancellationToken ct) =>
+{
+    if (string.IsNullOrWhiteSpace(req.VideoId))
+        return Results.BadRequest(new { error = "videoId is required" });
+    if (string.IsNullOrWhiteSpace(req.Prompt))
+        return Results.BadRequest(new { error = "prompt is required" });
+
+    var (baseUrl, apiKey, _) = AoaiCfg(cfg);
+    var client = hf.CreateClient();
+    client.Timeout = TimeSpan.FromMinutes(2);
+
+    // Sora-2 remix payload mirrors POST /videos shape; only supplies the delta-prompt.
+    var payload = new Dictionary<string, object?>
+    {
+        ["prompt"] = req.Prompt
+    };
+    if (req.Seconds.HasValue) payload["seconds"] = req.Seconds.Value.ToString();
+    if (!string.IsNullOrWhiteSpace(req.Size)) payload["size"] = req.Size;
+
+    using var msg = new HttpRequestMessage(HttpMethod.Post,
+        $"{baseUrl}/openai/v1/videos/{Uri.EscapeDataString(req.VideoId!)}/remix");
+    msg.Headers.Add("api-key", apiKey);
+    msg.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+    using var resp = await client.SendAsync(msg, ct);
+    var body = await resp.Content.ReadAsStringAsync(ct);
+    if (!resp.IsSuccessStatusCode)
+        return Results.Problem($"Remix failed ({(int)resp.StatusCode}): {body}");
+    return Results.Content(body, "application/json");
 });
 
 // 4. Narrate: synthesize speech via Azure Speech, upload MP3, return SAS URL.
@@ -667,6 +735,7 @@ Return a SINGLE valid JSON object — no prose, no markdown — matching this sc
 {{
   ""style"": ""<one line, film stock + grade + aesthetic. e.g. 'Photorealistic, Arri Alexa, 35mm anamorphic, warm naturalistic grade, shallow DOF, subtle film grain.'>"",
   ""characterAnchor"": ""<3-5 distinctive repeatable details in one sentence: gender/age/hair/wardrobe/build. This exact string will be PASTED VERBATIM into every segment, so make it concrete.>"",
+  ""distinctiveTraits"": ""<3-5 NON-FACE identifiers that survive AI drift, comma-separated. Each must be a CONCRETE visible signature: distinctive clothing item with colour and texture, accessory, prop carried, scar/birthmark/tattoo with location, hair ornament, footwear with detail, and at least ONE high-contrast saturated colour element (e.g. 'bright cobalt-blue bandana on left wrist'). These are what locks identity across clips when faces drift; pick traits easy to redraw and easy to spot. Avoid anything face-shape or skin-tone dependent.>"",
   ""sceneAnchor"": ""<2-3 sentences: environment with concrete nouns, time of day, weather, palette of 3-5 anchor colors, 1-2 small ambient details. Pasted verbatim into every segment.>"",
   ""cinematography"": ""<multi-line block: 'Camera shot: ...\nCamera motion: ...\nLens: 50mm spherical, f/2.0, shallow DOF\nLighting: ...\nMood: ...' — keep the lens/lighting/grade IDENTICAL across all segments by stating them once here.>"",
   ""voiceDescription"": ""<one sentence describing the speaker's vocal character: gender ({gender}), age range, timbre, pace, accent ({langName}). Pasted verbatim into every segment so Sora produces a consistent voice.>"",
@@ -691,7 +760,8 @@ Return a SINGLE valid JSON object — no prose, no markdown — matching this sc
 
 Hard rules:
 - Output ONLY the JSON object. No markdown fences. No prose.
-- The five anchors (style/characterAnchor/sceneAnchor/cinematography/voiceDescription/backgroundSound) MUST stay constant across segments — they describe the unchanging world. The segments array carries the changing action.
+- The five anchors (style/characterAnchor/distinctiveTraits/sceneAnchor/cinematography/voiceDescription/backgroundSound) MUST stay constant across segments — they describe the unchanging world. The segments array carries the changing action.
+- distinctiveTraits is a CONSISTENCY LIFELINE: when a viewer looks at clip 5 they should still see the same wrist-bandana, same scar location, same prop. Be specific.
 - Every segment's beats describe DISTINCT progression. Segment N must logically continue from segment N-1's last beat.
 - Dialogue must be embedded verbatim in the supplied script; never translate it; never invent extra lines.
 - {beatCount} beats per segment is the target.";
@@ -792,3 +862,5 @@ public record EnhanceRequest(string Prompt, string? Narration, string? Voice, in
 public record StitchRequest(string[] Urls, double? Crossfade);
 public record IdentityRequest(string VideoUrl, string? OriginalAnchor);
 public record TailRequest(string VideoUrl, double? Seconds, string? Size);
+public record SliceRequest(string VideoUrl, double? StartSec, double? DurationSec, string? Size, bool? FromEnd);
+public record RemixRequest(string VideoId, string Prompt, int? Seconds, string? Size);

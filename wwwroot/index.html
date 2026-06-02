@@ -342,7 +342,8 @@ function App() {
   const [finalPrompt, setFinalPrompt] = useState("");
   const [plan, setPlan] = useState(null);
   const [segSummaries, setSegSummaries] = useState([]);
-  const [identityBible, setIdentityBible] = useState(null); // { characterDescriptor, wardrobe, sceneDescriptor, palette, lensLightingNotes }
+  const [identityBible, setIdentityBible] = useState(null); // { characterDescriptor, wardrobe, sceneDescriptor, palette, lensLightingNotes, distinctiveTraits }
+  const [useRemix, setUseRemix] = useState(true); // #1: clips 2..N remix-from-clip-1 (native identity preservation)
   const [enhancing, setEnhancing] = useState(false);
   const [running, setRunning] = useState(false);
   const [status, setStatus] = useState({ phase: "idle", pct: 0, label: "ready" });
@@ -485,9 +486,15 @@ function App() {
     const seg = segs[k] || {};
     const N = segs.length;
     const useBible = !!bible && k >= 1;
+    // Distinctive traits string: prefer the empirical bible trait list (post clip-1)
+    // and fall back to the LLM-planned traits. These get echoed in EVERY segment
+    // verbatim as the consistency lifeline (#8).
+    const traits = (useBible && bible.distinctiveTraits) ? bible.distinctiveTraits
+                  : (planObj.distinctiveTraits || "");
     const characterLine = useBible
       ? `Character (LOCKED identity bible from clip 1 — match these features exactly): ${bible.characterDescriptor || planObj.characterAnchor || ""}\n  Wardrobe (identical to clip 1, every item): ${bible.wardrobe || ""}`
       : `Character (use this exact description anywhere the speaker is referenced): ${planObj.characterAnchor || ""}`;
+    const traitsLine = traits ? `Distinctive identity markers (MUST appear in every frame, identical position and colour): ${traits}` : "";
     const sceneLine = useBible
       ? `Scene (locked from clip 1): ${bible.sceneDescriptor || planObj.sceneAnchor || ""}\n  Anchor palette: ${(bible.palette || []).join(", ")}\n  Lens & lighting (identical to clip 1): ${bible.lensLightingNotes || ""}`
       : `Scene: ${planObj.sceneAnchor || ""}`;
@@ -503,16 +510,19 @@ function App() {
     const continuity = k === 0 ? ""
       : `\nContinuity directives:\n  - DIRECT CONTINUATION. The first frame matches the last frame of segment ${k} exactly.\n  - SAME character${useBible ? " — match the locked identity bible above pixel-for-pixel (face, hair, skin, every wardrobe item)" : " (use the Character anchor below verbatim)"}, SAME wardrobe, SAME environment, SAME lens & focal length, SAME lighting setup and color grade.\n  - SAME voice timbre, pitch, accent and speaking pace as the previous segment.\n  - The diegetic background sound bed continues uninterrupted: ${planObj.backgroundSound || ""}.\n  - No cut, no fade, no recap. Motion and audio pick up immediately.`;
     return [
+      `=== IDENTITY LOCK (bit-identical across all clips — do not paraphrase) ===`,
       `Style: ${planObj.style || ""}`,
       ``,
       sceneLine,
       ``,
       characterLine,
+      traitsLine,
       ``,
       `Cinematography:`,
       planObj.cinematography || "",
       ``,
       `Voice: ${planObj.voiceDescription || ""}`,
+      `=== END IDENTITY LOCK ===`,
       previously,
       ``,
       `This segment is segment ${k+1} of ${N} (time ${seg.startSec}\u2013${seg.endSec}s of the full ${segs[N-1]?.endSec || ""}s arc).`,
@@ -557,6 +567,33 @@ function App() {
     const blob = await new Promise(res => canvas.toBlob(res, "image/jpeg", 0.92));
     if (!blob) throw new Error("canvas.toBlob returned null");
     return new File([blob], "lastframe.jpg", { type: "image/jpeg" });
+  }
+
+  // Remix attempt: ask Sora-2 to generate clip k as a delta-edit of an earlier video.
+  // Returns the finalized clip object (same shape as runOneClip) or throws.
+  // The remix endpoint preserves character/lighting/lens natively — strongest
+  // single lever for cross-clip identity (#1).
+  async function runOneClipViaRemix(sourceVideoId, thePrompt, chunkSec, label, basePct, spanPct) {
+    setStatus(s => ({ ...s, label: `${label}: remix from clip 1, submitting`, pct: basePct }));
+    const r = await fetch("/api/remix", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ videoId: sourceVideoId, prompt: thePrompt, seconds: chunkSec, size })
+    });
+    if (!r.ok) {
+      const t = await r.text();
+      throw new Error(`remix submit ${r.status}: ${t.slice(0, 300)}`);
+    }
+    const job = JSON.parse(await r.text());
+    const etaMs = chunkSec * 15_000;
+    await poll(job.id, (st, elapsed) => {
+      const frac = Math.min(0.98, elapsed / etaMs);
+      const ss = Math.round(elapsed / 1000);
+      setStatus(s => ({ ...s, label: `${label}: remix ${st} (${ss}s)`, pct: basePct + spanPct * frac }));
+    });
+    setStatus(s => ({ ...s, label: `${label}: remix finalizing`, pct: basePct + spanPct }));
+    const fr = await fetch(`/api/jobs/${job.id}/finalize`, { method: "POST" });
+    return await jsonOrThrow(fr);
   }
 
   // One Sora attempt: submit + poll + finalize. Returns finalized clip object.
@@ -607,6 +644,7 @@ function App() {
       const priorSummaries = [];
       let prevFrame = null;
       let bible = null;
+      let firstClipVideoId = null;
       // Show ETA up front so the wait is expected, not surprising.
       const etaSec = chunks * (chunkSize <= 4 ? 60 : chunkSize <= 8 ? 100 : 150);
       const etaMin = Math.ceil(etaSec / 60);
@@ -625,19 +663,37 @@ function App() {
         const basePct = 2 + (i / chunks) * 95;
         const spanPct = (1 / chunks) * 90;
         let fj;
-        try {
-          fj = await runOneClip(thePrompt, segSec, prevFrame, label, basePct, spanPct);
-        } catch (e) {
-          // One retry without input_reference if Sora rejects the anchor ("Job failed" right after submit).
-          if (prevFrame && /Job (failed|cancelled)/i.test(e.message)) {
-            dbg("warn", `${label} failed with anchor — retrying without input_reference`);
-            fj = await runOneClip(thePrompt, segSec, null, `${label} (retry)`, basePct, spanPct);
-          } else {
-            throw e;
+        // Strategy ladder for clips 2..N (#1 → #3 fallback chain):
+        //   1. Try Sora-2 remix from clip 1 (native identity preservation).
+        //   2. On remix failure, fall back to fresh job with 4s tail anchor.
+        //   3. On anchor rejection, retry without anchor.
+        const tryRemix = i >= 1 && usePlan && firstClipVideoId && useRemix;
+        if (tryRemix) {
+          try {
+            fj = await runOneClipViaRemix(firstClipVideoId, thePrompt, segSec, label, basePct, spanPct);
+            dbg("ok", `${label} rendered via remix from clip 1 (${firstClipVideoId})`);
+          } catch (e) {
+            dbg("warn", `${label} remix failed (${e.message}); falling back to fresh + tail anchor`);
+            fj = null;
+          }
+        }
+        if (!fj) {
+          try {
+            fj = await runOneClip(thePrompt, segSec, prevFrame, label, basePct, spanPct);
+          } catch (e) {
+            // One retry without input_reference if Sora rejects the anchor ("Job failed" right after submit).
+            if (prevFrame && /Job (failed|cancelled)/i.test(e.message)) {
+              dbg("warn", `${label} failed with anchor — retrying without input_reference`);
+              fj = await runOneClip(thePrompt, segSec, null, `${label} (retry)`, basePct, spanPct);
+            } else {
+              throw e;
+            }
           }
         }
         finals.push({ ...fj, seconds: segSec, size });
         setOuts([...finals]);
+        // Capture clip 1's videoId so subsequent clips can remix from it.
+        if (i === 0 && fj.videoId) firstClipVideoId = fj.videoId;
         if (usePlan) {
           const sum = plan.segments[i].summary || "";
           priorSummaries.push(sum);
@@ -823,6 +879,13 @@ function App() {
                   </optgroup>
                 `)}
               </select>
+            </div>
+            <div style=${{marginTop:12,display:"flex",gap:8,alignItems:"flex-start"}}>
+              <input type="checkbox" id="useRemix" checked=${useRemix} onChange=${e => setUseRemix(e.target.checked)} style=${{marginTop:3}} />
+              <label htmlFor="useRemix" style=${{cursor:"pointer"}}>
+                <strong>Lock character via Sora-2 remix</strong>
+                <div class="muted small">Clips 2..N are generated as remix-edits of clip 1 (native identity preservation). Falls back to fresh + 4s tail anchor if remix fails.</div>
+              </label>
             </div>
           </Accordion>
           <Accordion title="Reference image (optional)">
