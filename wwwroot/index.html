@@ -327,8 +327,8 @@ async function run() {
   const stitched = chunks.length > 1;
 
   const t0 = Date.now();
-  // ~22s of generation per second of output, in parallel across chunks
-  const expected = Math.max(20, Math.max(...chunks) * 22);
+  // Sequential: ~22s of generation per second of output, summed across chunks
+  const expected = Math.max(20, chunks.reduce((a,b)=>a+b,0) * 22);
 
   const fakePct = () => {
     const t = (Date.now() - t0) / 1000;
@@ -342,9 +342,9 @@ async function run() {
 
   try {
     setStatus("in_progress",
-      stitched ? `submitting ${chunks.length} clips (×${chunks[0]}s) in parallel…` : "submitting…");
+      stitched ? `rendering ${chunks.length} clips sequentially (Sora-2 allows 1 at a time)…` : "submitting…");
 
-    // 1) Submit all chunks in parallel, with continuity hints for stitched runs
+    // Submit + poll one chunk at a time (Sora-2 deployment allows only 1 running task).
     const submitOne = async (sec, idx) => {
       const fd = new FormData();
       const promptForChunk = stitched
@@ -357,25 +357,20 @@ async function run() {
       fd.append("size", $("#size").value);
       // Reference file applies to the first clip only (Sora limit)
       if (idx === 0 && pickedFile) fd.append("inputReference", pickedFile);
-      const r = await fetch("/api/jobs", { method: "POST", body: fd });
-      const txt = await r.text();
-      if (!r.ok) throw new Error(`Clip ${idx+1}: ${txt}`);
-      return JSON.parse(txt);
+      // Retry on 429 "Too many running tasks" with backoff (handles edge race)
+      for (let attempt = 0; attempt < 8; attempt++) {
+        const r = await fetch("/api/jobs", { method: "POST", body: fd });
+        const txt = await r.text();
+        if (r.ok) return JSON.parse(txt);
+        if (r.status === 500 && /Too many running tasks/i.test(txt)) {
+          await new Promise(res => setTimeout(res, 5000 + attempt * 2000));
+          continue;
+        }
+        throw new Error(`Clip ${idx+1}: ${txt}`);
+      }
+      throw new Error(`Clip ${idx+1}: still rate-limited after retries`);
     };
-    const jobs = await Promise.all(chunks.map((s, i) => submitOne(s, i)));
 
-    // 2) Kick off TTS in parallel if narration present
-    const narration = $("#narration").value.trim();
-    let narrationPromise = null;
-    if (narration) {
-      narrationPromise = fetch("/api/narrate", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ text: narration, voice: $("#voice").value })
-      }).then(async r => { const t = await r.text(); if (!r.ok) throw new Error(t); return JSON.parse(t); });
-    }
-
-    // 3) Poll all jobs until each is terminal
     const pollOne = async (job) => {
       let last = job;
       while (true) {
@@ -390,19 +385,38 @@ async function run() {
         last = JSON.parse(txt);
       }
     };
-    let completedCount = 0;
-    const polls = jobs.map(j => pollOne(j).then(r => {
-      completedCount++;
-      setStatus("in_progress", `rendered ${completedCount}/${jobs.length} clip(s)…`);
-      return r;
-    }));
-    const finals = await Promise.all(polls);
+
+    // 1) Kick off TTS in parallel if narration present (independent of Sora queue)
+    const narration = $("#narration").value.trim();
+    let narrationPromise = null;
+    if (narration) {
+      narrationPromise = fetch("/api/narrate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: narration, voice: $("#voice").value })
+      }).then(async r => { const t = await r.text(); if (!r.ok) throw new Error(t); return JSON.parse(t); });
+    }
+
+    // 2) Submit + render one clip at a time
+    const jobs = [];
+    const finals = [];
+    for (let i = 0; i < chunks.length; i++) {
+      setStatus("in_progress",
+        stitched ? `submitting clip ${i+1}/${chunks.length}…` : "submitting…");
+      const job = await submitOne(chunks[i], i);
+      jobs.push(job);
+      setStatus("in_progress",
+        stitched ? `rendering clip ${i+1}/${chunks.length}…` : "rendering…");
+      const final = await pollOne(job);
+      finals.push(final);
+      setStatus("in_progress", `rendered ${i+1}/${chunks.length} clip(s)…`);
+    }
 
     run._done = true;
     setStatus("completed", "saving to storage…", 96);
     $("#barFill").style.width = "96%";
 
-    // 4) Finalize all clips in parallel (download from Sora -> blob -> SAS URL)
+    // 3) Finalize all clips in parallel (download from Sora -> blob -> SAS URL)
     const outs = await Promise.all(jobs.map(async j => {
       const r = await fetch(`/api/jobs/${j.id}/finalize`, { method: "POST" });
       const txt = await r.text();
@@ -410,7 +424,7 @@ async function run() {
       return JSON.parse(txt);
     }));
 
-    // 5) Resolve narration
+    // 4) Resolve narration
     let narr = null;
     if (narrationPromise) {
       try { narr = await narrationPromise; }
