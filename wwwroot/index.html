@@ -308,7 +308,32 @@ const DURATIONS = [
   { v: 4, label: "4s" }, { v: 8, label: "8s" }, { v: 12, label: "12s" },
   { v: 24, label: "24s (×2)" }, { v: 36, label: "36s (×3)" }, { v: 48, label: "48s (×4)" },
 ];
-const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// Interruptible sleep: when the tab is backgrounded on mobile, browsers throttle
+// setTimeout (often to 1×/min) which makes long render polls appear "dead".
+// We track every pending sleep so wakeAllSleeps() — fired on visibilitychange to
+// `visible` — resolves them all immediately, snapping the poll loop back to life
+// the instant the user returns to the tab.
+const _pendingSleeps = new Set();
+function sleep(ms) {
+  return new Promise(resolve => {
+    let done = false;
+    const fire = () => { if (done) return; done = true; clearTimeout(t); _pendingSleeps.delete(fire); resolve(); };
+    const t = setTimeout(fire, ms);
+    _pendingSleeps.add(fire);
+  });
+}
+function wakeAllSleeps() {
+  for (const fn of Array.from(_pendingSleeps)) { try { fn(); } catch {} }
+}
+if (typeof document !== "undefined") {
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") wakeAllSleeps();
+  });
+  // Also wake on focus (covers some mobile browsers that don't fire visibilitychange reliably).
+  window.addEventListener("focus", wakeAllSleeps);
+  window.addEventListener("pageshow", wakeAllSleeps);
+}
 
 async function jsonOrThrow(r) {
   const txt = await r.text();
@@ -407,6 +432,39 @@ function App() {
   const [craftProgress, setCraftProgress] = useState(null);
   const craftJobIdRef = useRef(null);
   const [running, setRunning] = useState(false);
+
+  // Wake Lock: keep the screen on during generation so mobile browsers don't
+  // suspend the tab when the user puts the phone down. The lock auto-releases
+  // when the tab goes to background; we re-acquire it on visibilitychange.
+  // Falls back gracefully on browsers without the API (older Safari, etc.).
+  const wakeLockRef = useRef(null);
+  useEffect(() => {
+    let cancelled = false;
+    async function acquire() {
+      if (!running) return;
+      if (!("wakeLock" in navigator)) { dbg("warn", "wakeLock API not available — screen may sleep during render"); return; }
+      try {
+        const lock = await navigator.wakeLock.request("screen");
+        if (cancelled) { try { await lock.release(); } catch {} return; }
+        wakeLockRef.current = lock;
+        lock.addEventListener("release", () => { dbg("info", "wakeLock released by browser"); });
+        dbg("ok", "wakeLock acquired — screen will stay on while rendering");
+      } catch (e) { dbg("warn", `wakeLock request failed: ${e.message}`); }
+    }
+    async function release() {
+      const lock = wakeLockRef.current; wakeLockRef.current = null;
+      if (lock) { try { await lock.release(); } catch {} }
+    }
+    if (running) {
+      acquire();
+      // Re-acquire when the user returns to the tab (Wake Lock is auto-released on hide).
+      const onVis = () => { if (document.visibilityState === "visible" && running && !wakeLockRef.current) acquire(); };
+      document.addEventListener("visibilitychange", onVis);
+      return () => { cancelled = true; document.removeEventListener("visibilitychange", onVis); release(); };
+    } else {
+      release();
+    }
+  }, [running]);
   const [status, setStatus] = useState({ phase: "idle", pct: 0, label: "ready" });
   const [outs, setOuts] = useState([]);
   const [stitched, setStitched] = useState(null); // { url, clips, crossfade } or null
