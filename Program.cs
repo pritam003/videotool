@@ -559,13 +559,12 @@ app.MapPost("/api/remix", async (RemixRequest req, IHttpClientFactory hf,
     var client = hf.CreateClient();
     client.Timeout = TimeSpan.FromMinutes(2);
 
-    // Sora-2 remix payload mirrors POST /videos shape; only supplies the delta-prompt.
+    // Sora-2 remix payload only accepts `prompt`. The remix inherits seconds/size
+    // from the source clip; passing them returns 400 "Unknown parameter".
     var payload = new Dictionary<string, object?>
     {
         ["prompt"] = req.Prompt
     };
-    if (req.Seconds.HasValue) payload["seconds"] = req.Seconds.Value.ToString();
-    if (!string.IsNullOrWhiteSpace(req.Size)) payload["size"] = req.Size;
 
     using var msg = new HttpRequestMessage(HttpMethod.Post,
         $"{baseUrl}/openai/v1/videos/{Uri.EscapeDataString(req.VideoId!)}/remix");

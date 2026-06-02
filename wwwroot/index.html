@@ -753,33 +753,18 @@ function App() {
           }
         }
         if (i < chunks - 1) {
-          // Phase 2: prefer a 4s tail clip as the visual anchor (Sora-2 accepts up
-          // to 5s of video as input_reference, providing far richer identity signal
-          // than a single still frame). Fall back to a JPEG last-frame if /api/tail
-          // or Sora rejects the video reference.
+          // Use a JPEG last-frame as the visual anchor. The 4s MP4 tail (sent via
+          // /api/tail + Sora input_reference) is rejected by orgs that lack the
+          // "Video inpaint" capability with: "Video inpaint is not available for
+          // your organization." JPEG input_reference is universally accepted.
           prevFrame = null;
           try {
-            setStatus(s => ({ ...s, label: `${label}: capturing 4s tail anchor` }));
-            const tr = await fetch("/api/tail", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ videoUrl: fj.url, seconds: 4, size })
-            });
-            const tj = await jsonOrThrow(tr);
-            const tailResp = await fetch(tj.url);
-            if (!tailResp.ok) throw new Error(`tail download ${tailResp.status}`);
-            const tailBlob = await tailResp.blob();
-            prevFrame = new File([tailBlob], "tail.mp4", { type: "video/mp4" });
-            dbg("ok", `4s tail anchor ready (${(tailBlob.size/1024).toFixed(0)}KB) for clip ${i+2}`);
+            setStatus(s => ({ ...s, label: `${label}: capturing last-frame anchor` }));
+            prevFrame = await extractLastFrame(fj.url, W, H);
+            dbg("ok", `last-frame anchor captured (${prevFrame.size} bytes) for clip ${i+2}`);
           } catch (e) {
-            dbg("warn", `tail anchor failed (${e.message}); falling back to last-frame JPEG`);
-            try {
-              prevFrame = await extractLastFrame(fj.url, W, H);
-              dbg("ok", `last-frame captured (${prevFrame.size} bytes) for clip ${i+2} anchor`);
-            } catch (e2) {
-              dbg("warn", "last-frame extraction also failed; continuing with plan-based continuity only", e2.message);
-              prevFrame = null;
-            }
+            dbg("warn", `last-frame extraction failed (${e.message}); continuing with plan-based continuity only`);
+            prevFrame = null;
           }
         }
       }
