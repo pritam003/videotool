@@ -1077,15 +1077,22 @@ Plan now. Output JSON only.";
 
 {LOCKS}
 
+CHARACTER LOCK PROTOCOL — strict, mandatory:
+  • Take the plan's identityBible.characterAnchor and identityBible.distinctiveTraits as a single canonical block.
+  • Every single segment prompt MUST begin with that block reproduced VERBATIM, word-for-word, in the same order, with the same adjectives, colours, props, tattoos, hairstyle, age, build, accessories. Do NOT paraphrase, abbreviate, reorder, translate, or substitute synonyms in the lock block.
+  • After the lock block, append a single sentence: ""Reproduce these identity anchors identically in every frame; do not introduce new wardrobe, props, hair, or facial features.""
+  • Then continue with scene/cinematography/beats/dialogue.
+  • The lock block MUST be IDENTICAL string content across all {segmentCount} segments. A reader diffing segment 1 prompt vs segment {segmentCount} prompt should see the first paragraph match exactly.
+
 Each segment prompt MUST follow this template internally (but write it as flowing paragraphs, no labels):
-  [STYLE line] → [character anchor sentence] → [distinctive traits sentence] → [scene anchor sentences] → [cinematography block] → [face-occlusion device statement] → [beats as numbered actions with timestamps] → [dialogue if present] → [voice description] → [background sound] → [negative prompt: 'no on-screen text, no captions, no logos, no watermarks, no extra speakers, no duplicated limbs, no fantasy elements (unless ask permits), no impossible physics']
+  [CHARACTER LOCK BLOCK — verbatim from identityBible, identical across all segments] → [STYLE line] → [scene anchor sentences] → [cinematography block] → [face-occlusion device statement] → [beats as numbered actions with timestamps] → [dialogue if present] → [voice description] → [background sound] → [negative prompt: 'no on-screen text, no captions, no logos, no watermarks, no extra speakers, no duplicated limbs, no fantasy elements (unless ask permits), no impossible physics']
 
 OUTPUT SCHEMA:
 {{
   ""segments"": [
     {{
       ""index"": 1,
-      ""prompt"": ""<the full Sora-2 prompt as a single string, 200-500 words, flowing paragraphs not bullet points>"",
+      ""prompt"": ""<the full Sora-2 prompt as a single string, 200-500 words, flowing paragraphs not bullet points, MUST start with the verbatim CHARACTER LOCK block>"",
       ""dialogue"": ""<verbatim line or null>"",
       ""seconds"": {chunkSeconds}
     }}
@@ -1180,6 +1187,55 @@ Score, list deviations, and emit refinedSegments now. Output JSON only.";
 
             // Layer 4: FINAL ASSEMBLY
             SetPhase("Assembling final prompt");
+
+            // SAFETY NET: enforce the character-lock invariant by prepending the
+            // canonical block to every segment prompt that doesn't already start
+            // with it. Even if the LLM drifted on iteration 5/5, the rendered
+            // prompts will be byte-identical in their identity preface, which is
+            // the single strongest signal against character drift across clips.
+            string characterLockBlock = "";
+            try
+            {
+                var ib = planJson.GetProperty("identityBible");
+                var ca = ib.TryGetProperty("characterAnchor", out var caEl) ? caEl.GetString() ?? "" : "";
+                var dt = ib.TryGetProperty("distinctiveTraits", out var dtEl) ? dtEl.GetString() ?? "" : "";
+                var fo = ib.TryGetProperty("faceOcclusionDevice", out var foEl) ? foEl.GetString() ?? "" : "";
+                if (!string.IsNullOrWhiteSpace(ca))
+                {
+                    characterLockBlock =
+                        "[CHARACTER LOCK — reproduce identically in every frame; do not paraphrase, do not introduce new wardrobe, props, hair, or facial features.] "
+                        + ca
+                        + (string.IsNullOrWhiteSpace(dt) ? "" : " Distinctive identity markers that must remain visible and consistent: " + dt + ".")
+                        + (string.IsNullOrWhiteSpace(fo) ? "" : " Face-occlusion device, kept consistent throughout: " + fo + ".");
+                }
+            }
+            catch { /* plan didn't include identityBible — leave block empty */ }
+
+            if (!string.IsNullOrWhiteSpace(characterLockBlock))
+            {
+                var segArr = currentSegments.EnumerateArray().ToArray();
+                var rebuilt = new List<object>();
+                foreach (var seg in segArr)
+                {
+                    var promptText = seg.GetProperty("prompt").GetString() ?? "";
+                    // Idempotent: only prepend if the prompt doesn't already lead
+                    // with the canonical block (within a small tolerance window).
+                    var trimmed = promptText.TrimStart();
+                    if (!trimmed.StartsWith("[CHARACTER LOCK", StringComparison.OrdinalIgnoreCase))
+                        promptText = characterLockBlock + "\n\n" + promptText;
+                    rebuilt.Add(new
+                    {
+                        index = seg.TryGetProperty("index", out var ix) ? ix.GetInt32() : 0,
+                        prompt = promptText,
+                        dialogue = seg.TryGetProperty("dialogue", out var dl) && dl.ValueKind != JsonValueKind.Null ? dl.GetString() : null,
+                        seconds = seg.TryGetProperty("seconds", out var sc) && sc.ValueKind == JsonValueKind.Number ? sc.GetInt32() : chunkSeconds,
+                        changeNote = seg.TryGetProperty("changeNote", out var cn) ? cn.GetString() : null
+                    });
+                }
+                // Replace currentSegments with the locked version for downstream use.
+                currentSegments = JsonSerializer.SerializeToElement(rebuilt);
+            }
+
             var combinedPrompt = new StringBuilder();
             foreach (var seg in currentSegments.EnumerateArray())
             {
