@@ -1189,7 +1189,7 @@ Narration to embed verbatim (distribute across segments naturally if non-empty):
 
 Plan now. Output JSON only.";
 
-            var planJson = await CallReasoner(planSys, planUser, 8000);
+            var planJson = await CallReasoner(planSys, planUser, 4000);
 
             // Layer 2: COMPILE
             SetPhase("Compiling Sora-2 segment prompts");
@@ -1226,7 +1226,7 @@ Output JSON only.";
 
 Compile the {segmentCount} segment prompts now. Output JSON only.";
 
-            var compiled = await CallReasoner(compileSys, compileUser, 12000);
+            var compiled = await CallReasoner(compileSys, compileUser, 6000);
 
             // Layer 3: CRITIC LOOP
             var iterations = new List<object>();
@@ -1278,7 +1278,7 @@ CURRENT SEGMENTS:
 
 Score, list deviations, and emit refinedSegments now. Output JSON only.";
 
-                var critique = await CallReasoner(criticSys, criticUser, 12000);
+                var critique = await CallReasoner(criticSys, criticUser, 6000);
                 var scores = critique.GetProperty("scores");
                 int faith = scores.GetProperty("faithfulness").GetInt32();
                 int real = scores.GetProperty("realism").GetInt32();
