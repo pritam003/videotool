@@ -370,12 +370,13 @@ function App() {
     finally { setEnhancing(false); }
   }
 
-  async function submitChunk(thePrompt, chunkSeconds) {
+  async function submitChunk(thePrompt, chunkSeconds, refOverride) {
     const fd = new FormData();
     fd.append("prompt", thePrompt);
     fd.append("seconds", String(chunkSeconds));
     fd.append("size", size);
-    if (refFile) fd.append("inputReference", refFile);
+    const ref = refOverride || refFile;
+    if (ref) fd.append("inputReference", ref);
     for (let attempt = 0; attempt < 8; attempt++) {
       const r = await fetch("/api/jobs", { method: "POST", body: fd });
       const txt = await r.text();
@@ -400,6 +401,36 @@ function App() {
     }
   }
 
+  // Extract last frame of a video URL as a JPEG File for use as Sora input_reference.
+  // Storage account must have CORS GET allowed for this origin (already configured).
+  async function extractLastFrame(url, w, h) {
+    const v = document.createElement("video");
+    v.crossOrigin = "anonymous";
+    v.muted = true;
+    v.playsInline = true;
+    v.preload = "auto";
+    v.src = url;
+    await new Promise((res, rej) => {
+      v.onloadedmetadata = () => res();
+      v.onerror = () => rej(new Error("video load failed (CORS?)"));
+      setTimeout(() => rej(new Error("video load timeout")), 15000);
+    });
+    const target = Math.max(0, (v.duration || 0) - 0.05);
+    await new Promise((res, rej) => {
+      v.onseeked = () => res();
+      v.onerror = () => rej(new Error("video seek failed"));
+      v.currentTime = target;
+      setTimeout(() => rej(new Error("video seek timeout")), 8000);
+    });
+    const canvas = document.createElement("canvas");
+    canvas.width = w || v.videoWidth;
+    canvas.height = h || v.videoHeight;
+    canvas.getContext("2d").drawImage(v, 0, 0, canvas.width, canvas.height);
+    const blob = await new Promise(res => canvas.toBlob(res, "image/jpeg", 0.92));
+    if (!blob) throw new Error("canvas.toBlob returned null");
+    return new File([blob], "lastframe.jpg", { type: "image/jpeg" });
+  }
+
   async function run() {
     const finalText = finalPrompt.trim() || prompt.trim();
     if (!finalText) { toast("Enter a prompt first.", true); return; }
@@ -408,16 +439,30 @@ function App() {
       // Sora-2 chunks
       const chunkSize = Math.min(seconds, 12);
       const chunks = Math.ceil(seconds / chunkSize);
+      const [W, H] = size.split("x").map(Number);
       const finals = [];
+      let prevFrame = null; // last frame of previous chunk → input_reference for next
       for (let i = 0; i < chunks; i++) {
-        setStatus(s => ({ ...s, label: `clip ${i+1}/${chunks}: submitting`, pct: 5 + (i / chunks) * 80 }));
-        const job = await submitChunk(finalText, chunkSize);
+        const continuation = i === 0 ? "" :
+          `\n\n[Segment ${i+1}/${chunks} — DIRECT CONTINUATION of the previous segment. Same character (identical wardrobe, hair, face, build), same environment, same lighting, same lens, same color grade. SAME VOICE timbre, accent, pitch and pace as the previous segment. Same diegetic background sound bed continues uninterrupted. The first frame matches the previous segment's last frame; motion and audio pick up immediately with no cut, no fade, no recap.]`;
+        setStatus(s => ({ ...s, label: `clip ${i+1}/${chunks}: ${prevFrame ? "with last-frame anchor, " : ""}submitting`, pct: 5 + (i / chunks) * 80 }));
+        const job = await submitChunk(finalText + continuation, chunkSize, prevFrame);
         setStatus(s => ({ ...s, label: `clip ${i+1}/${chunks}: rendering`, pct: 10 + (i / chunks) * 80 }));
         await poll(job.id);
         const fr = await fetch(`/api/jobs/${job.id}/finalize`, { method: "POST" });
         const fj = await jsonOrThrow(fr);
         finals.push({ ...fj, seconds: chunkSize, size });
         setOuts([...finals]);
+        if (i < chunks - 1) {
+          try {
+            setStatus(s => ({ ...s, label: `clip ${i+1}/${chunks}: capturing last frame for continuity`, pct: 5 + ((i+1) / chunks) * 80 }));
+            prevFrame = await extractLastFrame(fj.url, W, H);
+            dbg("ok", `last-frame captured (${prevFrame.size} bytes) for clip ${i+2} anchor`);
+          } catch (e) {
+            dbg("warn", "last-frame extraction failed; continuing without anchor", e.message);
+            prevFrame = null;
+          }
+        }
       }
       setStatus({ phase: "done", pct: 100, label: "ready" });
       setRefreshLib(x => x + 1);
