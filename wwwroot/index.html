@@ -341,6 +341,17 @@ async function jsonOrThrow(r) {
   try { return JSON.parse(txt); } catch { return txt; }
 }
 
+// Decode the URL-safe base64 VAPID public key the server returns into the
+// Uint8Array form pushManager.subscribe() expects.
+function urlBase64ToUint8Array(b64) {
+  const padding = "=".repeat((4 - b64.length % 4) % 4);
+  const std = (b64 + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const raw = atob(std);
+  const out = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+  return out;
+}
+
 // ---------- App ----------
 function useTheme() {
   const [theme, setTheme] = useState(() => localStorage.getItem("theme") || "light");
@@ -465,6 +476,70 @@ function App() {
       release();
     }
   }, [running]);
+
+  // Web Push: register the service worker once on mount. The SW receives push
+  // events from our backend and shows a lock-screen / status-bar notification
+  // when each Sora chunk completes (so the user knows to come back to the tab,
+  // where Wake Lock + interruptible-sleep resume the next chunk). Notification
+  // permission is asked lazily — only the first time `run()` is started, so we
+  // never prompt unsolicited.
+  const swRegRef = useRef(null);
+  const pushSubRef = useRef(null);
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) { dbg("warn", "Service Worker API unavailable — no lock-screen notifications"); return; }
+    navigator.serviceWorker.register("/sw.js").then(reg => {
+      swRegRef.current = reg;
+      dbg("ok", "service worker registered");
+    }).catch(e => dbg("warn", `service worker register failed: ${e.message}`));
+    // Listen for taps on the OS notification — the SW posts a message to us so
+    // we can immediately wake any pending poll sleep and re-poll the job.
+    const onMsg = (e) => {
+      if (e.data?.type === "videotool:notification-click") {
+        dbg("info", `notification tapped (jobId=${e.data.jobId || "?"}) — kicking poll`);
+        wakeAllSleeps();
+      }
+    };
+    navigator.serviceWorker.addEventListener("message", onMsg);
+    return () => navigator.serviceWorker.removeEventListener("message", onMsg);
+  }, []);
+
+  // Helper: ensure notification permission, ensure a PushSubscription exists,
+  // and bind it to a specific Sora job ID server-side so the server pushes a
+  // notification when that job completes. Best-effort — silent on failure so a
+  // missing-API browser (iOS Safari without PWA install, Firefox private mode)
+  // never blocks the render.
+  async function pushSubscribeForJob(jobId, label) {
+    try {
+      if (!("Notification" in window)) return;
+      if (!swRegRef.current) return;
+      if (Notification.permission === "default") {
+        try { await Notification.requestPermission(); } catch {}
+      }
+      if (Notification.permission !== "granted") return;
+      let sub = pushSubRef.current || await swRegRef.current.pushManager.getSubscription();
+      if (!sub) {
+        const r = await fetch("/api/push/vapid-public-key");
+        const { publicKey } = await jsonOrThrow(r);
+        sub = await swRegRef.current.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(publicKey),
+        });
+        dbg("ok", `push subscription created (${sub.endpoint.slice(0, 60)}…)`);
+      }
+      pushSubRef.current = sub;
+      const json = sub.toJSON();
+      await fetch("/api/push/subscribe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jobId, label,
+          endpoint: json.endpoint,
+          keys: { p256dh: json.keys.p256dh, auth: json.keys.auth },
+        }),
+      });
+      dbg("ok", `push notifier armed for ${label} (jobId ${jobId.slice(0, 8)}…)`);
+    } catch (e) { dbg("warn", `push subscribe failed (${e.message}) — render will still work, just no lock-screen notification`); }
+  }
   const [status, setStatus] = useState({ phase: "idle", pct: 0, label: "ready" });
   const [outs, setOuts] = useState([]);
   const [stitched, setStitched] = useState(null); // { url, clips, crossfade } or null
@@ -849,6 +924,7 @@ function App() {
       throw new Error(`remix submit ${r.status}: ${t.slice(0, 300)}`);
     }
     const job = JSON.parse(await r.text());
+    pushSubscribeForJob(job.id, `${label} (remix)`);
     const etaMs = chunkSec * 15_000;
     await poll(job.id, (st, elapsed) => {
       const frac = Math.min(0.98, elapsed / etaMs);
@@ -864,6 +940,10 @@ function App() {
   async function runOneClip(thePrompt, chunkSec, ref, label, basePct, spanPct) {
     setStatus(s => ({ ...s, label: `${label}: ${ref ? "with anchor, " : ""}submitting`, pct: basePct }));
     const job = await submitChunk(thePrompt, chunkSec, ref);
+    // Arm a server-side watcher that will fire a lock-screen / status-bar push
+    // notification when this Sora job completes — critical when the phone is
+    // locked and the JS poll loop is suspended by the browser.
+    pushSubscribeForJob(job.id, label);
     // ETA: Sora-2 takes ~10s/sec of output. 12s clip ≈ 120s. Use 15s/sec as conservative ceiling.
     const etaMs = chunkSec * 15_000;
     await poll(job.id, (st, elapsed) => {

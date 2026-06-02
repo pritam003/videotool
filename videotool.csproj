@@ -9,6 +9,9 @@
   <ItemGroup>
     <PackageReference Include="Azure.Identity" Version="1.13.1" />
     <PackageReference Include="Azure.Storage.Blobs" Version="12.22.2" />
+    <!-- Web Push: server pushes lock-screen / status-bar notifications to subscribed
+         browsers (Android Chrome any tab; iOS Safari requires PWA install). -->
+    <PackageReference Include="WebPush" Version="1.0.12" />
   </ItemGroup>
 
 </Project>

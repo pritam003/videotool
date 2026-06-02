@@ -7,6 +7,7 @@ using Azure.Identity;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using Azure.Storage.Sas;
+using WebPush;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddHttpClient();
@@ -14,6 +15,12 @@ builder.Services.AddSingleton<TokenCredential>(new DefaultAzureCredential());
 // In-process job store for PromptCraft progress. F1 is single-instance so a
 // process-local dictionary is sufficient; jobs auto-evict after 10 minutes.
 builder.Services.AddSingleton<PromptCraftJobStore>();
+// Web Push: VAPID keys + subscription store + watcher registry. Auto-generates
+// keys on first start (persisted to /home/data/vapid.json on App Service Linux,
+// or ./vapid.json locally) so the operator doesn't have to set anything manually.
+builder.Services.AddSingleton<VapidConfig>(sp => VapidConfig.LoadOrCreate(sp.GetRequiredService<ILogger<VapidConfig>>()));
+builder.Services.AddSingleton<PushSubscriptionStore>();
+builder.Services.AddSingleton<SoraJobWatcherRegistry>();
 
 var app = builder.Build();
 app.UseDefaultFiles();
@@ -1338,6 +1345,113 @@ app.MapPost("/api/promptcraft/{jobId}/cancel", (string jobId, PromptCraftJobStor
     return Results.Ok(new { cancelled = true });
 });
 
+// ----- Web Push: VAPID key, subscriptions, per-Sora-job notifier -----------
+//
+// Goal: when the user's phone is locked / Chrome is backgrounded, the JS poll
+// loop is suspended by the browser, so the user never knows when each clip has
+// finished. To bridge that gap, the server polls Sora itself and sends a Web
+// Push notification on completion, which appears on the lock screen / status
+// bar. Tapping the notification refocuses the tab; the page's interruptible
+// sleep + Wake Lock then resume the JS render loop for the next chunk.
+
+app.MapGet("/api/push/vapid-public-key", (VapidConfig vapid) =>
+    Results.Ok(new { publicKey = vapid.PublicKey }));
+
+// Subscribe a browser to receive push notifications for a specific Sora job.
+// Body: { jobId, endpoint, keys: { p256dh, auth }, label? }.
+// Side effect: registers a server-side watcher Task that polls Sora until the
+// job reaches a terminal state, then fires one notification to all subs.
+app.MapPost("/api/push/subscribe", async (HttpRequest http, PushSubscriptionStore subs,
+    SoraJobWatcherRegistry registry, VapidConfig vapid, IHttpClientFactory hf,
+    IConfiguration cfg, ILogger<PushSubscriptionStore> log, CancellationToken ct) =>
+{
+    PushSubscribeBody? body;
+    try { body = await JsonSerializer.DeserializeAsync<PushSubscribeBody>(http.Body, cancellationToken: ct); }
+    catch { return Results.BadRequest(new { error = "invalid json" }); }
+    if (body is null || string.IsNullOrWhiteSpace(body.JobId) || string.IsNullOrWhiteSpace(body.Endpoint)
+        || body.Keys is null || string.IsNullOrWhiteSpace(body.Keys.P256dh) || string.IsNullOrWhiteSpace(body.Keys.Auth))
+        return Results.BadRequest(new { error = "jobId, endpoint, keys.p256dh, keys.auth required" });
+
+    subs.Add(body.JobId, new StoredPushSub(body.Endpoint, body.Keys.P256dh, body.Keys.Auth, body.Label ?? body.JobId));
+
+    // Start a one-shot watcher (idempotent: registry de-dupes by jobId).
+    registry.StartWatcher(body.JobId, async stoppingToken =>
+    {
+        var (baseUrl, apiKey, _) = AoaiCfg(cfg);
+        var client = hf.CreateClient();
+        client.DefaultRequestHeaders.Add("api-key", apiKey);
+        var elapsed = 0;
+        var consecutiveFails = 0;
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            // Match the client's polling cadence: less aggressive early, faster late.
+            var wait = elapsed < 60_000 ? 6000 : elapsed < 120_000 ? 4000 : 3000;
+            try { await Task.Delay(wait, stoppingToken); } catch { break; }
+            elapsed += wait;
+            string? status = null;
+            try
+            {
+                using var resp = await client.GetAsync($"{baseUrl}/openai/v1/videos/{body.JobId}", stoppingToken);
+                if ((int)resp.StatusCode == 429 || ((int)resp.StatusCode >= 500 && (int)resp.StatusCode <= 599))
+                {
+                    consecutiveFails++;
+                    if (consecutiveFails >= 12) { log.LogWarning("watcher {Id}: 12× transient {Code}, giving up", body.JobId, (int)resp.StatusCode); break; }
+                    continue;
+                }
+                consecutiveFails = 0;
+                if (!resp.IsSuccessStatusCode) { log.LogWarning("watcher {Id}: non-success {Code}", body.JobId, (int)resp.StatusCode); break; }
+                using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync(stoppingToken));
+                if (doc.RootElement.TryGetProperty("status", out var s)) status = s.GetString();
+            }
+            catch (OperationCanceledException) { break; }
+            catch (Exception ex) { log.LogWarning(ex, "watcher {Id}: poll error", body.JobId); consecutiveFails++; if (consecutiveFails >= 12) break; continue; }
+
+            if (status == "succeeded" || status == "completed")
+            {
+                await SendPushAsync(subs, vapid, body.JobId, $"Clip ready: {body.Label ?? body.JobId}",
+                    "Tap to return and continue rendering.", "videotool-clip", log);
+                break;
+            }
+            if (status == "failed" || status == "cancelled")
+            {
+                await SendPushAsync(subs, vapid, body.JobId, $"Clip {status}: {body.Label ?? body.JobId}",
+                    $"Sora job {status}. Open videotool to retry.", "videotool-clip", log);
+                break;
+            }
+        }
+    });
+
+    return Results.Ok(new { ok = true });
+});
+
+// Local helper used above.
+static async Task SendPushAsync(PushSubscriptionStore subs, VapidConfig vapid, string jobId,
+    string title, string body, string tag, ILogger log)
+{
+    var details = new VapidDetails("mailto:noreply@videotool.local", vapid.PublicKey, vapid.PrivateKey);
+    var pushClient = new WebPushClient();
+    var payload = JsonSerializer.Serialize(new { title, body, tag, jobId, ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() });
+    var dead = new List<StoredPushSub>();
+    foreach (var s in subs.Get(jobId))
+    {
+        try
+        {
+            var sub = new PushSubscription(s.Endpoint, s.P256dh, s.Auth);
+            await pushClient.SendNotificationAsync(sub, payload, details);
+        }
+        catch (WebPushException wpe) when ((int)wpe.StatusCode == 404 || (int)wpe.StatusCode == 410)
+        {
+            // Subscription is gone; clean up.
+            dead.Add(s);
+        }
+        catch (Exception ex)
+        {
+            log.LogWarning(ex, "push send failed for {Endpoint}", s.Endpoint);
+        }
+    }
+    foreach (var d in dead) subs.Remove(jobId, d);
+}
+
 app.Run();
 
 public record NarrateRequest(string Text, string? Voice);
@@ -1387,4 +1501,118 @@ public class PromptCraftJobStore
 
     public PromptCraftJob? Get(string id) =>
         _jobs.TryGetValue(id, out var j) ? j : null;
+}
+
+// ----- Web Push support types --------------------------------------------
+
+public record PushSubscribeBody(string JobId, string Endpoint, PushKeys Keys, string? Label);
+public record PushKeys(string P256dh, string Auth);
+public record StoredPushSub(string Endpoint, string P256dh, string Auth, string Label);
+
+// VAPID keys are required by the Web Push protocol to identify the application
+// server. We auto-generate on first run and persist to disk so subscriptions
+// survive restarts. On Azure App Service Linux, /home/data is a writable
+// persistent path; locally we fall back to ./vapid.json.
+public class VapidConfig
+{
+    public string PublicKey { get; init; } = "";
+    public string PrivateKey { get; init; } = "";
+
+    public static VapidConfig LoadOrCreate(ILogger<VapidConfig> log)
+    {
+        // Allow override via env vars / config (e.g. App Settings).
+        var envPub = Environment.GetEnvironmentVariable("VAPID_PUBLIC_KEY");
+        var envPriv = Environment.GetEnvironmentVariable("VAPID_PRIVATE_KEY");
+        if (!string.IsNullOrWhiteSpace(envPub) && !string.IsNullOrWhiteSpace(envPriv))
+        {
+            log.LogInformation("VAPID keys loaded from environment");
+            return new VapidConfig { PublicKey = envPub!, PrivateKey = envPriv! };
+        }
+
+        var dataDir = Directory.Exists("/home/data") ? "/home/data" : AppContext.BaseDirectory;
+        var path = Path.Combine(dataDir, "vapid.json");
+        if (File.Exists(path))
+        {
+            try
+            {
+                using var fs = File.OpenRead(path);
+                var loaded = JsonSerializer.Deserialize<VapidConfig>(fs);
+                if (loaded != null && !string.IsNullOrWhiteSpace(loaded.PublicKey) && !string.IsNullOrWhiteSpace(loaded.PrivateKey))
+                {
+                    log.LogInformation("VAPID keys loaded from {Path}", path);
+                    return loaded;
+                }
+            }
+            catch (Exception ex) { log.LogWarning(ex, "failed to load VAPID keys from {Path}; regenerating", path); }
+        }
+
+        var keys = VapidHelper.GenerateVapidKeys();
+        var cfg = new VapidConfig { PublicKey = keys.PublicKey, PrivateKey = keys.PrivateKey };
+        try
+        {
+            File.WriteAllText(path, JsonSerializer.Serialize(cfg));
+            log.LogInformation("VAPID keys generated and persisted to {Path}", path);
+        }
+        catch (Exception ex) { log.LogWarning(ex, "VAPID keys generated but could not persist to {Path} (in-memory only)", path); }
+        return cfg;
+    }
+}
+
+// In-memory store mapping Sora jobId → list of subscriptions interested in that
+// job. Subscriptions are added per render submission and removed when they
+// become invalid (404/410 from push gateway).
+public class PushSubscriptionStore
+{
+    private readonly ConcurrentDictionary<string, List<StoredPushSub>> _subs = new();
+
+    public void Add(string jobId, StoredPushSub sub)
+    {
+        var list = _subs.GetOrAdd(jobId, _ => new List<StoredPushSub>());
+        lock (list)
+        {
+            // De-dupe by endpoint so a re-subscribe doesn't fan out.
+            list.RemoveAll(s => s.Endpoint == sub.Endpoint);
+            list.Add(sub);
+        }
+    }
+
+    public IReadOnlyList<StoredPushSub> Get(string jobId)
+    {
+        if (!_subs.TryGetValue(jobId, out var list)) return Array.Empty<StoredPushSub>();
+        lock (list) return list.ToArray();
+    }
+
+    public void Remove(string jobId, StoredPushSub sub)
+    {
+        if (!_subs.TryGetValue(jobId, out var list)) return;
+        lock (list) list.RemoveAll(s => s.Endpoint == sub.Endpoint);
+    }
+}
+
+// Tracks active per-Sora-job watcher Tasks. Idempotent registration: calling
+// StartWatcher twice for the same jobId only spins one polling loop.
+public class SoraJobWatcherRegistry
+{
+    private readonly ConcurrentDictionary<string, CancellationTokenSource> _active = new();
+
+    public void StartWatcher(string jobId, Func<CancellationToken, Task> body)
+    {
+        // Drop completed watchers from earlier jobs.
+        foreach (var kv in _active.ToArray())
+            if (kv.Value.IsCancellationRequested) _active.TryRemove(kv.Key, out _);
+
+        var cts = new CancellationTokenSource();
+        if (!_active.TryAdd(jobId, cts)) { cts.Dispose(); return; } // already watching
+        cts.CancelAfter(TimeSpan.FromMinutes(20)); // hard ceiling so a stuck Sora poll never leaks
+
+        _ = Task.Run(async () =>
+        {
+            try { await body(cts.Token); }
+            catch { /* swallow; watcher errors must not crash the host */ }
+            finally
+            {
+                if (_active.TryRemove(jobId, out var owned)) owned.Dispose();
+            }
+        });
+    }
 }
