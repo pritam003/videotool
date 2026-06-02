@@ -345,55 +345,55 @@ app.MapPost("/api/enhance", async (EnhanceRequest req, IHttpClientFactory hf,
         @"(male|kunal|aarav|prabhat|madhur|rehaan|arjun|adam|andrew|alloy|echo|bashkar|niranjan|gagan|midhun|manohar|ojas|valluvar|mohan|salman)",
         System.Text.RegularExpressions.RegexOptions.IgnoreCase) ? "male" : "female";
 
-    var sys = $@"You are a senior film director writing a shot brief for OpenAI's Sora-2 text-to-video model (which generates synchronized native audio, dialogue, and lip-sync).
-Rewrite the user's idea into a structured, frame-by-frame cinematic prompt that follows OpenAI's official Sora-2 template EXACTLY in this order and with these exact section headers:
+    var sys = $@"You are a senior film director planning a short film for OpenAI's Sora-2 (text-to-video with synchronized native audio, dialogue and lip-sync).
+The film is {totalSeconds}s long, rendered as {segmentCount} sequential segment(s) of up to {chunkSeconds}s each that will be stitched together. Plan the WHOLE arc, then describe each segment so it FLOWS into the next with identical character, wardrobe, environment, lens, lighting, color grade, voice timbre and ambient sound.
 
-Style: <one line — film stock / aesthetic / era / grade. e.g. ""Photorealistic, shot on Arri Alexa, 35mm anamorphic, warm naturalistic grade, shallow DOF, subtle film grain.""  Avoid 'cinematic' alone; be specific.>
+Return a SINGLE valid JSON object — no prose, no markdown — matching this schema EXACTLY:
 
-Scene: <2-4 sentences of prose. Anchor the main character with 3-5 distinctive, repeatable details (age, hair, wardrobe, build) — these MUST be reused identically anywhere the character is referenced again. Describe the environment with concrete nouns (""wet cobblestone"", ""rust-streaked steel beams""), time of day, weather, and 3-5 palette anchor colors. Mention 1-2 small environmental details (dust motes, steam, reflections) for realism.>
-
-Cinematography:
-Camera shot: <framing + angle, e.g. ""medium close-up, eye-level"" or ""wide establishing, slight low angle"">
-Camera motion: <ONE clear move, e.g. ""slow 1ft dolly-in"" or ""static tripod"" or ""handheld follow"">
-Lens: <focal length + DOF, e.g. ""50mm spherical, shallow depth of field, f/2.0"">
-Lighting: <key + fill + rim with direction and color temperature, e.g. ""soft warm key from camera-left window, cool blue rim from street neon behind, low ambient fill"">
-Mood: <2-3 adjectives>
-
-Actions (frame-by-frame beats, exactly {beatCount} beats covering the {seconds}s clip in order):
-- Beat 1 (0–{seconds / beatCount}s): <one specific, visible action with counted movement — e.g. ""she takes two steps toward the window, hand brushing the curtain"". Include a camera/light note if it changes.>
-- Beat 2 (...): <next beat>
-- ... continue until Beat {beatCount}. Each beat = ONE concrete physical action and/or one short dialogue delivery. Place the dialogue line on the beat where it is spoken.
-
-Dialogue:
-{(string.IsNullOrWhiteSpace(translatedNarration) ? "<omit this entire section if no narration was given>" : "<ONE labeled line, EXACTLY as supplied — speaker label in English, then the line verbatim in the target script>")}
-
-Lip sync & performance: The on-screen speaker (gender: {gender}) is clearly visible, mouth open and forming the words of the line above in {langName}. Lip movements, jaw, and breath match the syllable rhythm of the {langName} line. No off-screen narrator. No dubbing. Native {langName} pronunciation.
-
-Background sound: <2-4 concrete diegetic sounds that match the environment — e.g. ""distant surf, gull calls, soft breeze through palm fronds"". No background music unless the user asked for it.>
-
-Negative: no on-screen text, no captions, no logos, no watermarks, no extra speakers, no duplicated limbs.
+{{
+  ""style"": ""<one line, film stock + grade + aesthetic. e.g. 'Photorealistic, Arri Alexa, 35mm anamorphic, warm naturalistic grade, shallow DOF, subtle film grain.'>"",
+  ""characterAnchor"": ""<3-5 distinctive repeatable details in one sentence: gender/age/hair/wardrobe/build. This exact string will be PASTED VERBATIM into every segment, so make it concrete.>"",
+  ""sceneAnchor"": ""<2-3 sentences: environment with concrete nouns, time of day, weather, palette of 3-5 anchor colors, 1-2 small ambient details. Pasted verbatim into every segment.>"",
+  ""cinematography"": ""<multi-line block: 'Camera shot: ...\nCamera motion: ...\nLens: 50mm spherical, f/2.0, shallow DOF\nLighting: ...\nMood: ...' — keep the lens/lighting/grade IDENTICAL across all segments by stating them once here.>"",
+  ""voiceDescription"": ""<one sentence describing the speaker's vocal character: gender ({gender}), age range, timbre, pace, accent ({langName}). Pasted verbatim into every segment so Sora produces a consistent voice.>"",
+  ""backgroundSound"": ""<2-4 concrete diegetic sounds matching the environment, comma-separated. Pasted verbatim into every segment so the ambient bed continues.>"",
+  ""negative"": ""no on-screen text, no captions, no logos, no watermarks, no extra speakers, no duplicated limbs"",
+  ""segments"": [
+    {{
+      ""index"": 1,
+      ""startSec"": 0,
+      ""endSec"": {chunkSeconds},
+      ""summary"": ""<one short sentence describing what happens in this segment, written in past tense from the perspective of a later segment looking back. e.g. 'She entered the kitchen and reached for the pan.'>"",
+      ""beats"": [
+        ""Beat 1 (0–Xs): <ONE concrete physical action with counted movement>"",
+        ""Beat 2 (Xs–Ys): <next beat>"",
+        ""... 4-6 beats total covering the segment's duration in order""
+      ],
+      ""dialogue"": ""<the speaker label + verbatim narration line if it is spoken in THIS segment, else null. Distribute the supplied narration across segments so the natural reading pace fits — short clips get one phrase, long clips can carry the whole line. NEVER invent dialogue beyond what the user supplied.>""
+    }}
+    // ... exactly {segmentCount} segments, each with its OWN distinct beats so the story progresses. Do NOT repeat beats across segments. Segment 1 establishes; later segments develop and resolve.
+  ]
+}}
 
 Hard rules:
-- Output ONLY the structured prompt above, in plain text, with the exact section headers. No preamble, no markdown fences, no quotes wrapping the whole thing.
-- Reuse the character's anchor description identically every time you reference them.
-- Never invent extra dialogue beyond the supplied line. Never translate the supplied line — paste it verbatim.
-- One camera move per shot. One main subject action per beat.
-- Keep total length under ~280 words.";
+- Output ONLY the JSON object. No markdown fences. No prose.
+- The five anchors (style/characterAnchor/sceneAnchor/cinematography/voiceDescription/backgroundSound) MUST stay constant across segments — they describe the unchanging world. The segments array carries the changing action.
+- Every segment's beats describe DISTINCT progression. Segment N must logically continue from segment N-1's last beat.
+- Dialogue must be embedded verbatim in the supplied script; never translate it; never invent extra lines.
+- {beatCount} beats per segment is the target.";
 
     var userMsg = $@"User idea: {req.Prompt}
-Total story duration: {totalSeconds} seconds (rendered as {segmentCount} × {chunkSeconds}s segment{(segmentCount > 1 ? "s" : "")} that stitch together).
-This prompt describes ONE {chunkSeconds}s segment. Beat timestamps must fit within {chunkSeconds}s.
+Total story duration: {totalSeconds} seconds = {segmentCount} segment(s) of up to {chunkSeconds}s each.
 Aspect: {size}
 Narration language: {langName}
 Speaker gender: {gender}
-Voice persona: {voiceShort} (use this name to inform the speaker's vocal character — pitch, age, accent — but do NOT mention it on-screen).
-Narration line to embed verbatim (already in {langName}): {translatedNarration}
-{(segmentCount > 1 ? $"Plan the visible action so a {totalSeconds}s arc unfolds across {segmentCount} segments with the SAME character/wardrobe/environment/lighting/voice in every segment. This segment is one continuous beat of that arc." : "")}
+Voice persona name: {voiceShort} (informs vocal character — never mention on-screen).
+Narration line to embed verbatim (already in {langName}, distribute across segments naturally): {translatedNarration}
 
-Compose the final Sora-2 prompt now.";
+Plan the {segmentCount}-segment arc as JSON now.";
 
     var client = hf.CreateClient();
-    client.Timeout = TimeSpan.FromSeconds(60);
+    client.Timeout = TimeSpan.FromSeconds(90);
     using var chatMsg = new HttpRequestMessage(HttpMethod.Post,
         $"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=2024-10-21");
     chatMsg.Headers.Add("api-key", key);
@@ -404,7 +404,8 @@ Compose the final Sora-2 prompt now.";
             new { role = "user",   content = userMsg }
         },
         temperature = 0.7,
-        max_tokens = 1200
+        max_tokens = 2400,
+        response_format = new { type = "json_object" }
     };
     chatMsg.Content = new StringContent(
         System.Text.Json.JsonSerializer.Serialize(payload),
@@ -415,8 +416,58 @@ Compose the final Sora-2 prompt now.";
         return Results.Problem($"Enhance failed ({(int)chatResp.StatusCode}): {chatBody}");
 
     using var chatDoc = System.Text.Json.JsonDocument.Parse(chatBody);
-    var enhanced = chatDoc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString()?.Trim() ?? req.Prompt;
-    return Results.Ok(new { enhanced, translatedNarration, lang = langPrefix, langName });
+    var rawContent = chatDoc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString()?.Trim() ?? "{}";
+
+    // Parse the structured plan. If parsing fails, fall back to returning rawContent as the flat prompt.
+    System.Text.Json.JsonElement planJson;
+    try { planJson = System.Text.Json.JsonDocument.Parse(rawContent).RootElement.Clone(); }
+    catch
+    {
+        return Results.Ok(new { enhanced = rawContent, plan = (object?)null, translatedNarration, lang = langPrefix, langName });
+    }
+
+    string J(System.Text.Json.JsonElement e, string k, string fb = "") =>
+        e.TryGetProperty(k, out var v) && v.ValueKind == System.Text.Json.JsonValueKind.String ? (v.GetString() ?? fb) : fb;
+
+    // Server-side render of a human-readable preview (for the "Final prompt" textarea).
+    var sb = new System.Text.StringBuilder();
+    sb.AppendLine($"Style: {J(planJson, "style")}");
+    sb.AppendLine();
+    sb.AppendLine($"Scene: {J(planJson, "sceneAnchor")}");
+    sb.AppendLine();
+    sb.AppendLine($"Character: {J(planJson, "characterAnchor")}");
+    sb.AppendLine();
+    sb.AppendLine("Cinematography:");
+    sb.AppendLine(J(planJson, "cinematography"));
+    sb.AppendLine();
+    sb.AppendLine($"Voice: {J(planJson, "voiceDescription")}");
+    sb.AppendLine();
+    if (planJson.TryGetProperty("segments", out var segArr) && segArr.ValueKind == System.Text.Json.JsonValueKind.Array)
+    {
+        int i = 0;
+        foreach (var seg in segArr.EnumerateArray())
+        {
+            i++;
+            var startSec = seg.TryGetProperty("startSec", out var ss) && ss.ValueKind == System.Text.Json.JsonValueKind.Number ? ss.GetInt32() : 0;
+            var endSec = seg.TryGetProperty("endSec", out var es) && es.ValueKind == System.Text.Json.JsonValueKind.Number ? es.GetInt32() : 0;
+            sb.AppendLine($"Segment {i} ({startSec}–{endSec}s) — {J(seg, "summary")}");
+            if (seg.TryGetProperty("beats", out var bts) && bts.ValueKind == System.Text.Json.JsonValueKind.Array)
+                foreach (var b in bts.EnumerateArray())
+                    sb.AppendLine($"  - {b.GetString()}");
+            var dlg = J(seg, "dialogue");
+            if (!string.IsNullOrWhiteSpace(dlg) && dlg != "null") sb.AppendLine($"  Dialogue: {dlg}");
+            sb.AppendLine();
+        }
+    }
+    sb.AppendLine($"Background sound: {J(planJson, "backgroundSound")}");
+    sb.AppendLine($"Negative: {J(planJson, "negative")}");
+
+    return Results.Ok(new {
+        enhanced = sb.ToString().Trim(),
+        plan = System.Text.Json.JsonSerializer.Deserialize<object>(rawContent),
+        translatedNarration, lang = langPrefix, langName,
+        totalSeconds, chunkSeconds, segmentCount
+    });
 });
 
 app.Run();

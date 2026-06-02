@@ -140,6 +140,18 @@
   /* Final prompt big editable */
   textarea.final { font-family: var(--mono); font-size: 12.5px; min-height: 240px; }
 
+  /* Story plan */
+  .plan { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px; background: var(--surface-2); }
+  .plan-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+  .plan-seg { border-top: 1px dashed var(--border); padding: 8px 4px; }
+  .plan-seg:first-of-type { border-top: 0; }
+  .plan-seg.done { opacity: 0.65; }
+  .plan-seg-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .plan-seg-summary { font-weight: 500; }
+  .plan-beats { margin: 6px 0 0 24px; padding: 0; font-size: 12.5px; color: var(--muted); }
+  .plan-beats li { margin: 2px 0; }
+  .plan-dialogue { font-size: 12.5px; margin: 4px 0 0 24px; color: var(--text); }
+
   /* Toast */
   .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
     background: var(--text); color: var(--bg); padding: 10px 16px; border-radius: 999px;
@@ -324,6 +336,8 @@ function App() {
   const [size, setSize] = useState("1280x720");
   const [refFile, setRefFile] = useState(null);
   const [finalPrompt, setFinalPrompt] = useState("");
+  const [plan, setPlan] = useState(null);
+  const [segSummaries, setSegSummaries] = useState([]);
   const [enhancing, setEnhancing] = useState(false);
   const [running, setRunning] = useState(false);
   const [status, setStatus] = useState({ phase: "idle", pct: 0, label: "ready" });
@@ -382,7 +396,12 @@ function App() {
       });
       const j = await jsonOrThrow(r);
       setFinalPrompt(j.enhanced || "");
-      toast("Final prompt generated. You can edit it before running.");
+      setPlan(j.plan || null);
+      setSegSummaries([]);
+      const segCount = j.plan?.segments?.length || 0;
+      toast(segCount > 1
+        ? `Plan ready — ${segCount} segments. Edit if needed, then run.`
+        : "Final prompt generated. You can edit it before running.");
     } catch (e) { toast("Enhance failed: " + e.message, true); }
     finally { setEnhancing(false); }
   }
@@ -439,6 +458,50 @@ function App() {
       if (st === "succeeded" || st === "completed") return j;
       if (st === "failed" || st === "cancelled") throw new Error("Job " + st);
     }
+  }
+
+  // Build the prompt for a single segment using the structured plan + memory of
+  // earlier rendered segments + outline of later ones. Each Sora-2 render thus
+  // receives full narrative + audio + visual context of preceding/following clips.
+  function buildSegmentPrompt(planObj, k, priorSummaries) {
+    const segs = planObj.segments || [];
+    const seg = segs[k] || {};
+    const N = segs.length;
+    const previously = priorSummaries.length === 0 ? "" :
+      "\nPreviously (already rendered, this segment continues directly from the last):\n" +
+      priorSummaries.map((s, i) => `  - Segment ${i+1} (${segs[i]?.startSec}\u2013${segs[i]?.endSec}s): ${s}`).join("\n");
+    const coming = k >= N - 1 ? "" :
+      "\nComing next (do NOT render, but pace toward it):\n" +
+      segs.slice(k+1).map((s, i) => `  - Segment ${k+2+i} (${s.startSec}\u2013${s.endSec}s): ${s.summary || ""}`).join("\n");
+    const dialogueBlock = seg.dialogue && seg.dialogue !== "null"
+      ? `\nDialogue (this segment, spoken on-screen, embed verbatim):\n${seg.dialogue}`
+      : "";
+    const continuity = k === 0 ? ""
+      : `\nContinuity directives:\n  - DIRECT CONTINUATION. The first frame matches the last frame of segment ${k} exactly.\n  - SAME character (use the Character anchor below verbatim), SAME wardrobe, SAME environment, SAME lens & focal length, SAME lighting setup and color grade.\n  - SAME voice timbre, pitch, accent and speaking pace as the previous segment.\n  - The diegetic background sound bed continues uninterrupted: ${planObj.backgroundSound || ""}.\n  - No cut, no fade, no recap. Motion and audio pick up immediately.`;
+    return [
+      `Style: ${planObj.style || ""}`,
+      ``,
+      `Scene: ${planObj.sceneAnchor || ""}`,
+      ``,
+      `Character (use this exact description anywhere the speaker is referenced): ${planObj.characterAnchor || ""}`,
+      ``,
+      `Cinematography:`,
+      planObj.cinematography || "",
+      ``,
+      `Voice: ${planObj.voiceDescription || ""}`,
+      previously,
+      ``,
+      `This segment is segment ${k+1} of ${N} (time ${seg.startSec}\u2013${seg.endSec}s of the full ${segs[N-1]?.endSec || ""}s arc).`,
+      `Summary of this segment: ${seg.summary || ""}`,
+      `Beat-by-beat actions in this segment (perform exactly these, in order):`,
+      ...(seg.beats || []).map(b => `  - ${b}`),
+      dialogueBlock,
+      coming,
+      continuity,
+      ``,
+      `Background sound (continues across segments, render identically): ${planObj.backgroundSound || ""}`,
+      `Negative: ${planObj.negative || "no on-screen text, no captions, no logos, no watermarks, no extra speakers, no duplicated limbs"}`,
+    ].filter(Boolean).join("\n");
   }
 
   // Extract last frame of a video URL as a JPEG File for use as Sora input_reference.
@@ -553,8 +616,34 @@ function App() {
             </div>
             ${finalPrompt && html`
               <div>
-                <label>Final prompt sent to Sora <span class="muted">(editable)</span></label>
+                <label>Final prompt preview <span class="muted">(editable; only used if plan is empty)</span></label>
                 <textarea class="final" value=${finalPrompt} onInput=${e => setFinalPrompt(e.target.value)}></textarea>
+              </div>
+            `}
+            ${plan && Array.isArray(plan.segments) && plan.segments.length > 1 && html`
+              <div class="plan">
+                <div class="plan-head">
+                  <strong>Story plan</strong>
+                  <span class="pill">${plan.segments.length} segments</span>
+                  <span class="muted small">Each clip carries memory of earlier clips + pacing toward later ones</span>
+                </div>
+                ${plan.segments.map((s, i) => {
+                  const done = i < segSummaries.length;
+                  return html`
+                    <div class=${"plan-seg" + (done ? " done" : "")} key=${i}>
+                      <div class="plan-seg-head">
+                        <span class="pill">${i+1}</span>
+                        <span class="muted small">${s.startSec}–${s.endSec}s</span>
+                        <span class="plan-seg-summary">${s.summary || ""}</span>
+                        ${done && html`<span class="pill ok small">rendered</span>`}
+                      </div>
+                      <ul class="plan-beats">
+                        ${(s.beats || []).map((b, j) => html`<li key=${j}>${b}</li>`)}
+                      </ul>
+                      ${s.dialogue && s.dialogue !== "null" && html`<div class="plan-dialogue"><em>Dialogue:</em> ${s.dialogue}</div>`}
+                    </div>
+                  `;
+                })}
               </div>
             `}
           </div>
