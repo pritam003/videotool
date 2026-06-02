@@ -639,13 +639,42 @@ function App() {
       const jobId = start.jobId;
       craftJobIdRef.current = jobId;
 
-      // Poll loop. ~1s cadence; bail out on done/error.
+      // Poll loop. ~1s cadence; bail out on done/error. Tolerates transient
+      // network failures (TypeError: Failed to fetch from mobile tab-suspend,
+      // upstream 5xx, request timeouts) so a temporarily backgrounded tab can
+      // pick up where it left off — the PromptCraft job lives in server memory
+      // for 10 minutes regardless of what the client does.
       let j = null;
+      let transientFails = 0;
+      const MAX_TRANSIENT = 12;
       while (true) {
         await sleep(1000);
         if (craftJobIdRef.current !== jobId) throw new Error("Cancelled");
-        const sr = await fetch(`/api/promptcraft/${jobId}`);
-        const st = await jsonOrThrow(sr);
+        let st;
+        try {
+          // 30s per-request timeout: long-running reasoner steps can take a
+          // while server-side, but a stuck connection should not block forever.
+          const sr = await fetch(`/api/promptcraft/${jobId}`, { signal: AbortSignal.timeout(30_000) });
+          if (sr.status === 429 || (sr.status >= 500 && sr.status <= 599)) {
+            transientFails++;
+            dbg("warn", `promptcraft poll: transient ${sr.status} (${transientFails}/${MAX_TRANSIENT}) — retrying`);
+            if (transientFails >= MAX_TRANSIENT) throw new Error(`server returned ${sr.status} ${MAX_TRANSIENT}× — giving up`);
+            continue;
+          }
+          st = await jsonOrThrow(sr);
+          transientFails = 0;
+        } catch (fetchErr) {
+          // Network-layer failure (mobile tab suspended an in-flight fetch,
+          // DNS hiccup, AbortSignal.timeout). The server job keeps running;
+          // we just retry. Only bail after MAX_TRANSIENT consecutive failures.
+          const isAbort = fetchErr.name === "AbortError" || fetchErr.name === "TimeoutError";
+          const isNet = fetchErr instanceof TypeError; // "Failed to fetch"
+          if (!isAbort && !isNet) throw fetchErr;
+          transientFails++;
+          dbg("warn", `promptcraft poll: ${fetchErr.name || "fetch"} (${transientFails}/${MAX_TRANSIENT}) — server still has the job, retrying`);
+          if (transientFails >= MAX_TRANSIENT) throw new Error(`network unreachable after ${MAX_TRANSIENT} retries: ${fetchErr.message}`);
+          continue;
+        }
         setCraftProgress({ phase: st.phase, pct: st.pct, liveIterations: st.liveIterations });
         if (st.error) throw new Error(st.error);
         if (st.done && st.result) { j = st.result; break; }
