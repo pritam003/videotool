@@ -1,6 +1,7 @@
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using System.Collections.Concurrent;
 using Azure.Core;
 using Azure.Identity;
 using Azure.Storage.Blobs;
@@ -10,6 +11,9 @@ using Azure.Storage.Sas;
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddHttpClient();
 builder.Services.AddSingleton<TokenCredential>(new DefaultAzureCredential());
+// In-process job store for PromptCraft progress. F1 is single-instance so a
+// process-local dictionary is sufficient; jobs auto-evict after 10 minutes.
+builder.Services.AddSingleton<PromptCraftJobStore>();
 
 var app = builder.Build();
 app.UseDefaultFiles();
@@ -896,8 +900,8 @@ Plan the {segmentCount}-segment arc as JSON now.";
 // Plus the existing FACE-RISK rules: occlusion device per shot, non-face
 // identifiers, no close-ups unless the brief demands.
 // ─────────────────────────────────────────────────────────────────────────────
-app.MapPost("/api/promptcraft", async (PromptCraftRequest req, IHttpClientFactory hf,
-    IConfiguration cfg, CancellationToken ct) =>
+app.MapPost("/api/promptcraft", (PromptCraftRequest req, IHttpClientFactory hf,
+    IConfiguration cfg, PromptCraftJobStore store) =>
 {
     if (string.IsNullOrWhiteSpace(req.UserAsk))
         return Results.BadRequest(new { error = "userAsk is required" });
@@ -905,7 +909,7 @@ app.MapPost("/api/promptcraft", async (PromptCraftRequest req, IHttpClientFactor
     var endpoint = Cfg(cfg, "AOAI_ENDPOINT").TrimEnd('/');
     var key = Cfg(cfg, "AOAI_KEY");
     var deployment = cfg["REASONING_DEPLOYMENT"] ?? "gpt-5_4";
-    var apiVersion = "2024-12-01-preview"; // supports gpt-5.x reasoning models
+    var apiVersion = "2024-12-01-preview";
     var totalSeconds = Math.Clamp(req.TotalSeconds ?? 8, 4, 60);
     var size = req.Size ?? "1280x720";
     var chunkSeconds = Math.Min(totalSeconds, 12);
@@ -914,48 +918,63 @@ app.MapPost("/api/promptcraft", async (PromptCraftRequest req, IHttpClientFactor
     var voice = req.Voice ?? "en-US-AvaMultilingualNeural";
     var narration = req.Narration ?? "";
 
-    var client = hf.CreateClient();
-    client.Timeout = TimeSpan.FromMinutes(4);
-
-    // Helper: one structured call to the reasoner. gpt-5.x reasoning models
-    // require max_completion_tokens (not max_tokens) and temperature must be 1.
-    async Task<JsonElement> CallReasoner(string sys, string user, int maxOut)
+    var jobId = Guid.NewGuid().ToString("n");
+    var job = store.Create(jobId);
+    // Total phases for the progress bar: PLAN(1) + COMPILE(1) + maxIter critic + FINAL(1).
+    // We weight roughly equally; UI just uses pct from server.
+    int totalPhases = 2 + maxIter + 1;
+    int phaseIdx = 0;
+    void SetPhase(string label)
     {
-        using var msg = new HttpRequestMessage(HttpMethod.Post,
-            $"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={apiVersion}");
-        msg.Headers.Add("api-key", key);
-        var payload = new Dictionary<string, object?>
-        {
-            ["messages"] = new object[] {
-                new { role = "system", content = sys },
-                new { role = "user",   content = user }
-            },
-            ["max_completion_tokens"] = maxOut,
-            ["response_format"] = new { type = "json_object" }
-        };
-        msg.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
-        using var resp = await client.SendAsync(msg, ct);
-        var raw = await resp.Content.ReadAsStringAsync(ct);
-        if (!resp.IsSuccessStatusCode)
-            throw new InvalidOperationException($"Reasoner call failed ({(int)resp.StatusCode}): {raw}");
-        using var doc = JsonDocument.Parse(raw);
-        var content = doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString() ?? "{}";
-        // Reasoner may wrap in ```json``` fences occasionally; strip them.
-        content = content.Trim();
-        if (content.StartsWith("```"))
-        {
-            var nl = content.IndexOf('\n');
-            if (nl > 0) content = content[(nl + 1)..];
-            if (content.EndsWith("```")) content = content[..^3];
-            content = content.Trim();
-        }
-        return JsonDocument.Parse(content).RootElement.Clone();
+        phaseIdx++;
+        job.Phase = label;
+        job.Pct = (int)Math.Min(99, Math.Round(100.0 * phaseIdx / totalPhases));
+        job.UpdatedAt = DateTimeOffset.UtcNow;
     }
 
-    // Constants pasted into every layer's system prompt — the two hard locks
-    // and the face-risk rules. Keeping these centralised guarantees no layer
-    // forgets them.
-    const string LOCKS = @"
+    // Fire-and-forget background task. We DO NOT pass the request's CT — that
+    // cancels the moment the response is sent. Use the store's CT instead so
+    // callers could cancel via a future /cancel endpoint.
+    _ = Task.Run(async () =>
+    {
+        try
+        {
+            var client = hf.CreateClient();
+            client.Timeout = TimeSpan.FromMinutes(4);
+
+            async Task<JsonElement> CallReasoner(string sys, string user, int maxOut)
+            {
+                using var msg = new HttpRequestMessage(HttpMethod.Post,
+                    $"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={apiVersion}");
+                msg.Headers.Add("api-key", key);
+                var payload = new Dictionary<string, object?>
+                {
+                    ["messages"] = new object[] {
+                        new { role = "system", content = sys },
+                        new { role = "user",   content = user }
+                    },
+                    ["max_completion_tokens"] = maxOut,
+                    ["response_format"] = new { type = "json_object" }
+                };
+                msg.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+                using var resp = await client.SendAsync(msg, job.Cts.Token);
+                var raw = await resp.Content.ReadAsStringAsync(job.Cts.Token);
+                if (!resp.IsSuccessStatusCode)
+                    throw new InvalidOperationException($"Reasoner call failed ({(int)resp.StatusCode}): {raw}");
+                using var doc = JsonDocument.Parse(raw);
+                var content = doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString() ?? "{}";
+                content = content.Trim();
+                if (content.StartsWith("```"))
+                {
+                    var nl = content.IndexOf('\n');
+                    if (nl > 0) content = content[(nl + 1)..];
+                    if (content.EndsWith("```")) content = content[..^3];
+                    content = content.Trim();
+                }
+                return JsonDocument.Parse(content).RootElement.Clone();
+            }
+
+            const string LOCKS = @"
 HARD LOCKS — violating any of these means the response is invalid:
 
 1. WORD LOCK: Every meaningful noun, adjective, verb, number, colour, location,
@@ -989,11 +1008,9 @@ HARD LOCKS — violating any of these means the response is invalid:
      render text reliably).
 ";
 
-    // ─── Layer 1: PLAN ────────────────────────────────────────────────────
-    // Single deep-reasoning pass that produces the full plan: intent
-    // contract (every user word categorised), identity bible, storyboard
-    // (segments with beats), and frame manifest (one keyframe per second).
-    var planSys = $@"You are the chief planner for a Sora-2 video shoot. Think step by step about the user ask, then output a SINGLE JSON object — no markdown, no prose outside JSON.
+            // Layer 1: PLAN
+            SetPhase("Planning intent + identity + storyboard");
+            var planSys = $@"You are the chief planner for a Sora-2 video shoot. Think step by step about the user ask, then output a SINGLE JSON object — no markdown, no prose outside JSON.
 
 {LOCKS}
 
@@ -1042,7 +1059,7 @@ framesManifest MUST contain one entry per second of total video (so {totalSecond
 storyboard.segments MUST contain exactly {segmentCount} entries.
 extractedWords MUST cover every meaningful token in the user ask — aim for thoroughness, list 10-30 words.";
 
-    var planUser = $@"USER ASK (verbatim, treat every word as a constraint):
+            var planUser = $@"USER ASK (verbatim, treat every word as a constraint):
 {req.UserAsk}
 
 Total duration: {totalSeconds}s rendered as {segmentCount} segment(s) of up to {chunkSeconds}s.
@@ -1052,12 +1069,11 @@ Narration to embed verbatim (distribute across segments naturally if non-empty):
 
 Plan now. Output JSON only.";
 
-    var planJson = await CallReasoner(planSys, planUser, 8000);
+            var planJson = await CallReasoner(planSys, planUser, 8000);
 
-    // ─── Layer 2: COMPILE ─────────────────────────────────────────────────
-    // Turn the plan into Sora-2-ready per-segment prompts. Each prompt is a
-    // self-contained brief that pastes anchors verbatim then enumerates beats.
-    var compileSys = $@"You are a Sora-2 prompt compiler. Given a structured plan, produce per-segment prompts ready to send to Sora-2.
+            // Layer 2: COMPILE
+            SetPhase("Compiling Sora-2 segment prompts");
+            var compileSys = $@"You are a Sora-2 prompt compiler. Given a structured plan, produce per-segment prompts ready to send to Sora-2.
 
 {LOCKS}
 
@@ -1078,21 +1094,18 @@ OUTPUT SCHEMA:
 
 Output JSON only.";
 
-    var compileUser = $@"PLAN:
+            var compileUser = $@"PLAN:
 {planJson.GetRawText()}
 
 Compile the {segmentCount} segment prompts now. Output JSON only.";
 
-    var compiled = await CallReasoner(compileSys, compileUser, 6000);
+            var compiled = await CallReasoner(compileSys, compileUser, 6000);
 
-    // ─── Layer 3: CRITIC LOOP (×N) ────────────────────────────────────────
-    // Each iteration scores faithfulness, realism, Sora-compat, and frame
-    // coherence on 1-10 axes, lists deviations, and emits a refined segments
-    // array. We stop when all four axes are ≥ 9 or maxIter is reached.
-    var iterations = new List<object>();
-    var currentSegments = compiled.GetProperty("segments");
+            // Layer 3: CRITIC LOOP
+            var iterations = new List<object>();
+            var currentSegments = compiled.GetProperty("segments");
 
-    var criticSys = $@"You are a brutally honest video-prompt critic. Given the user ask, the plan, and current per-segment Sora-2 prompts, score on FOUR axes (1-10) and emit refined prompts.
+            var criticSys = $@"You are a brutally honest video-prompt critic. Given the user ask, the plan, and current per-segment Sora-2 prompts, score on FOUR axes (1-10) and emit refined prompts.
 
 {LOCKS}
 
@@ -1120,13 +1133,14 @@ OUTPUT SCHEMA:
 Be ruthless on faithfulness — if the user said 'red bicycle in the rain' and the prompt has a 'crimson cycle in mist', that is a deviation. Use the exact user words.
 Output JSON only.";
 
-    JsonElement finalScores = default;
-    string finalVerdict = "refine_again";
-    int iterDone = 0;
+            JsonElement finalScores = default;
+            string finalVerdict = "refine_again";
+            int iterDone = 0;
 
-    for (int i = 1; i <= maxIter; i++)
-    {
-        var criticUser = $@"USER ASK (verbatim):
+            for (int i = 1; i <= maxIter; i++)
+            {
+                SetPhase($"Critic iteration {i}/{maxIter}");
+                var criticUser = $@"USER ASK (verbatim):
 {req.UserAsk}
 
 PLAN:
@@ -1137,57 +1151,103 @@ CURRENT SEGMENTS:
 
 Score, list deviations, and emit refinedSegments now. Output JSON only.";
 
-        var critique = await CallReasoner(criticSys, criticUser, 6000);
-        var scores = critique.GetProperty("scores");
-        int faith = scores.GetProperty("faithfulness").GetInt32();
-        int real = scores.GetProperty("realism").GetInt32();
-        int sora = scores.GetProperty("soraCompat").GetInt32();
-        int frame = scores.GetProperty("frameCoherence").GetInt32();
+                var critique = await CallReasoner(criticSys, criticUser, 6000);
+                var scores = critique.GetProperty("scores");
+                int faith = scores.GetProperty("faithfulness").GetInt32();
+                int real = scores.GetProperty("realism").GetInt32();
+                int soraS = scores.GetProperty("soraCompat").GetInt32();
+                int frame = scores.GetProperty("frameCoherence").GetInt32();
 
-        iterations.Add(new
+                var iterRecord = new
+                {
+                    n = i,
+                    scores = new { faithfulness = faith, realism = real, soraCompat = soraS, frameCoherence = frame },
+                    deviations = critique.TryGetProperty("deviations", out var dev) ? dev.Clone() : default,
+                    verdict = critique.TryGetProperty("verdict", out var v) ? v.GetString() : "refine_again"
+                };
+                iterations.Add(iterRecord);
+                job.LiveIterations = iterations.ToArray(); // visible to status poller
+
+                if (critique.TryGetProperty("refinedSegments", out var refined) && refined.GetArrayLength() > 0)
+                    currentSegments = refined.Clone();
+
+                finalScores = scores.Clone();
+                finalVerdict = critique.TryGetProperty("verdict", out var vv) ? (vv.GetString() ?? "refine_again") : "refine_again";
+                iterDone = i;
+
+                if (faith >= 9 && real >= 9 && soraS >= 9 && frame >= 9 && finalVerdict == "ship") break;
+            }
+
+            // Layer 4: FINAL ASSEMBLY
+            SetPhase("Assembling final prompt");
+            var combinedPrompt = new StringBuilder();
+            foreach (var seg in currentSegments.EnumerateArray())
+            {
+                if (combinedPrompt.Length > 0) combinedPrompt.AppendLine().AppendLine("---").AppendLine();
+                combinedPrompt.Append(seg.GetProperty("prompt").GetString());
+            }
+
+            job.Result = new
+            {
+                userAsk = req.UserAsk,
+                totalSeconds,
+                segmentCount,
+                chunkSeconds,
+                plan = planJson,
+                segments = currentSegments,
+                iterations,
+                iterationsRun = iterDone,
+                finalScores,
+                verdict = finalVerdict,
+                combinedPrompt = combinedPrompt.ToString(),
+                reasoningModel = deployment
+            };
+            job.Phase = "done";
+            job.Pct = 100;
+            job.Done = true;
+            job.UpdatedAt = DateTimeOffset.UtcNow;
+        }
+        catch (OperationCanceledException)
         {
-            n = i,
-            scores = new { faithfulness = faith, realism = real, soraCompat = sora, frameCoherence = frame },
-            deviations = critique.TryGetProperty("deviations", out var dev) ? dev.Clone() : default,
-            verdict = critique.TryGetProperty("verdict", out var v) ? v.GetString() : "refine_again"
-        });
+            job.Error = "cancelled";
+            job.Done = true;
+            job.UpdatedAt = DateTimeOffset.UtcNow;
+        }
+        catch (Exception ex)
+        {
+            job.Error = ex.Message;
+            job.Done = true;
+            job.UpdatedAt = DateTimeOffset.UtcNow;
+        }
+    });
 
-        if (critique.TryGetProperty("refinedSegments", out var refined) && refined.GetArrayLength() > 0)
-            currentSegments = refined.Clone();
+    return Results.Json(new { jobId, totalPhases });
+});
 
-        finalScores = scores.Clone();
-        finalVerdict = critique.TryGetProperty("verdict", out var vv) ? (vv.GetString() ?? "refine_again") : "refine_again";
-        iterDone = i;
-
-        // Early exit: all axes ≥ 9.
-        if (faith >= 9 && real >= 9 && sora >= 9 && frame >= 9 && finalVerdict == "ship") break;
-    }
-
-    // ─── Layer 4: FINAL ASSEMBLY ──────────────────────────────────────────
-    // Assemble a single combined prompt the user can paste into the existing
-    // generator UI directly — concatenated segments with clear delimiters.
-    var combinedPrompt = new StringBuilder();
-    foreach (var seg in currentSegments.EnumerateArray())
-    {
-        if (combinedPrompt.Length > 0) combinedPrompt.AppendLine().AppendLine("---").AppendLine();
-        combinedPrompt.Append(seg.GetProperty("prompt").GetString());
-    }
-
+// Status poller: returns current phase/pct, plus the result once done.
+app.MapGet("/api/promptcraft/{jobId}", (string jobId, PromptCraftJobStore store) =>
+{
+    var job = store.Get(jobId);
+    if (job == null) return Results.NotFound(new { error = "job not found or expired" });
     return Results.Json(new
     {
-        userAsk = req.UserAsk,
-        totalSeconds,
-        segmentCount,
-        chunkSeconds,
-        plan = planJson,
-        segments = currentSegments,
-        iterations,
-        iterationsRun = iterDone,
-        finalScores,
-        verdict = finalVerdict,
-        combinedPrompt = combinedPrompt.ToString(),
-        reasoningModel = deployment
+        jobId,
+        phase = job.Phase,
+        pct = job.Pct,
+        done = job.Done,
+        error = job.Error,
+        liveIterations = job.LiveIterations,
+        result = job.Done && job.Error == null ? job.Result : null
     });
+});
+
+// Cancel an in-flight PromptCraft job. Cooperative — only stops at the next reasoner call.
+app.MapPost("/api/promptcraft/{jobId}/cancel", (string jobId, PromptCraftJobStore store) =>
+{
+    var job = store.Get(jobId);
+    if (job == null) return Results.NotFound(new { error = "job not found" });
+    job.Cts.Cancel();
+    return Results.Ok(new { cancelled = true });
 });
 
 app.Run();
@@ -1201,3 +1261,42 @@ public record IdentityRequest(string VideoUrl, string? OriginalAnchor);
 public record TailRequest(string VideoUrl, double? Seconds, string? Size);
 public record SliceRequest(string VideoUrl, double? StartSec, double? DurationSec, string? Size, bool? FromEnd);
 public record RemixRequest(string VideoId, string Prompt, int? Seconds, string? Size);
+
+// In-memory store for PromptCraft jobs. Single-instance F1 deployment, so a
+// process-local concurrent dictionary is the simplest viable storage. Jobs
+// older than 10 minutes are evicted on each Create() call so the dict never
+// grows unbounded.
+public class PromptCraftJob
+{
+    public string Phase { get; set; } = "queued";
+    public int Pct { get; set; } = 0;
+    public bool Done { get; set; } = false;
+    public string? Error { get; set; }
+    public object? Result { get; set; }
+    public object[]? LiveIterations { get; set; }
+    public DateTimeOffset CreatedAt { get; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public CancellationTokenSource Cts { get; } = new();
+}
+
+public class PromptCraftJobStore
+{
+    private readonly ConcurrentDictionary<string, PromptCraftJob> _jobs = new();
+
+    public PromptCraftJob Create(string id)
+    {
+        // Evict anything older than 10 minutes before adding the new one.
+        var cutoff = DateTimeOffset.UtcNow.AddMinutes(-10);
+        foreach (var kv in _jobs)
+        {
+            if (kv.Value.UpdatedAt < cutoff)
+                _jobs.TryRemove(kv.Key, out _);
+        }
+        var job = new PromptCraftJob();
+        _jobs[id] = job;
+        return job;
+    }
+
+    public PromptCraftJob? Get(string id) =>
+        _jobs.TryGetValue(id, out var j) ? j : null;
+}

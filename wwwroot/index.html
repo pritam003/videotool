@@ -351,6 +351,9 @@ function App() {
   const [crafting, setCrafting] = useState(false);
   const [craftResult, setCraftResult] = useState(null); // {segments, iterations, finalScores, plan, combinedPrompt, ...}
   const [craftPanelOpen, setCraftPanelOpen] = useState(false);
+  // Live progress driven by server. craftProgress = { phase, pct, jobId }.
+  const [craftProgress, setCraftProgress] = useState(null);
+  const craftJobIdRef = useRef(null);
   const [running, setRunning] = useState(false);
   const [status, setStatus] = useState({ phase: "idle", pct: 0, label: "ready" });
   const [outs, setOuts] = useState([]);
@@ -426,13 +429,15 @@ function App() {
     finally { setEnhancing(false); }
   }
 
-  // PromptCraft: multi-layer reasoner pass. Hits POST /api/promptcraft which runs
-  // PLAN → COMPILE → CRITIC×5 with hard locks for word-faithfulness + realism + face-risk.
-  // Takes 30-90s wall time. The result loads straight into finalPrompt so existing run() works.
+  // PromptCraft: multi-layer reasoner pass. POSTs to /api/promptcraft to start a
+  // background job, then polls GET /api/promptcraft/{jobId} every 1s for real
+  // phase + percent updates. The reasoner walks PLAN → COMPILE → CRITIC×5 with
+  // hard locks for word-faithfulness + realism + face-risk. Takes 30-120s.
   async function promptCraft() {
-    if (!prompt.trim()) { toast("Enter a prompt first.", true); return; }
+    if (!canCraft) { toast("Fill prompt, voice, duration and aspect first.", true); return; }
     setCrafting(true);
     setCraftResult(null);
+    setCraftProgress({ phase: "starting…", pct: 1 });
     try {
       const r = await fetch("/api/promptcraft", {
         method: "POST", headers: { "Content-Type": "application/json" },
@@ -445,12 +450,25 @@ function App() {
           maxIterations: 5
         })
       });
-      const j = await jsonOrThrow(r);
+      const start = await jsonOrThrow(r);
+      const jobId = start.jobId;
+      craftJobIdRef.current = jobId;
+
+      // Poll loop. ~1s cadence; bail out on done/error.
+      let j = null;
+      while (true) {
+        await sleep(1000);
+        if (craftJobIdRef.current !== jobId) throw new Error("Cancelled");
+        const sr = await fetch(`/api/promptcraft/${jobId}`);
+        const st = await jsonOrThrow(sr);
+        setCraftProgress({ phase: st.phase, pct: st.pct, liveIterations: st.liveIterations });
+        if (st.error) throw new Error(st.error);
+        if (st.done && st.result) { j = st.result; break; }
+      }
+
       setCraftResult(j);
       setCraftPanelOpen(true);
-      // Load combined prompt into finalPrompt so the existing run() pipeline picks it up.
       setFinalPrompt(j.combinedPrompt || "");
-      // Synthesize a plan-shaped object so the existing multi-segment run() ladder works.
       if (Array.isArray(j.segments) && j.segments.length) {
         setPlan({
           segments: j.segments.map(s => ({
@@ -466,7 +484,21 @@ function App() {
       const sc = j.finalScores || {};
       toast(`Prompt crafted in ${j.iterationsRun} iter — F:${sc.faithfulness||"?"} R:${sc.realism||"?"} S:${sc.soraCompat||"?"} C:${sc.frameCoherence||"?"}`);
     } catch (e) { toast("PromptCraft failed: " + e.message, true); }
-    finally { setCrafting(false); }
+    finally {
+      setCrafting(false);
+      setCraftProgress(null);
+      craftJobIdRef.current = null;
+    }
+  }
+
+  // Cancel an in-flight PromptCraft job. Tells server to abort the next
+  // reasoner call, and breaks the local poll loop immediately.
+  async function cancelCraft() {
+    const id = craftJobIdRef.current;
+    if (!id) return;
+    craftJobIdRef.current = null; // stop polling
+    try { await fetch(`/api/promptcraft/${id}/cancel`, { method: "POST" }); } catch {}
+    toast("PromptCraft cancelled.");
   }
 
   // Auto re-enhance when duration / aspect / voice change AFTER the user has
@@ -855,6 +887,10 @@ function App() {
 
   const recentLines = dbgLines.slice(-200);
 
+  // Gate the prompt-generation buttons: every selection (prompt + voice + duration + aspect)
+  // must be present. Defaults exist but explicit truthy check protects against ""/0/null.
+  const canCraft = !!(prompt.trim() && voice && seconds && size);
+
   return html`
     <header class="app">
       <span class="dot"></span>
@@ -886,14 +922,30 @@ function App() {
                 value=${narration} onInput=${e => setNarration(e.target.value)}></textarea>
             </div>
             <div style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
-              <button class="primary" onClick=${enhanceClick} disabled=${enhancing || crafting || !prompt.trim()}>
+              <button class="primary" onClick=${enhanceClick} disabled=${!canCraft || enhancing || crafting}>
                 ${enhancing ? "Enhancing…" : "✨ Generate cinematic prompt"}
               </button>
-              <button onClick=${promptCraft} disabled=${enhancing || crafting || !prompt.trim()} title="Multi-layer reasoner (gpt-5.4) with 5 critic iterations. Honours every word of your ask, locks realism, mitigates Sora face-drift. Takes 30-90s.">
-                ${crafting ? "Crafting (30-90s)…" : "🧠 PromptCraft (deep reasoner)"}
+              <button onClick=${promptCraft} disabled=${!canCraft || enhancing || crafting} title=${canCraft ? "Multi-layer reasoner (gpt-5.4) with 5 critic iterations. Honours every word of your ask, locks realism, mitigates Sora face-drift. Takes 30-120s." : "Fill prompt, voice, duration and aspect first."}>
+                ${crafting ? "Crafting…" : "🧠 PromptCraft (deep reasoner)"}
               </button>
-              <span class="muted small">Frame-by-frame, scales with duration &amp; voice</span>
+              ${crafting && html`<button class="ghost small" onClick=${cancelCraft}>✕ Cancel</button>`}
+              <span class="muted small">Frame-by-frame, scales with duration & voice</span>
             </div>
+            ${crafting && craftProgress && html`
+              <div style=${{marginTop:8}}>
+                <div style=${{display:"flex",justifyContent:"space-between",fontSize:12,marginBottom:4}}>
+                  <span class="muted">${craftProgress.phase || "working…"}</span>
+                  <span class="muted">${craftProgress.pct || 0}%</span>
+                </div>
+                <div class="progress"><div style=${{width: (craftProgress.pct || 0) + "%"}}></div></div>
+                ${Array.isArray(craftProgress.liveIterations) && craftProgress.liveIterations.length > 0 && html`
+                  <div class="muted small" style=${{marginTop:4}}>
+                    iter ${craftProgress.liveIterations.length} latest scores —
+                    ${(() => { const it = craftProgress.liveIterations[craftProgress.liveIterations.length-1]; return ` F:${it.scores.faithfulness} R:${it.scores.realism} S:${it.scores.soraCompat} C:${it.scores.frameCoherence} (${it.verdict})`; })()}
+                  </div>
+                `}
+              </div>
+            `}
             ${craftResult && html`
               <div class="plan">
                 <div class="plan-head">
