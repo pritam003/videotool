@@ -235,8 +235,12 @@ window.fetch = async (input, init) => {
 };
 window.addEventListener("error", e => dbg("error", e.message,
   `${e.filename}:${e.lineno}:${e.colno}\n${e.error?.stack || ""}`));
-window.addEventListener("unhandledrejection", e => dbg("error", "unhandledrejection",
-  String(e.reason?.stack || e.reason?.message || e.reason)));
+window.addEventListener("unhandledrejection", e => {
+  const msg = String(e.reason?.message || e.reason || "");
+  // Benign: HTMLMediaElement aborts a pending play() when we pause/seek to grab last frame.
+  if (/play\(\) request was interrupted/i.test(msg)) { e.preventDefault(); return; }
+  dbg("error", "unhandledrejection", String(e.reason?.stack || msg));
+});
 
 // ---------- toast ----------
 function toast(msg, isErr) {
@@ -514,17 +518,24 @@ function App() {
     v.preload = "auto";
     v.src = url;
     await new Promise((res, rej) => {
-      v.onloadedmetadata = () => res();
-      v.onerror = () => rej(new Error("video load failed (CORS?)"));
-      setTimeout(() => rej(new Error("video load timeout")), 15000);
+      const t = setTimeout(() => rej(new Error("video load timeout")), 25000);
+      v.onloadedmetadata = () => { clearTimeout(t); res(); };
+      v.onerror = () => { clearTimeout(t); rej(new Error("video load failed (CORS?)")); };
     });
-    const target = Math.max(0, (v.duration || 0) - 0.05);
-    await new Promise((res, rej) => {
-      v.onseeked = () => res();
-      v.onerror = () => rej(new Error("video seek failed"));
-      v.currentTime = target;
-      setTimeout(() => rej(new Error("video seek timeout")), 8000);
+    const dur = v.duration || 0;
+    const seekTo = (target) => new Promise((res, rej) => {
+      const t = setTimeout(() => rej(new Error("video seek timeout")), 20000);
+      v.onseeked = () => { clearTimeout(t); res(); };
+      v.onerror = () => { clearTimeout(t); rej(new Error("video seek failed")); };
+      try { v.currentTime = target; } catch (e) { clearTimeout(t); rej(e); }
     });
+    // Try near-end; if that times out fall back to 95% then 90%.
+    let lastErr = null;
+    for (const frac of [0.985, 0.95, 0.9]) {
+      try { await seekTo(Math.max(0, dur * frac)); lastErr = null; break; }
+      catch (e) { lastErr = e; }
+    }
+    if (lastErr) throw lastErr;
     const canvas = document.createElement("canvas");
     canvas.width = w || v.videoWidth;
     canvas.height = h || v.videoHeight;
@@ -534,31 +545,62 @@ function App() {
     return new File([blob], "lastframe.jpg", { type: "image/jpeg" });
   }
 
+  // One Sora attempt: submit + poll + finalize. Returns finalized clip object.
+  async function runOneClip(thePrompt, chunkSec, ref, label) {
+    setStatus(s => ({ ...s, label: `${label}: ${ref ? "with last-frame anchor, " : ""}submitting` }));
+    const job = await submitChunk(thePrompt, chunkSec, ref);
+    setStatus(s => ({ ...s, label: `${label}: rendering` }));
+    await poll(job.id);
+    const fr = await fetch(`/api/jobs/${job.id}/finalize`, { method: "POST" });
+    return await jsonOrThrow(fr);
+  }
+
   async function run() {
     const finalText = finalPrompt.trim() || prompt.trim();
     if (!finalText) { toast("Enter a prompt first.", true); return; }
-    setRunning(true); setOuts([]); setStatus({ phase: "running", pct: 5, label: "submitting" });
+    setRunning(true); setOuts([]); setSegSummaries([]); setStatus({ phase: "running", pct: 5, label: "submitting" });
     try {
-      // Sora-2 chunks
+      const usePlan = plan && Array.isArray(plan.segments) && plan.segments.length > 0;
       const chunkSize = Math.min(seconds, 12);
-      const chunks = Math.ceil(seconds / chunkSize);
+      const chunks = usePlan ? plan.segments.length : Math.ceil(seconds / chunkSize);
       const [W, H] = size.split("x").map(Number);
       const finals = [];
-      let prevFrame = null; // last frame of previous chunk → input_reference for next
+      const priorSummaries = [];
+      let prevFrame = null;
       for (let i = 0; i < chunks; i++) {
-        const continuation = i === 0 ? "" :
-          `\n\n[Segment ${i+1}/${chunks} — DIRECT CONTINUATION of the previous segment. Same character (identical wardrobe, hair, face, build), same environment, same lighting, same lens, same color grade. SAME VOICE timbre, accent, pitch and pace as the previous segment. Same diegetic background sound bed continues uninterrupted. The first frame matches the previous segment's last frame; motion and audio pick up immediately with no cut, no fade, no recap.]`;
-        setStatus(s => ({ ...s, label: `clip ${i+1}/${chunks}: ${prevFrame ? "with last-frame anchor, " : ""}submitting`, pct: 5 + (i / chunks) * 80 }));
-        const job = await submitChunk(finalText + continuation, chunkSize, prevFrame);
-        setStatus(s => ({ ...s, label: `clip ${i+1}/${chunks}: rendering`, pct: 10 + (i / chunks) * 80 }));
-        await poll(job.id);
-        const fr = await fetch(`/api/jobs/${job.id}/finalize`, { method: "POST" });
-        const fj = await jsonOrThrow(fr);
-        finals.push({ ...fj, seconds: chunkSize, size });
+        // Per-segment chunk size: in plan mode, derive from the segment's own span (clamped to 4/8/12).
+        let segSec = chunkSize;
+        if (usePlan) {
+          const span = (plan.segments[i].endSec ?? 0) - (plan.segments[i].startSec ?? 0);
+          segSec = span >= 12 ? 12 : span >= 8 ? 8 : 4;
+        }
+        const thePrompt = usePlan
+          ? buildSegmentPrompt(plan, i, priorSummaries)
+          : finalText + (i === 0 ? "" : `\n\n[Segment ${i+1}/${chunks} — DIRECT CONTINUATION of the previous segment. Same character, environment, lighting, lens, color grade. SAME voice timbre, accent, pitch, pace. Same diegetic background sound bed continues uninterrupted. First frame matches previous segment's last frame; motion and audio pick up immediately with no cut, no fade, no recap.]`);
+        const label = `clip ${i+1}/${chunks}`;
+        setStatus(s => ({ ...s, pct: 5 + (i / chunks) * 80 }));
+        let fj;
+        try {
+          fj = await runOneClip(thePrompt, segSec, prevFrame, label);
+        } catch (e) {
+          // One retry without input_reference if Sora rejects the anchor ("Job failed" right after submit).
+          if (prevFrame && /Job (failed|cancelled)/i.test(e.message)) {
+            dbg("warn", `${label} failed with anchor — retrying without input_reference`);
+            fj = await runOneClip(thePrompt, segSec, null, `${label} (retry)`);
+          } else {
+            throw e;
+          }
+        }
+        finals.push({ ...fj, seconds: segSec, size });
         setOuts([...finals]);
+        if (usePlan) {
+          const sum = plan.segments[i].summary || "";
+          priorSummaries.push(sum);
+          setSegSummaries(arr => [...arr, sum]);
+        }
         if (i < chunks - 1) {
           try {
-            setStatus(s => ({ ...s, label: `clip ${i+1}/${chunks}: capturing last frame for continuity`, pct: 5 + ((i+1) / chunks) * 80 }));
+            setStatus(s => ({ ...s, label: `${label}: capturing last frame for continuity`, pct: 5 + ((i+1) / chunks) * 80 }));
             prevFrame = await extractLastFrame(fj.url, W, H);
             dbg("ok", `last-frame captured (${prevFrame.size} bytes) for clip ${i+2} anchor`);
           } catch (e) {
