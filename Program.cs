@@ -118,9 +118,26 @@ app.MapGet("/api/jobs/{id}", async (string id, IHttpClientFactory hf, IConfigura
     var (baseUrl, apiKey, _) = AoaiCfg(cfg);
     var client = hf.CreateClient();
     client.DefaultRequestHeaders.Add("api-key", apiKey);
-    using var resp = await client.GetAsync($"{baseUrl}/openai/v1/videos/{id}", ct);
-    var body = await resp.Content.ReadAsStringAsync(ct);
-    return Results.Content(body, "application/json", statusCode: (int)resp.StatusCode);
+    // Retry transient 5xx / 429 from Sora's polling endpoint with exponential
+    // backoff. Sora occasionally returns "server had an error processing your
+    // request" mid-render; the underlying job is still alive, so a retried GET
+    // usually succeeds and the user's render survives.
+    HttpResponseMessage? resp = null;
+    string body = "";
+    var delays = new[] { 1000, 2000, 4000, 8000 };
+    for (int attempt = 0; attempt <= delays.Length; attempt++)
+    {
+        resp?.Dispose();
+        resp = await client.GetAsync($"{baseUrl}/openai/v1/videos/{id}", ct);
+        body = await resp.Content.ReadAsStringAsync(ct);
+        var sc = (int)resp.StatusCode;
+        var transient = sc == 429 || (sc >= 500 && sc <= 599);
+        if (!transient || attempt == delays.Length) break;
+        try { await Task.Delay(delays[attempt], ct); } catch { break; }
+    }
+    var status = resp != null ? (int)resp.StatusCode : 502;
+    resp?.Dispose();
+    return Results.Content(body, "application/json", statusCode: status);
 });
 
 // 2b. Cancel an in-flight job. Forwards to Sora's cancel endpoint so we stop

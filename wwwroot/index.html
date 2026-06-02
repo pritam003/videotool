@@ -578,6 +578,7 @@ function App() {
     currentJobIdRef.current = id;
     let elapsed = 0;
     try {
+      let transientFails = 0;
       while (true) {
         if (cancelRef.current) throw new Error("Cancelled by user");
         const wait = elapsed < 60_000 ? 6000 : elapsed < 120_000 ? 4000 : 3000;
@@ -585,6 +586,19 @@ function App() {
         elapsed += wait;
         if (cancelRef.current) throw new Error("Cancelled by user");
         const r = await fetch(`/api/jobs/${id}`);
+        // Tolerate transient upstream 5xx / 429 from Sora — the underlying
+        // render job is still alive, just the status endpoint hiccuped.
+        // Bail only after several consecutive failures.
+        if (r.status === 429 || (r.status >= 500 && r.status <= 599)) {
+          transientFails++;
+          dbg("warn", `transient ${r.status} on /api/jobs/${id} (fail ${transientFails}/6) — keep polling`);
+          if (transientFails >= 6) {
+            const tx = await r.text().catch(() => "");
+            throw new Error(`Sora status endpoint returned ${r.status} 6× in a row: ${tx.slice(0, 240)}`);
+          }
+          continue;
+        }
+        transientFails = 0;
         const j = await jsonOrThrow(r);
         const st = j.status;
         if (onProgress) onProgress(st, elapsed);
