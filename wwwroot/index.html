@@ -183,7 +183,7 @@
         </select>
       </div>
       <div>
-        <label>Voice</label>
+        <label>Narration language / voice</label>
         <select id="voice">
           <optgroup label="English (US)">
             <option value="en-US-AvaMultilingualNeural">Ava (US, female)</option>
@@ -228,8 +228,8 @@
       <div class="preview" id="preview" hidden></div>
     </label>
 
-    <label>Narration script <span style="text-transform:none;color:var(--muted)">(optional · spoken alongside the video)</span></label>
-    <textarea id="narration" placeholder="What the video should say while it plays. e.g. 'Above the clouds, time slows. Each peak holds its breath as the sun lights the world on fire.'"></textarea>
+    <label>Narration script <span style="text-transform:none;color:var(--muted)">(optional · Sora speaks this inside the video, in the language of the chosen voice)</span></label>
+    <textarea id="narration" placeholder="Type what should be said. e.g. 'Help me, the crabs are everywhere!' — pick a Bengali voice and Sora will translate and speak it in Bengali with natural emotion."></textarea>
 
     <button id="go" class="primary">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
@@ -344,14 +344,42 @@ async function run() {
     setStatus("in_progress",
       stitched ? `rendering ${chunks.length} clips sequentially (Sora-2 allows 1 at a time)…` : "submitting…");
 
+    // Narration is spoken by Sora itself. Translate if voice locale is non-English.
+    const narrationRaw = $("#narration").value.trim();
+    const voiceVal = $("#voice").value;
+    const localeMatch = voiceVal.match(/^([a-z]{2})-([A-Z]{2})/);
+    const langPrefix = localeMatch ? localeMatch[1] : "en";
+    const langName = ({ en:"English", hi:"Hindi", bn:"Bengali" })[langPrefix] || "English";
+    const voiceShort = voiceVal.split("-").slice(2).join("-").replace(/Neural$/i,"");
+    const voiceGender = /(male|kunal|aarav|prabhat|madhur|rehaan|arjun|adam|andrew|alloy|echo|bashkar)/i.test(voiceVal) ? "male" : "female";
+
+    let spokenLine = "";
+    if (narrationRaw) {
+      let toSpeak = narrationRaw;
+      if (langPrefix !== "en") {
+        setStatus("in_progress", `translating narration to ${langName}…`);
+        try {
+          const tr = await fetch("/api/translate", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ text: narrationRaw, to: langPrefix })
+          });
+          const tj = await tr.json();
+          if (tr.ok && tj.translated) toSpeak = tj.translated;
+        } catch (e) { /* fall back to original */ }
+      }
+      // Embed as a clear voiceover instruction for Sora.
+      spokenLine = `\n\nVoiceover: a ${voiceGender} voice (${voiceShort || langName}) speaks in ${langName}, with natural emotion and clear lip-sync if a character is on screen, saying exactly: "${toSpeak.replace(/"/g, '\\"')}". Include only this voiceover plus matching ambient sound — no music, no other speech.`;
+    }
+
     // Submit + poll one chunk at a time (Sora-2 deployment allows only 1 running task).
     const submitOne = async (sec, idx) => {
       const fd = new FormData();
-      const promptForChunk = stitched
+      const promptForChunk = (stitched
         ? `${prompt}\n\nThis is shot ${idx+1} of ${chunks.length} in one continuous scene. ` +
           (idx === 0 ? "Establish the scene and camera framing."
                      : "Continue seamlessly from the previous shot — same characters, lighting, palette, camera motion. Do not reset the scene.")
-        : prompt;
+        : prompt) + (idx === 0 ? spokenLine : "");
       fd.append("prompt", promptForChunk);
       fd.append("seconds", String(sec));
       fd.append("size", $("#size").value);
@@ -386,18 +414,7 @@ async function run() {
       }
     };
 
-    // 1) Kick off TTS in parallel if narration present (independent of Sora queue)
-    const narration = $("#narration").value.trim();
-    let narrationPromise = null;
-    if (narration) {
-      narrationPromise = fetch("/api/narrate", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ text: narration, voice: $("#voice").value })
-      }).then(async r => { const t = await r.text(); if (!r.ok) throw new Error(t); return JSON.parse(t); });
-    }
-
-    // 2) Submit + render one clip at a time
+    // Submit + render one clip at a time
     const jobs = [];
     const finals = [];
     for (let i = 0; i < chunks.length; i++) {
@@ -416,7 +433,7 @@ async function run() {
     setStatus("completed", "saving to storage…", 96);
     $("#barFill").style.width = "96%";
 
-    // 3) Finalize all clips in parallel (download from Sora -> blob -> SAS URL)
+    // Finalize all clips in parallel (download from Sora -> blob -> SAS URL)
     const outs = await Promise.all(jobs.map(async j => {
       const r = await fetch(`/api/jobs/${j.id}/finalize`, { method: "POST" });
       const txt = await r.text();
@@ -424,12 +441,8 @@ async function run() {
       return JSON.parse(txt);
     }));
 
-    // 4) Resolve narration
+    // Sora generates audio natively; no TTS overlay.
     let narr = null;
-    if (narrationPromise) {
-      try { narr = await narrationPromise; }
-      catch (e) { toast("Narration failed: " + e.message, true); }
-    }
 
     setStatus("completed", "ready", 100);
     $("#barFill").style.width = "100%";
@@ -496,8 +509,10 @@ function renderPlayer(outs, narr, last, totalSeconds) {
     v.addEventListener("pause", () => audio.pause());
     v.addEventListener("ended", () => {/* let our handler above continue narration */});
   } else {
+    // No narration — let Sora's native audio play
     audio.removeAttribute("src");
     audio.hidden = true;
+    v.muted = false;
   }
 
   const meta = $("#meta");

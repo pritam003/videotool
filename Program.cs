@@ -153,9 +153,32 @@ app.MapPost("/api/narrate", async (NarrateRequest req, IHttpClientFactory hf,
     var voice = string.IsNullOrWhiteSpace(req.Voice) ? "en-US-AvaMultilingualNeural" : req.Voice!;
     // Derive locale from voice short name (e.g. "hi-IN-SwaraNeural" -> "hi-IN")
     var lang = voice.Length >= 5 && voice[2] == '-' ? voice.Substring(0, 5) : "en-US";
+    var langPrefix = lang.Substring(0, 2).ToLowerInvariant();
+
+    // Auto-translate to target language if voice is non-English (Bengali, Hindi, etc.)
+    var text = req.Text!;
+    if (langPrefix != "en")
+    {
+        var client0 = hf.CreateClient();
+        client0.Timeout = TimeSpan.FromSeconds(30);
+        using var trMsg = new HttpRequestMessage(HttpMethod.Post,
+            $"https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to={langPrefix}");
+        trMsg.Headers.Add("Ocp-Apim-Subscription-Key", key);
+        trMsg.Headers.Add("Ocp-Apim-Subscription-Region", region);
+        trMsg.Content = new StringContent(
+            System.Text.Json.JsonSerializer.Serialize(new[] { new { Text = text } }),
+            Encoding.UTF8, "application/json");
+        using var trResp = await client0.SendAsync(trMsg, ct);
+        if (trResp.IsSuccessStatusCode)
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(await trResp.Content.ReadAsStringAsync(ct));
+            var translated = doc.RootElement[0].GetProperty("translations")[0].GetProperty("text").GetString();
+            if (!string.IsNullOrWhiteSpace(translated)) text = translated!;
+        }
+    }
 
     var ssml = $@"<speak version='1.0' xml:lang='{lang}'>
-<voice name='{voice}'>{System.Security.SecurityElement.Escape(req.Text)}</voice>
+<voice name='{voice}'>{System.Security.SecurityElement.Escape(text)}</voice>
 </speak>";
 
     var client = hf.CreateClient();
@@ -180,7 +203,7 @@ app.MapPost("/api/narrate", async (NarrateRequest req, IHttpClientFactory hf,
     var container = svc.GetBlobContainerClient(cfg["STORAGE_CONTAINER"] ?? "videos");
     var name = $"narration/{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}.mp3";
     var url = await UploadAndSign(container, name, mp3, "audio/mpeg", svc, account, ct);
-    return Results.Ok(new { url, voice, length = mp3.Length });
+    return Results.Ok(new { url, voice, lang, translated = (text != req.Text!) ? text : null, length = mp3.Length });
 });
 
 app.MapGet("/api/voices", async (IHttpClientFactory hf, IConfiguration cfg, CancellationToken ct) =>
@@ -196,6 +219,33 @@ app.MapGet("/api/voices", async (IHttpClientFactory hf, IConfiguration cfg, Canc
     return Results.Content(body, "application/json", statusCode: (int)resp.StatusCode);
 });
 
+// Translate arbitrary text to a target language code (e.g. "bn", "hi").
+app.MapPost("/api/translate", async (TranslateRequest req, IHttpClientFactory hf,
+    IConfiguration cfg, CancellationToken ct) =>
+{
+    if (string.IsNullOrWhiteSpace(req.Text) || string.IsNullOrWhiteSpace(req.To))
+        return Results.BadRequest(new { error = "text and to are required" });
+    var key = Cfg(cfg, "AOAI_KEY");
+    var region = Cfg(cfg, "SPEECH_REGION");
+    var client = hf.CreateClient();
+    client.Timeout = TimeSpan.FromSeconds(30);
+    using var msg = new HttpRequestMessage(HttpMethod.Post,
+        $"https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to={Uri.EscapeDataString(req.To!)}");
+    msg.Headers.Add("Ocp-Apim-Subscription-Key", key);
+    msg.Headers.Add("Ocp-Apim-Subscription-Region", region);
+    msg.Content = new StringContent(
+        System.Text.Json.JsonSerializer.Serialize(new[] { new { Text = req.Text } }),
+        Encoding.UTF8, "application/json");
+    using var resp = await client.SendAsync(msg, ct);
+    var body = await resp.Content.ReadAsStringAsync(ct);
+    if (!resp.IsSuccessStatusCode)
+        return Results.Problem($"Translate failed ({(int)resp.StatusCode}): {body}");
+    using var doc = System.Text.Json.JsonDocument.Parse(body);
+    var translated = doc.RootElement[0].GetProperty("translations")[0].GetProperty("text").GetString();
+    return Results.Ok(new { translated, to = req.To });
+});
+
 app.Run();
 
 public record NarrateRequest(string Text, string? Voice);
+public record TranslateRequest(string Text, string? To);
