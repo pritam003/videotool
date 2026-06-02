@@ -494,10 +494,14 @@ function App() {
           // the IDENTITY LOCK header.
           segments: j.segments.map((s, i) => {
             const sbi = sb[i] || {};
+            // Sora-2 only supports 4/8/12. Snap to the nearest supported value.
+            const rawSec = Number(s.seconds) || 12;
+            const segSec = rawSec >= 12 ? 12 : rawSec >= 8 ? 8 : 4;
             return {
               index: s.index ?? (i + 1),
-              startSec: sbi.startSec ?? (i * (s.seconds || 12)),
-              endSec: sbi.endSec ?? ((i + 1) * (s.seconds || 12)),
+              seconds: segSec,
+              startSec: sbi.startSec ?? (i * segSec),
+              endSec: sbi.endSec ?? ((i + 1) * segSec),
               summary: s.prompt,
               beats: Array.isArray(sbi.beats) ? sbi.beats : [],
               dialogue: s.dialogue
@@ -789,11 +793,20 @@ function App() {
       toast(`Rendering ${chunks} clip${chunks > 1 ? "s" : ""} · est. ~${etaMin} min on Sora-2 (sequential, 1 task/deployment)`);
       for (let i = 0; i < chunks; i++) {
         if (cancelRef.current) throw new Error("Cancelled by user");
-        // Per-segment chunk size: in plan mode, derive from the segment's own span (clamped to 4/8/12).
+        // Per-segment chunk size: in plan mode, prefer the segment's explicit
+        // `seconds` field (set by PromptCraft from chunkSeconds). Fall back to
+        // the endSec-startSec span only if seconds is missing. Final fallback is
+        // the user-selected chunkSize so we NEVER silently collapse to 4s.
         let segSec = chunkSize;
         if (usePlan) {
-          const span = (plan.segments[i].endSec ?? 0) - (plan.segments[i].startSec ?? 0);
-          segSec = span >= 12 ? 12 : span >= 8 ? 8 : 4;
+          const segObj = plan.segments[i] || {};
+          const explicit = Number(segObj.seconds);
+          if (explicit === 4 || explicit === 8 || explicit === 12) {
+            segSec = explicit;
+          } else {
+            const span = (segObj.endSec ?? 0) - (segObj.startSec ?? 0);
+            segSec = span >= 12 ? 12 : span >= 8 ? 8 : span >= 4 ? 4 : chunkSize;
+          }
         }
         const thePrompt = usePlan
           ? buildSegmentPrompt(plan, i, priorSummaries, bible)
