@@ -187,8 +187,7 @@
 <script type="module">
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { createRoot } from "react-dom/client";
-import htm from "htm";
-const html = htm.bind(React.createElement);
+import { html } from "htm";
 
 // ---------- debug log ----------
 const dbgListeners = new Set();
