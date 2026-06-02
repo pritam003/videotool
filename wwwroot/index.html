@@ -639,16 +639,18 @@ function App() {
       const jobId = start.jobId;
       craftJobIdRef.current = jobId;
 
-      // Poll loop. ~1s cadence; bail out on done/error. Tolerates transient
-      // network failures (TypeError: Failed to fetch from mobile tab-suspend,
-      // upstream 5xx, request timeouts) so a temporarily backgrounded tab can
-      // pick up where it left off — the PromptCraft job lives in server memory
-      // for 10 minutes regardless of what the client does.
+      // Poll loop. ~1s cadence on the happy path; on transient failure
+      // (mobile tab-suspend killing in-flight fetches, DNS hiccup, upstream
+      // 5xx, request timeout) we keep retrying with exponential backoff for
+      // up to ~9 minutes — the PromptCraft job lives in server memory for 10
+      // minutes regardless of client state, so we want to use most of that
+      // budget. When the device is offline, we wait for the `online` event
+      // (capped by the backoff timer) instead of busy-failing.
       let j = null;
       let transientFails = 0;
-      const MAX_TRANSIENT = 12;
+      const POLL_DEADLINE = Date.now() + 9 * 60 * 1000; // 9 min — under 10-min server eviction
       while (true) {
-        await sleep(1000);
+        if (Date.now() > POLL_DEADLINE) throw new Error("PromptCraft poll exceeded 9 minutes — giving up");
         if (craftJobIdRef.current !== jobId) throw new Error("Cancelled");
         let st;
         try {
@@ -657,27 +659,44 @@ function App() {
           const sr = await fetch(`/api/promptcraft/${jobId}`, { signal: AbortSignal.timeout(30_000) });
           if (sr.status === 429 || (sr.status >= 500 && sr.status <= 599)) {
             transientFails++;
-            dbg("warn", `promptcraft poll: transient ${sr.status} (${transientFails}/${MAX_TRANSIENT}) — retrying`);
-            if (transientFails >= MAX_TRANSIENT) throw new Error(`server returned ${sr.status} ${MAX_TRANSIENT}× — giving up`);
+            const wait = Math.min(30_000, 1000 * Math.pow(2, Math.min(transientFails - 1, 5)));
+            dbg("warn", `promptcraft poll: transient ${sr.status} (#${transientFails}) — backing off ${wait}ms`);
+            await sleep(wait);
             continue;
           }
           st = await jsonOrThrow(sr);
           transientFails = 0;
         } catch (fetchErr) {
           // Network-layer failure (mobile tab suspended an in-flight fetch,
-          // DNS hiccup, AbortSignal.timeout). The server job keeps running;
-          // we just retry. Only bail after MAX_TRANSIENT consecutive failures.
+          // DNS hiccup, radio asleep, AbortSignal.timeout). The server job
+          // keeps running; we just retry with backoff and, when the browser
+          // reports we're offline, wait for the `online` event.
           const isAbort = fetchErr.name === "AbortError" || fetchErr.name === "TimeoutError";
           const isNet = fetchErr instanceof TypeError; // "Failed to fetch"
           if (!isAbort && !isNet) throw fetchErr;
           transientFails++;
-          dbg("warn", `promptcraft poll: ${fetchErr.name || "fetch"} (${transientFails}/${MAX_TRANSIENT}) — server still has the job, retrying`);
-          if (transientFails >= MAX_TRANSIENT) throw new Error(`network unreachable after ${MAX_TRANSIENT} retries: ${fetchErr.message}`);
+          const wait = Math.min(30_000, 1000 * Math.pow(2, Math.min(transientFails - 1, 5)));
+          const offline = (typeof navigator !== "undefined") && (navigator.onLine === false);
+          dbg("warn", `promptcraft poll: ${fetchErr.name || "fetch"} (#${transientFails})${offline ? " — offline, waiting" : ""} — backoff ${wait}ms`);
+          if (offline) {
+            // Resume as soon as connectivity returns, but no later than `wait`.
+            await new Promise((resolve) => {
+              let done = false;
+              const finish = () => { if (done) return; done = true; window.removeEventListener("online", finish); resolve(); };
+              window.addEventListener("online", finish, { once: true });
+              setTimeout(finish, wait);
+            });
+          } else {
+            await sleep(wait);
+          }
           continue;
         }
         setCraftProgress({ phase: st.phase, pct: st.pct, liveIterations: st.liveIterations });
         if (st.error) throw new Error(st.error);
         if (st.done && st.result) { j = st.result; break; }
+        // Happy-path cadence — only sleep here, not before the fetch, so
+        // backoff branches above don't double-sleep.
+        await sleep(1000);
       }
 
       setCraftResult(j);
