@@ -141,6 +141,48 @@ app.MapPost("/api/jobs/{id}/finalize", async (
     return Results.Ok(new { url, blob = name, videoId = id });
 });
 
+// 3a. List previously finalized videos (mp4 blobs in the container) with fresh SAS URLs.
+app.MapGet("/api/videos", async (IConfiguration cfg, TokenCredential cred, CancellationToken ct,
+    int? limit) =>
+{
+    var account = Cfg(cfg, "STORAGE_ACCOUNT");
+    var svc = new BlobServiceClient(new Uri($"https://{account}.blob.core.windows.net"), cred);
+    var container = svc.GetBlobContainerClient(cfg["STORAGE_CONTAINER"] ?? "videos");
+    var max = Math.Clamp(limit ?? 50, 1, 200);
+
+    var udk = await svc.GetUserDelegationKeyAsync(
+        DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddHours(2), ct);
+
+    var items = new List<object>();
+    await foreach (var b in container.GetBlobsAsync(BlobTraits.None, BlobStates.None, cancellationToken: ct))
+    {
+        if (!b.Name.EndsWith(".mp4", StringComparison.OrdinalIgnoreCase)) continue;
+        var sas = new BlobSasBuilder
+        {
+            BlobContainerName = container.Name,
+            BlobName = b.Name,
+            Resource = "b",
+            ExpiresOn = DateTimeOffset.UtcNow.AddHours(2)
+        };
+        sas.SetPermissions(BlobSasPermissions.Read);
+        var token = sas.ToSasQueryParameters(udk.Value, account).ToString();
+        var url = $"https://{account}.blob.core.windows.net/{container.Name}/{Uri.EscapeDataString(b.Name).Replace("%2F", "/")}?{token}";
+        items.Add(new
+        {
+            name = b.Name,
+            url,
+            size = b.Properties.ContentLength,
+            createdOn = b.Properties.CreatedOn,
+            lastModified = b.Properties.LastModified
+        });
+    }
+    var sorted = items
+        .OrderByDescending(x => ((dynamic)x).createdOn ?? ((dynamic)x).lastModified)
+        .Take(max)
+        .ToList();
+    return Results.Ok(new { count = sorted.Count, videos = sorted });
+});
+
 // 4. Narrate: synthesize speech via Azure Speech, upload MP3, return SAS URL.
 app.MapPost("/api/narrate", async (NarrateRequest req, IHttpClientFactory hf,
     IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
@@ -264,14 +306,8 @@ app.MapPost("/api/enhance", async (EnhanceRequest req, IHttpClientFactory hf,
     var seconds = req.Seconds ?? 8;
     var size = req.Size ?? "1280x720";
 
-    var sys = @"You are a senior cinematographer who writes prompts for the Sora-2 text-to-video model.
-Rewrite the user's idea into ONE single English paragraph (max 120 words) that Sora-2 will turn into a great video.
-Rules:
-- Be visually concrete: subject, action, setting, time of day, lighting, lens / camera move, mood.
-- Use ""photorealistic"", ""shallow depth of field"", ""35mm film look"" or ""anime"" style cues only when they fit the user's intent.
-- If a narration script is provided, the visible character must clearly be speaking it (open mouth, lip-sync) and the prompt must include a Voiceover instruction with the EXACT translated line in the target language, the speaker's gender, and the language name.
-- Never invent extra dialogue. Never add background music unless asked. Mention real ambient sound that fits.
-- Output ONLY the final prompt. No preamble, no markdown, no quotes around it.";
+    // Beat count scales with duration: ~1 beat per 2 seconds, capped to a sensible range.
+    var beatCount = Math.Clamp(seconds / 2, 3, 6);
 
     var translatedNarration = req.Narration ?? "";
     if (!string.IsNullOrWhiteSpace(req.Narration) && langPrefix != "en")
@@ -300,6 +336,41 @@ Rules:
         @"(male|kunal|aarav|prabhat|madhur|rehaan|arjun|adam|andrew|alloy|echo|bashkar|niranjan|gagan|midhun|manohar|ojas|valluvar|mohan|salman)",
         System.Text.RegularExpressions.RegexOptions.IgnoreCase) ? "male" : "female";
 
+    var sys = $@"You are a senior film director writing a shot brief for OpenAI's Sora-2 text-to-video model (which generates synchronized native audio, dialogue, and lip-sync).
+Rewrite the user's idea into a structured, frame-by-frame cinematic prompt that follows OpenAI's official Sora-2 template EXACTLY in this order and with these exact section headers:
+
+Style: <one line — film stock / aesthetic / era / grade. e.g. ""Photorealistic, shot on Arri Alexa, 35mm anamorphic, warm naturalistic grade, shallow DOF, subtle film grain.""  Avoid 'cinematic' alone; be specific.>
+
+Scene: <2-4 sentences of prose. Anchor the main character with 3-5 distinctive, repeatable details (age, hair, wardrobe, build) — these MUST be reused identically anywhere the character is referenced again. Describe the environment with concrete nouns (""wet cobblestone"", ""rust-streaked steel beams""), time of day, weather, and 3-5 palette anchor colors. Mention 1-2 small environmental details (dust motes, steam, reflections) for realism.>
+
+Cinematography:
+Camera shot: <framing + angle, e.g. ""medium close-up, eye-level"" or ""wide establishing, slight low angle"">
+Camera motion: <ONE clear move, e.g. ""slow 1ft dolly-in"" or ""static tripod"" or ""handheld follow"">
+Lens: <focal length + DOF, e.g. ""50mm spherical, shallow depth of field, f/2.0"">
+Lighting: <key + fill + rim with direction and color temperature, e.g. ""soft warm key from camera-left window, cool blue rim from street neon behind, low ambient fill"">
+Mood: <2-3 adjectives>
+
+Actions (frame-by-frame beats, exactly {beatCount} beats covering the {seconds}s clip in order):
+- Beat 1 (0–{seconds / beatCount}s): <one specific, visible action with counted movement — e.g. ""she takes two steps toward the window, hand brushing the curtain"". Include a camera/light note if it changes.>
+- Beat 2 (...): <next beat>
+- ... continue until Beat {beatCount}. Each beat = ONE concrete physical action and/or one short dialogue delivery. Place the dialogue line on the beat where it is spoken.
+
+Dialogue:
+{(string.IsNullOrWhiteSpace(translatedNarration) ? "<omit this entire section if no narration was given>" : "<ONE labeled line, EXACTLY as supplied — speaker label in English, then the line verbatim in the target script>")}
+
+Lip sync & performance: The on-screen speaker (gender: {gender}) is clearly visible, mouth open and forming the words of the line above in {langName}. Lip movements, jaw, and breath match the syllable rhythm of the {langName} line. No off-screen narrator. No dubbing. Native {langName} pronunciation.
+
+Background sound: <2-4 concrete diegetic sounds that match the environment — e.g. ""distant surf, gull calls, soft breeze through palm fronds"". No background music unless the user asked for it.>
+
+Negative: no on-screen text, no captions, no logos, no watermarks, no extra speakers, no duplicated limbs.
+
+Hard rules:
+- Output ONLY the structured prompt above, in plain text, with the exact section headers. No preamble, no markdown fences, no quotes wrapping the whole thing.
+- Reuse the character's anchor description identically every time you reference them.
+- Never invent extra dialogue beyond the supplied line. Never translate the supplied line — paste it verbatim.
+- One camera move per shot. One main subject action per beat.
+- Keep total length under ~280 words.";
+
     var userMsg = $@"User idea: {req.Prompt}
 Target duration: {seconds} seconds
 Aspect: {size}
@@ -322,7 +393,7 @@ Compose the final Sora-2 prompt now.";
             new { role = "user",   content = userMsg }
         },
         temperature = 0.7,
-        max_tokens = 600
+        max_tokens = 1200
     };
     chatMsg.Content = new StringContent(
         System.Text.Json.JsonSerializer.Serialize(payload),
