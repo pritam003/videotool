@@ -565,6 +565,65 @@ app.MapPost("/api/remix", async (RemixRequest req, IHttpClientFactory hf,
     return Results.Content(body, "application/json");
 });
 
+// 3b. Local model proxy: forwards to a self-hosted Wan 2.2 (or compatible) container.
+// Synchronous: blocks until inference completes (~9 min on A100). Returns the same
+// shape as /api/jobs finalize so the frontend can treat it interchangeably.
+app.MapPost("/api/jobs/local", async (LocalInferRequest req, IHttpClientFactory hf,
+    IConfiguration cfg, CancellationToken ct) =>
+{
+    var endpoint = cfg["LOCAL_VIDEO_ENDPOINT"];
+    var token = cfg["LOCAL_VIDEO_TOKEN"];
+    if (string.IsNullOrWhiteSpace(endpoint))
+        return Results.BadRequest(new { error = "LOCAL_VIDEO_ENDPOINT not configured. See wan22/README.md." });
+    if (string.IsNullOrWhiteSpace(req.Prompt))
+        return Results.BadRequest(new { error = "prompt is required" });
+
+    // Parse "1280x720" -> (1280, 720). Default 1280x720.
+    int width = 1280, height = 720;
+    if (!string.IsNullOrWhiteSpace(req.Size))
+    {
+        var parts = req.Size!.Split('x');
+        if (parts.Length == 2 && int.TryParse(parts[0], out var w) && int.TryParse(parts[1], out var h))
+        { width = w; height = h; }
+    }
+
+    var payload = new Dictionary<string, object?>
+    {
+        ["prompt"] = req.Prompt,
+        ["seconds"] = req.Seconds ?? 5.0,
+        ["width"] = width,
+        ["height"] = height,
+    };
+    if (req.Seed.HasValue) payload["seed"] = req.Seed.Value;
+
+    var client = hf.CreateClient();
+    client.Timeout = TimeSpan.FromMinutes(15); // Wan TI2V-5B can take ~9 min for 5s
+    using var msg = new HttpRequestMessage(HttpMethod.Post, $"{endpoint!.TrimEnd('/')}/infer");
+    if (!string.IsNullOrWhiteSpace(token))
+        msg.Headers.Add("Authorization", $"Bearer {token}");
+    msg.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+
+    using var resp = await client.SendAsync(msg, ct);
+    var body = await resp.Content.ReadAsStringAsync(ct);
+    if (!resp.IsSuccessStatusCode)
+        return Results.Problem($"Local model failed ({(int)resp.StatusCode}): {body}");
+
+    using var doc = JsonDocument.Parse(body);
+    var blobUrl = doc.RootElement.TryGetProperty("blobUrl", out var b) ? b.GetString() : null;
+    if (string.IsNullOrWhiteSpace(blobUrl))
+        return Results.Problem($"Local model returned no blobUrl: {body}");
+
+    // Shape matches /api/jobs/{id}/finalize so frontend can use it directly.
+    return Results.Json(new
+    {
+        url = blobUrl,
+        videoId = (string?)null, // local model = no remix-able id
+        provider = "wan22",
+        seconds = doc.RootElement.TryGetProperty("seconds", out var s) ? s.GetDouble() : (req.Seconds ?? 5.0),
+        inferenceSeconds = doc.RootElement.TryGetProperty("inferenceSeconds", out var i) ? i.GetDouble() : 0.0,
+    });
+});
+
 // 4. Narrate: synthesize speech via Azure Speech, upload MP3, return SAS URL.
 app.MapPost("/api/narrate", async (NarrateRequest req, IHttpClientFactory hf,
     IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
@@ -864,3 +923,4 @@ public record IdentityRequest(string VideoUrl, string? OriginalAnchor);
 public record TailRequest(string VideoUrl, double? Seconds, string? Size);
 public record SliceRequest(string VideoUrl, double? StartSec, double? DurationSec, string? Size, bool? FromEnd);
 public record RemixRequest(string VideoId, string Prompt, int? Seconds, string? Size);
+public record LocalInferRequest(string Prompt, double? Seconds, string? Size, int? Seed);

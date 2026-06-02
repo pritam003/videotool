@@ -344,6 +344,7 @@ function App() {
   const [segSummaries, setSegSummaries] = useState([]);
   const [identityBible, setIdentityBible] = useState(null); // { characterDescriptor, wardrobe, sceneDescriptor, palette, lensLightingNotes, distinctiveTraits }
   const [useRemix, setUseRemix] = useState(true); // #1: clips 2..N remix-from-clip-1 (native identity preservation)
+  const [provider, setProvider] = useState("sora"); // "sora" | "wan22" — model backend selector
   const [enhancing, setEnhancing] = useState(false);
   const [running, setRunning] = useState(false);
   const [status, setStatus] = useState({ phase: "idle", pct: 0, label: "ready" });
@@ -612,6 +613,33 @@ function App() {
     return await jsonOrThrow(fr);
   }
 
+  // One Wan 2.2 (self-hosted) attempt: synchronous /api/jobs/local. Returns clip-shaped object.
+  // No remix, no anchor — local model is text-to-video only. Identity consistency relies on the
+  // identity-bible / IDENTITY LOCK delimiters in the prompt itself.
+  async function runOneClipViaLocal(thePrompt, chunkSec, label, basePct, spanPct) {
+    setStatus(s => ({ ...s, label: `${label}: Wan 2.2 inferring (~9 min)`, pct: basePct }));
+    const startedAt = Date.now();
+    // Tick the progress bar while we wait for the synchronous /api/jobs/local call.
+    const etaMs = chunkSec * 110_000; // ~110s/output-second on A100 for Wan TI2V-5B
+    const tick = setInterval(() => {
+      const elapsed = Date.now() - startedAt;
+      const frac = Math.min(0.97, elapsed / etaMs);
+      const ss = Math.round(elapsed / 1000);
+      setStatus(s => ({ ...s, label: `${label}: Wan 2.2 inferring (${ss}s)`, pct: basePct + spanPct * frac }));
+    }, 2000);
+    try {
+      const r = await fetch("/api/jobs/local", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: thePrompt, seconds: chunkSec, size })
+      });
+      const j = await jsonOrThrow(r);
+      return { url: j.url, videoId: null, provider: j.provider, seconds: j.seconds };
+    } finally {
+      clearInterval(tick);
+    }
+  }
+
   // Manual re-stitch with a chosen crossfade. Used by the "Re-stitch with crossfade" button.
   async function restitch(cfSec) {
     if (outs.length < 2) { toast("Need at least 2 clips to stitch.", true); return; }
@@ -668,7 +696,11 @@ function App() {
         //   2. On remix failure, fall back to fresh job with 4s tail anchor.
         //   3. On anchor rejection, retry without anchor.
         const tryRemix = i >= 1 && usePlan && firstClipVideoId && useRemix;
-        if (tryRemix) {
+        if (provider === "wan22") {
+          // Self-hosted Wan 2.2 — single backend, text-to-video only, no remix/anchor.
+          fj = await runOneClipViaLocal(thePrompt, segSec, label, basePct, spanPct);
+          dbg("ok", `${label} rendered via Wan 2.2 (self-hosted, ${fj.seconds}s)`);
+        } else if (tryRemix) {
           try {
             fj = await runOneClipViaRemix(firstClipVideoId, thePrompt, segSec, label, basePct, spanPct);
             dbg("ok", `${label} rendered via remix from clip 1 (${firstClipVideoId})`);
@@ -886,6 +918,19 @@ function App() {
                 <strong>Lock character via Sora-2 remix</strong>
                 <div class="muted small">Clips 2..N are generated as remix-edits of clip 1 (native identity preservation). Falls back to fresh + 4s tail anchor if remix fails.</div>
               </label>
+            </div>
+            <div style=${{marginTop:12}}>
+              <label class="muted small" style=${{display:"block",marginBottom:4}}>Model backend</label>
+              <div style=${{display:"flex",gap:14,flexWrap:"wrap"}}>
+                <label style=${{cursor:"pointer"}}>
+                  <input type="radio" name="provider" value="sora" checked=${provider==="sora"} onChange=${() => setProvider("sora")} />
+                  &nbsp;<strong>Sora-2</strong> <span class="muted small">(hosted, ~$0.50/5s, face-block)</span>
+                </label>
+                <label style=${{cursor:"pointer"}}>
+                  <input type="radio" name="provider" value="wan22" checked=${provider==="wan22"} onChange=${() => setProvider("wan22")} />
+                  &nbsp;<strong>Wan 2.2</strong> <span class="muted small">(self-hosted, ~9 min/5s, no face-block)</span>
+                </label>
+              </div>
             </div>
           </Accordion>
           <Accordion title="Reference image (optional)">
