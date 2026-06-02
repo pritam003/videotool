@@ -31,17 +31,10 @@ static BlobContainerClient Container(IConfiguration c, TokenCredential cred)
     return svc.GetBlobContainerClient(name);
 }
 
-static async Task<string> UploadAndSign(
-    BlobContainerClient container, string blobName, byte[] data, string contentType,
-    BlobServiceClient svc, string account, CancellationToken ct)
-{
-    using var ms = new MemoryStream(data);
-    return await UploadAndSign(container, blobName, ms, contentType, svc, account, ct);
-}
-
-// Streaming overload: avoids buffering large payloads (e.g. Sora MP4 downloads) in memory.
+// Streaming upload: avoids buffering large payloads (e.g. Sora MP4 downloads) in memory.
 // Critical on App Service F1 (1GB RAM) where a few concurrent finalize calls + a byte[]
-// MP4 was OOM-recycling the container mid-request.
+// MP4 was OOM-recycling the container mid-request. byte[] callers wrap with MemoryStream
+// inline (cheap; no extra copy).
 static async Task<string> UploadAndSign(
     BlobContainerClient container, string blobName, Stream data, string contentType,
     BlobServiceClient svc, string account, CancellationToken ct)
@@ -285,7 +278,8 @@ app.MapPost("/api/stitch", async (StitchRequest req, IHttpClientFactory hf,
         var svc = new BlobServiceClient(new Uri($"https://{account}.blob.core.windows.net"), cred);
         var container = svc.GetBlobContainerClient(cfg["STORAGE_CONTAINER"] ?? "videos");
         var name = $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-stitched-{req.Urls.Length}clips.mp4";
-        var url = await UploadAndSign(container, name, mp4, "video/mp4", svc, account, ct);
+        using var ms = new MemoryStream(mp4);
+        var url = await UploadAndSign(container, name, ms, "video/mp4", svc, account, ct);
         return Results.Ok(new { url, blob = name, clips = req.Urls.Length, crossfade, bytes = mp4.Length });
     }
     finally
@@ -529,7 +523,8 @@ static async Task<IResult> SliceImpl(SliceRequest req, IHttpClientFactory hf,
         var container = svc.GetBlobContainerClient(cfg["STORAGE_CONTAINER"] ?? "videos");
         var tag = req.FromEnd == true ? "tail" : "slice";
         var name = $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{tag}-{Guid.NewGuid():N}.mp4";
-        var url = await UploadAndSign(container, name, mp4, "video/mp4", svc, account, ct);
+        using var ms = new MemoryStream(mp4);
+        var url = await UploadAndSign(container, name, ms, "video/mp4", svc, account, ct);
         return Results.Ok(new { url, blob = name, seconds = dur, startSec = req.StartSec, fromEnd = req.FromEnd ?? (req.StartSec is null), bytes = mp4.Length });
     }
     finally
@@ -697,7 +692,8 @@ app.MapPost("/api/narrate", async (NarrateRequest req, IHttpClientFactory hf,
     var svc = new BlobServiceClient(new Uri($"https://{account}.blob.core.windows.net"), cred);
     var container = svc.GetBlobContainerClient(cfg["STORAGE_CONTAINER"] ?? "videos");
     var name = $"narration/{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}.mp3";
-    var url = await UploadAndSign(container, name, mp3, "audio/mpeg", svc, account, ct);
+    using var ms = new MemoryStream(mp3);
+    var url = await UploadAndSign(container, name, ms, "audio/mpeg", svc, account, ct);
     return Results.Ok(new { url, voice, lang, translated = (text != req.Text!) ? text : null, length = mp3.Length });
 });
 
