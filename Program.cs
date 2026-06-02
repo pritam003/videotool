@@ -35,10 +35,20 @@ static async Task<string> UploadAndSign(
     BlobContainerClient container, string blobName, byte[] data, string contentType,
     BlobServiceClient svc, string account, CancellationToken ct)
 {
+    using var ms = new MemoryStream(data);
+    return await UploadAndSign(container, blobName, ms, contentType, svc, account, ct);
+}
+
+// Streaming overload: avoids buffering large payloads (e.g. Sora MP4 downloads) in memory.
+// Critical on App Service F1 (1GB RAM) where a few concurrent finalize calls + a byte[]
+// MP4 was OOM-recycling the container mid-request.
+static async Task<string> UploadAndSign(
+    BlobContainerClient container, string blobName, Stream data, string contentType,
+    BlobServiceClient svc, string account, CancellationToken ct)
+{
     var blob = container.GetBlobClient(blobName);
     var opts = new BlobUploadOptions { HttpHeaders = new BlobHttpHeaders { ContentType = contentType } };
-    using (var ms = new MemoryStream(data))
-        await blob.UploadAsync(ms, opts, ct);
+    await blob.UploadAsync(data, opts, ct);
     var udk = await svc.GetUserDelegationKeyAsync(
         DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddHours(2), ct);
     var sas = new BlobSasBuilder
@@ -125,19 +135,22 @@ app.MapPost("/api/jobs/{id}/finalize", async (
     client.Timeout = TimeSpan.FromMinutes(5);
     client.DefaultRequestHeaders.Add("api-key", apiKey);
 
-    using var v = await client.GetAsync($"{baseUrl}/openai/v1/videos/{id}/content?variant=video", ct);
+    using var v = await client.GetAsync($"{baseUrl}/openai/v1/videos/{id}/content?variant=video",
+        HttpCompletionOption.ResponseHeadersRead, ct);
     if (!v.IsSuccessStatusCode)
     {
         var err = await v.Content.ReadAsStringAsync(ct);
         return Results.Problem($"Download failed ({(int)v.StatusCode}): {err}");
     }
-    var mp4 = await v.Content.ReadAsByteArrayAsync(ct);
 
     var account = Cfg(cfg, "STORAGE_ACCOUNT");
     var svc = new BlobServiceClient(new Uri($"https://{account}.blob.core.windows.net"), cred);
     var container = svc.GetBlobContainerClient(cfg["STORAGE_CONTAINER"] ?? "videos");
     var name = $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{id}.mp4";
-    var url = await UploadAndSign(container, name, mp4, "video/mp4", svc, account, ct);
+    // Stream Sora -> Blob directly. F1's 1GB RAM was OOM-recycling the container
+    // when we buffered the full MP4 into a byte[] before upload.
+    await using var src = await v.Content.ReadAsStreamAsync(ct);
+    var url = await UploadAndSign(container, name, src, "video/mp4", svc, account, ct);
     return Results.Ok(new { url, blob = name, videoId = id });
 });
 
