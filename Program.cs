@@ -329,6 +329,174 @@ static async Task<double> ProbeDurationAsync(string ffmpeg, string file, Cancell
          + double.Parse(m.Groups[3].Value, System.Globalization.CultureInfo.InvariantCulture);
 }
 
+// 3b. Identity bible: extract 3 stills from a finalized clip, send to gpt-4o(-mini) vision,
+//     and return a hyper-detailed character/scene descriptor that replaces the imagined
+//     anchors for subsequent segments. This locks identity to what Sora *actually* drew.
+app.MapPost("/api/identity", async (IdentityRequest req, IHttpClientFactory hf,
+    IConfiguration cfg, CancellationToken ct) =>
+{
+    if (string.IsNullOrWhiteSpace(req.VideoUrl))
+        return Results.BadRequest(new { error = "videoUrl is required" });
+
+    var ffmpeg = LocateFfmpeg();
+    if (ffmpeg is null)
+        return Results.Problem("ffmpeg binary not found.");
+
+    var endpoint = Cfg(cfg, "AOAI_ENDPOINT").TrimEnd('/');
+    var key = Cfg(cfg, "AOAI_KEY");
+    var deployment = cfg["VISION_DEPLOYMENT"] ?? cfg["CHAT_DEPLOYMENT"] ?? "gpt-4o-mini";
+
+    var work = Path.Combine(Path.GetTempPath(), $"id-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(work);
+    try
+    {
+        var http = hf.CreateClient();
+        http.Timeout = TimeSpan.FromMinutes(3);
+        var local = Path.Combine(work, "in.mp4");
+        using (var s = await http.GetStreamAsync(req.VideoUrl, ct))
+        await using (var f = File.Create(local))
+            await s.CopyToAsync(f, ct);
+
+        var dur = await ProbeDurationAsync(ffmpeg, local, ct);
+        var stamps = new[] { dur * 0.10, dur * 0.50, dur * 0.90 };
+        var jpgs = new List<string>();
+        for (int i = 0; i < stamps.Length; i++)
+        {
+            var jp = Path.Combine(work, $"f{i}.jpg");
+            // -ss before -i = fast keyframe seek; -frames:v 1 = single still; -q:v 2 = high quality JPEG.
+            var (ec, err) = await RunProcessAsync(ffmpeg,
+                $"-y -ss {stamps[i].ToString("0.000", System.Globalization.CultureInfo.InvariantCulture)} -i \"{local}\" -frames:v 1 -q:v 2 \"{jp}\"", ct);
+            if (ec == 0 && File.Exists(jp)) jpgs.Add(jp);
+        }
+        if (jpgs.Count == 0)
+            return Results.Problem("Failed to extract any frames from video.");
+
+        // Build chat-completions payload with inline base64 image_url parts.
+        var contentParts = new List<object>
+        {
+            new { type = "text", text = "Three stills from the same generated video clip (10%, 50%, 90% of duration). Describe the SINGLE on-screen character and their environment as a locked identity bible to be reused verbatim in later video generation prompts." }
+        };
+        foreach (var jp in jpgs)
+        {
+            var bytes = await File.ReadAllBytesAsync(jp, ct);
+            var b64 = Convert.ToBase64String(bytes);
+            contentParts.Add(new
+            {
+                type = "image_url",
+                image_url = new { url = $"data:image/jpeg;base64,{b64}", detail = "high" }
+            });
+        }
+
+        var sys = @"You are a continuity supervisor for a film. From the three reference stills you receive, produce a strictly-factual identity bible to lock the character and setting across follow-up shots.
+
+Return ONE JSON object, no prose, no markdown, exactly this shape:
+{
+  ""characterDescriptor"": ""<2-3 sentences. Concrete nouns only. Pin: apparent gender, age range, ethnicity if visually evident, face shape, eye color, eyebrow shape, hair (length, texture, color, parting/style), skin tone, build, height impression, any visible marks/jewellery. NO names, NO emotion, NO action verbs.>"",
+  ""wardrobe"": ""<1-2 sentences listing every visible garment and accessory with colour and texture, top-to-bottom. e.g. 'Faded indigo denim shorts mid-thigh; tan ribbed cotton crop top; bare feet; thin gold ankle bracelet on left ankle.'>"",
+  ""sceneDescriptor"": ""<2-3 sentences. Environment, time of day, weather, geometry, prominent props. Concrete nouns only.>"",
+  ""palette"": [""<hex or named anchor color 1>"", ""<...>"", ""<...3-5 total>""],
+  ""lensLightingNotes"": ""<one sentence: lens look (focal length feel, DOF), key light direction and quality, color grade.>""
+}
+
+Rules:
+- Use only what is visibly present in the stills. Do NOT invent details.
+- If a detail is ambiguous across the three stills (e.g. hair length partially obscured), pick the clearest still and note nothing about the others.
+- Output JSON only. No markdown, no commentary.";
+
+        var payload = new
+        {
+            messages = new object[]
+            {
+                new { role = "system", content = sys },
+                new { role = "user", content = contentParts.ToArray() }
+            },
+            temperature = 0.2,
+            max_tokens = 700,
+            response_format = new { type = "json_object" }
+        };
+
+        var client = hf.CreateClient();
+        client.Timeout = TimeSpan.FromSeconds(60);
+        using var msg = new HttpRequestMessage(HttpMethod.Post,
+            $"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=2024-10-21");
+        msg.Headers.Add("api-key", key);
+        msg.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+        using var resp = await client.SendAsync(msg, ct);
+        var body = await resp.Content.ReadAsStringAsync(ct);
+        if (!resp.IsSuccessStatusCode)
+            return Results.Problem($"Vision call failed ({(int)resp.StatusCode}): {body}");
+
+        using var doc = JsonDocument.Parse(body);
+        var raw = doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString()?.Trim() ?? "{}";
+        object? bible;
+        try { bible = JsonSerializer.Deserialize<object>(raw); }
+        catch { return Results.Problem($"Vision returned non-JSON: {raw}"); }
+
+        return Results.Ok(new { bible, stillsExtracted = jpgs.Count, durationSec = dur });
+    }
+    finally
+    {
+        try { Directory.Delete(work, recursive: true); } catch { }
+    }
+});
+
+// 3c. Tail: cut last N seconds (default 4) of a finalized clip, re-encoded at the
+//     requested size, and upload to blob. The SAS URL can be downloaded by the
+//     browser and passed as `input_reference` to the next Sora-2 job — Sora accepts
+//     up to 5s of video as a continuity anchor (per Sora-2 v1 API docs).
+app.MapPost("/api/tail", async (TailRequest req, IHttpClientFactory hf,
+    IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
+{
+    if (string.IsNullOrWhiteSpace(req.VideoUrl))
+        return Results.BadRequest(new { error = "videoUrl is required" });
+
+    var ffmpeg = LocateFfmpeg();
+    if (ffmpeg is null) return Results.Problem("ffmpeg binary not found.");
+
+    var seconds = Math.Clamp(req.Seconds ?? 4.0, 1.0, 5.0);
+    var size = string.IsNullOrWhiteSpace(req.Size) ? "1280x720" : req.Size!;
+    var sizeMatch = System.Text.RegularExpressions.Regex.Match(size, @"^(\d+)x(\d+)$");
+    if (!sizeMatch.Success) return Results.BadRequest(new { error = "size must be WxH" });
+    var W = int.Parse(sizeMatch.Groups[1].Value);
+    var H = int.Parse(sizeMatch.Groups[2].Value);
+
+    var work = Path.Combine(Path.GetTempPath(), $"tail-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(work);
+    try
+    {
+        var http = hf.CreateClient();
+        http.Timeout = TimeSpan.FromMinutes(3);
+        var local = Path.Combine(work, "in.mp4");
+        using (var s = await http.GetStreamAsync(req.VideoUrl, ct))
+        await using (var f = File.Create(local))
+            await s.CopyToAsync(f, ct);
+
+        var outPath = Path.Combine(work, "tail.mp4");
+        // -sseof -N seeks N seconds before EOF. Re-encode to lock size and clean keyframes.
+        var s2 = seconds.ToString("0.000", System.Globalization.CultureInfo.InvariantCulture);
+        var args =
+            $"-y -sseof -{s2} -i \"{local}\" -t {s2} " +
+            $"-vf \"scale={W}:{H}:force_original_aspect_ratio=decrease,pad={W}:{H}:(ow-iw)/2:(oh-ih)/2\" " +
+            $"-c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p " +
+            $"-c:a aac -b:a 128k -movflags +faststart \"{outPath}\"";
+        var (ec, err) = await RunProcessAsync(ffmpeg, args, ct);
+        if (ec != 0 || !File.Exists(outPath))
+            return Results.Problem($"ffmpeg tail failed (exit {ec}): {err.Substring(0, Math.Min(err.Length, 1500))}");
+
+        var mp4 = await File.ReadAllBytesAsync(outPath, ct);
+        var account = Cfg(cfg, "STORAGE_ACCOUNT");
+        var svc = new BlobServiceClient(new Uri($"https://{account}.blob.core.windows.net"), cred);
+        var container = svc.GetBlobContainerClient(cfg["STORAGE_CONTAINER"] ?? "videos");
+        var name = $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-tail-{Guid.NewGuid():N}.mp4";
+        var url = await UploadAndSign(container, name, mp4, "video/mp4", svc, account, ct);
+        return Results.Ok(new { url, blob = name, seconds, bytes = mp4.Length });
+    }
+    finally
+    {
+        try { Directory.Delete(work, recursive: true); } catch { }
+    }
+});
+
 // 4. Narrate: synthesize speech via Azure Speech, upload MP3, return SAS URL.
 app.MapPost("/api/narrate", async (NarrateRequest req, IHttpClientFactory hf,
     IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
@@ -622,3 +790,5 @@ public record NarrateRequest(string Text, string? Voice);
 public record TranslateRequest(string Text, string? To);
 public record EnhanceRequest(string Prompt, string? Narration, string? Voice, int? Seconds, string? Size);
 public record StitchRequest(string[] Urls, double? Crossfade);
+public record IdentityRequest(string VideoUrl, string? OriginalAnchor);
+public record TailRequest(string VideoUrl, double? Seconds, string? Size);

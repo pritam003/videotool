@@ -342,6 +342,7 @@ function App() {
   const [finalPrompt, setFinalPrompt] = useState("");
   const [plan, setPlan] = useState(null);
   const [segSummaries, setSegSummaries] = useState([]);
+  const [identityBible, setIdentityBible] = useState(null); // { characterDescriptor, wardrobe, sceneDescriptor, palette, lensLightingNotes }
   const [enhancing, setEnhancing] = useState(false);
   const [running, setRunning] = useState(false);
   const [status, setStatus] = useState({ phase: "idle", pct: 0, label: "ready" });
@@ -476,10 +477,20 @@ function App() {
   // Build the prompt for a single segment using the structured plan + memory of
   // earlier rendered segments + outline of later ones. Each Sora-2 render thus
   // receives full narrative + audio + visual context of preceding/following clips.
-  function buildSegmentPrompt(planObj, k, priorSummaries) {
+  // When `bible` is supplied (after clip 1 has rendered), its empirical character
+  // and scene descriptors REPLACE the LLM-imagined anchors so segments 2+ lock to
+  // what Sora actually drew, not what gpt-4o-mini hoped it would draw.
+  function buildSegmentPrompt(planObj, k, priorSummaries, bible) {
     const segs = planObj.segments || [];
     const seg = segs[k] || {};
     const N = segs.length;
+    const useBible = !!bible && k >= 1;
+    const characterLine = useBible
+      ? `Character (LOCKED identity bible from clip 1 — match these features exactly): ${bible.characterDescriptor || planObj.characterAnchor || ""}\n  Wardrobe (identical to clip 1, every item): ${bible.wardrobe || ""}`
+      : `Character (use this exact description anywhere the speaker is referenced): ${planObj.characterAnchor || ""}`;
+    const sceneLine = useBible
+      ? `Scene (locked from clip 1): ${bible.sceneDescriptor || planObj.sceneAnchor || ""}\n  Anchor palette: ${(bible.palette || []).join(", ")}\n  Lens & lighting (identical to clip 1): ${bible.lensLightingNotes || ""}`
+      : `Scene: ${planObj.sceneAnchor || ""}`;
     const previously = priorSummaries.length === 0 ? "" :
       "\nPreviously (already rendered, this segment continues directly from the last):\n" +
       priorSummaries.map((s, i) => `  - Segment ${i+1} (${segs[i]?.startSec}\u2013${segs[i]?.endSec}s): ${s}`).join("\n");
@@ -490,13 +501,13 @@ function App() {
       ? `\nDialogue (this segment, spoken on-screen, embed verbatim):\n${seg.dialogue}`
       : "";
     const continuity = k === 0 ? ""
-      : `\nContinuity directives:\n  - DIRECT CONTINUATION. The first frame matches the last frame of segment ${k} exactly.\n  - SAME character (use the Character anchor below verbatim), SAME wardrobe, SAME environment, SAME lens & focal length, SAME lighting setup and color grade.\n  - SAME voice timbre, pitch, accent and speaking pace as the previous segment.\n  - The diegetic background sound bed continues uninterrupted: ${planObj.backgroundSound || ""}.\n  - No cut, no fade, no recap. Motion and audio pick up immediately.`;
+      : `\nContinuity directives:\n  - DIRECT CONTINUATION. The first frame matches the last frame of segment ${k} exactly.\n  - SAME character${useBible ? " — match the locked identity bible above pixel-for-pixel (face, hair, skin, every wardrobe item)" : " (use the Character anchor below verbatim)"}, SAME wardrobe, SAME environment, SAME lens & focal length, SAME lighting setup and color grade.\n  - SAME voice timbre, pitch, accent and speaking pace as the previous segment.\n  - The diegetic background sound bed continues uninterrupted: ${planObj.backgroundSound || ""}.\n  - No cut, no fade, no recap. Motion and audio pick up immediately.`;
     return [
       `Style: ${planObj.style || ""}`,
       ``,
-      `Scene: ${planObj.sceneAnchor || ""}`,
+      sceneLine,
       ``,
-      `Character (use this exact description anywhere the speaker is referenced): ${planObj.characterAnchor || ""}`,
+      characterLine,
       ``,
       `Cinematography:`,
       planObj.cinematography || "",
@@ -586,7 +597,7 @@ function App() {
   async function run() {
     const finalText = finalPrompt.trim() || prompt.trim();
     if (!finalText) { toast("Enter a prompt first.", true); return; }
-    setRunning(true); setOuts([]); setStitched(null); setSegSummaries([]); setStatus({ phase: "running", pct: 2, label: "submitting" });
+    setRunning(true); setOuts([]); setStitched(null); setSegSummaries([]); setIdentityBible(null); setStatus({ phase: "running", pct: 2, label: "submitting" });
     try {
       const usePlan = plan && Array.isArray(plan.segments) && plan.segments.length > 0;
       const chunkSize = Math.min(seconds, 12);
@@ -595,6 +606,7 @@ function App() {
       const finals = [];
       const priorSummaries = [];
       let prevFrame = null;
+      let bible = null;
       // Show ETA up front so the wait is expected, not surprising.
       const etaSec = chunks * (chunkSize <= 4 ? 60 : chunkSize <= 8 ? 100 : 150);
       const etaMin = Math.ceil(etaSec / 60);
@@ -607,7 +619,7 @@ function App() {
           segSec = span >= 12 ? 12 : span >= 8 ? 8 : 4;
         }
         const thePrompt = usePlan
-          ? buildSegmentPrompt(plan, i, priorSummaries)
+          ? buildSegmentPrompt(plan, i, priorSummaries, bible)
           : finalText + (i === 0 ? "" : `\n\n[Segment ${i+1}/${chunks} — DIRECT CONTINUATION of the previous segment. Same character, environment, lighting, lens, color grade. SAME voice timbre, accent, pitch, pace. Same diegetic background sound bed continues uninterrupted. First frame matches previous segment's last frame; motion and audio pick up immediately with no cut, no fade, no recap.]`);
         const label = `clip ${i+1}/${chunks}`;
         const basePct = 2 + (i / chunks) * 95;
@@ -631,14 +643,55 @@ function App() {
           priorSummaries.push(sum);
           setSegSummaries(arr => [...arr, sum]);
         }
-        if (i < chunks - 1) {
+        // After clip 1 finalizes: lock identity by extracting empirical descriptors
+        // from what Sora actually drew. This replaces the imagined characterAnchor
+        // for clips 2+, which is the single biggest lever for character consistency.
+        if (i === 0 && usePlan) {
           try {
-            setStatus(s => ({ ...s, label: `${label}: capturing anchor frame` }));
-            prevFrame = await extractLastFrame(fj.url, W, H);
-            dbg("ok", `last-frame captured (${prevFrame.size} bytes) for clip ${i+2} anchor`);
+            setStatus(s => ({ ...s, label: `${label}: locking identity from clip 1` }));
+            const ir = await fetch("/api/identity", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ videoUrl: fj.url, originalAnchor: plan.characterAnchor || "" })
+            });
+            const ij = await jsonOrThrow(ir);
+            if (ij && ij.bible) {
+              bible = ij.bible;
+              setIdentityBible(bible);
+              dbg("ok", `identity bible locked: ${(bible.characterDescriptor || "").slice(0, 90)}\u2026`);
+            }
           } catch (e) {
-            dbg("warn", "last-frame extraction failed; continuing with plan-based continuity only", e.message);
-            prevFrame = null;
+            dbg("warn", "identity bible extraction failed; falling back to text anchor", e.message);
+          }
+        }
+        if (i < chunks - 1) {
+          // Phase 2: prefer a 4s tail clip as the visual anchor (Sora-2 accepts up
+          // to 5s of video as input_reference, providing far richer identity signal
+          // than a single still frame). Fall back to a JPEG last-frame if /api/tail
+          // or Sora rejects the video reference.
+          prevFrame = null;
+          try {
+            setStatus(s => ({ ...s, label: `${label}: capturing 4s tail anchor` }));
+            const tr = await fetch("/api/tail", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ videoUrl: fj.url, seconds: 4, size })
+            });
+            const tj = await jsonOrThrow(tr);
+            const tailResp = await fetch(tj.url);
+            if (!tailResp.ok) throw new Error(`tail download ${tailResp.status}`);
+            const tailBlob = await tailResp.blob();
+            prevFrame = new File([tailBlob], "tail.mp4", { type: "video/mp4" });
+            dbg("ok", `4s tail anchor ready (${(tailBlob.size/1024).toFixed(0)}KB) for clip ${i+2}`);
+          } catch (e) {
+            dbg("warn", `tail anchor failed (${e.message}); falling back to last-frame JPEG`);
+            try {
+              prevFrame = await extractLastFrame(fj.url, W, H);
+              dbg("ok", `last-frame captured (${prevFrame.size} bytes) for clip ${i+2} anchor`);
+            } catch (e2) {
+              dbg("warn", "last-frame extraction also failed; continuing with plan-based continuity only", e2.message);
+              prevFrame = null;
+            }
           }
         }
       }
@@ -720,6 +773,7 @@ function App() {
                 <div class="plan-head">
                   <strong>Story plan</strong>
                   <span class="pill">${plan.segments.length} segments</span>
+                  ${identityBible && html`<span class="pill ok small" title=${identityBible.characterDescriptor || ""}>identity locked from clip 1</span>`}
                   <span class="muted small">Each clip carries memory of earlier clips + pacing toward later ones</span>
                 </div>
                 ${plan.segments.map((s, i) => {
