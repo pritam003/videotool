@@ -183,6 +183,58 @@
   hr.sep { border: 0; border-top: 1px solid var(--border); margin: 14px 0; }
   .muted { color: var(--muted); }
   .small { font-size: 12px; }
+
+  /* ---------- Mobile-friendly tweaks ----------
+     Goals: prevent iOS zoom-on-focus (16px inputs), enlarge touch targets to
+     ≥44px, tighten paddings, let buttons & rows wrap, make the debug drawer
+     full-width, and keep the preview comfortably sized on phones. */
+  @media (max-width: 720px) {
+    main { padding: 12px; gap: 14px; }
+    header.app { padding: 10px 12px; gap: 8px; }
+    header.app .badge { display: none; }
+    .card { padding: 14px; border-radius: 12px; }
+    .card + .card { margin-top: 12px; }
+    .card h3 { font-size: 12px; margin-bottom: 10px; }
+
+    /* iOS zooms any input < 16px on focus — bump to 16px and keep mono fields readable. */
+    input[type="text"], input[type="number"], select, textarea { font-size: 16px; padding: 11px 12px; }
+    textarea.final { font-size: 13px; min-height: 180px; }
+    textarea { min-height: 80px; }
+
+    /* Bigger tap targets, allow wrapping, equal-width by default. */
+    button { padding: 11px 14px; min-height: 44px; }
+    .btn-row, .row-buttons, .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    .btn-row > button, .row-buttons > button, .actions > button { flex: 1 1 calc(50% - 4px); min-width: 0; }
+
+    .grid { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; }
+    .clip video { aspect-ratio: 16/9; }
+
+    /* Debug drawer: full-width sheet that slides up; collapse handle visible. */
+    .drawer { width: 100vw; max-height: 60vh; border-radius: 12px 12px 0 0;
+      border-left: 0; border-right: 0; }
+    .drawer .body { font-size: 12px; }
+
+    /* Toast clears the drawer collapsed handle. */
+    .toast { bottom: 56px; font-size: 13px; padding: 10px 14px; }
+
+    /* Plan + meta wrap nicely. */
+    .plan { padding: 8px; }
+    .plan-beats { margin-left: 16px; }
+    .plan-dialogue { margin-left: 16px; }
+    .meta { gap: 6px; font-size: 11px; }
+
+    /* Accordion heads tappable. */
+    .accordion-head { padding: 14px 0; min-height: 44px; }
+  }
+
+  @media (max-width: 420px) {
+    main { padding: 10px; }
+    .card { padding: 12px; }
+    .grid { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); }
+    /* On the smallest phones, give each action button its own row for clarity. */
+    .btn-row > button, .row-buttons > button, .actions > button { flex-basis: 100%; }
+    header.app .title { font-size: 14px; }
+  }
 </style>
 </head>
 <body>
@@ -972,7 +1024,7 @@ function App() {
               <textarea rows="2" placeholder="Help Pritam, crabs are everywhere!"
                 value=${narration} onInput=${e => setNarration(e.target.value)}></textarea>
             </div>
-            <div style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+            <div class="btn-row" style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
               <button class="primary" onClick=${enhanceClick} disabled=${!canCraft || enhancing || crafting}>
                 ${enhancing ? "Enhancing…" : "✨ Generate cinematic prompt"}
               </button>
@@ -1110,7 +1162,7 @@ function App() {
         </div>
 
         <div class="card">
-          <div style=${{display:"flex",gap:10,alignItems:"center"}}>
+          <div class="btn-row" style=${{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
             <button class="primary" onClick=${run} disabled=${running || (!prompt.trim() && !finalPrompt.trim())}>
               ${running ? "Generating…" : "▶ Generate video"}
             </button>
