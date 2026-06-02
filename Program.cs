@@ -151,8 +151,10 @@ app.MapPost("/api/narrate", async (NarrateRequest req, IHttpClientFactory hf,
     var key = Cfg(cfg, "AOAI_KEY"); // multi-service AIServices key works for Speech
     var region = Cfg(cfg, "SPEECH_REGION");
     var voice = string.IsNullOrWhiteSpace(req.Voice) ? "en-US-AvaMultilingualNeural" : req.Voice!;
+    // Derive locale from voice short name (e.g. "hi-IN-SwaraNeural" -> "hi-IN")
+    var lang = voice.Length >= 5 && voice[2] == '-' ? voice.Substring(0, 5) : "en-US";
 
-    var ssml = $@"<speak version='1.0' xml:lang='en-US'>
+    var ssml = $@"<speak version='1.0' xml:lang='{lang}'>
 <voice name='{voice}'>{System.Security.SecurityElement.Escape(req.Text)}</voice>
 </speak>";
 
