@@ -345,6 +345,12 @@ function App() {
   const [identityBible, setIdentityBible] = useState(null); // { characterDescriptor, wardrobe, sceneDescriptor, palette, lensLightingNotes, distinctiveTraits }
   const [useRemix, setUseRemix] = useState(true); // #1: clips 2..N remix-from-clip-1 (native identity preservation)
   const [enhancing, setEnhancing] = useState(false);
+  // PromptCraft (multi-layer reasoner): runs gpt-5.4 through 6 layers + 5 critic iterations
+  // to produce a Sora-2 prompt that honours every word of the user ask + locks realism + handles
+  // face-risk. Heavier than enhance() but much higher fidelity to the original brief.
+  const [crafting, setCrafting] = useState(false);
+  const [craftResult, setCraftResult] = useState(null); // {segments, iterations, finalScores, plan, combinedPrompt, ...}
+  const [craftPanelOpen, setCraftPanelOpen] = useState(false);
   const [running, setRunning] = useState(false);
   const [status, setStatus] = useState({ phase: "idle", pct: 0, label: "ready" });
   const [outs, setOuts] = useState([]);
@@ -418,6 +424,49 @@ function App() {
         : "Final prompt generated. You can edit it before running.");
     } catch (e) { toast("Enhance failed: " + e.message, true); }
     finally { setEnhancing(false); }
+  }
+
+  // PromptCraft: multi-layer reasoner pass. Hits POST /api/promptcraft which runs
+  // PLAN → COMPILE → CRITIC×5 with hard locks for word-faithfulness + realism + face-risk.
+  // Takes 30-90s wall time. The result loads straight into finalPrompt so existing run() works.
+  async function promptCraft() {
+    if (!prompt.trim()) { toast("Enter a prompt first.", true); return; }
+    setCrafting(true);
+    setCraftResult(null);
+    try {
+      const r = await fetch("/api/promptcraft", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          userAsk: prompt,
+          totalSeconds: seconds,
+          size,
+          narration,
+          voice,
+          maxIterations: 5
+        })
+      });
+      const j = await jsonOrThrow(r);
+      setCraftResult(j);
+      setCraftPanelOpen(true);
+      // Load combined prompt into finalPrompt so the existing run() pipeline picks it up.
+      setFinalPrompt(j.combinedPrompt || "");
+      // Synthesize a plan-shaped object so the existing multi-segment run() ladder works.
+      if (Array.isArray(j.segments) && j.segments.length) {
+        setPlan({
+          segments: j.segments.map(s => ({
+            index: s.index,
+            beats: [s.prompt],
+            dialogue: s.dialogue,
+            seconds: s.seconds
+          })),
+          characterDescriptor: j.plan?.identityBible?.characterAnchor || "",
+          distinctiveTraits: j.plan?.identityBible?.distinctiveTraits || ""
+        });
+      }
+      const sc = j.finalScores || {};
+      toast(`Prompt crafted in ${j.iterationsRun} iter — F:${sc.faithfulness||"?"} R:${sc.realism||"?"} S:${sc.soraCompat||"?"} C:${sc.frameCoherence||"?"}`);
+    } catch (e) { toast("PromptCraft failed: " + e.message, true); }
+    finally { setCrafting(false); }
   }
 
   // Auto re-enhance when duration / aspect / voice change AFTER the user has
@@ -836,12 +885,51 @@ function App() {
               <textarea rows="2" placeholder="Help Pritam, crabs are everywhere!"
                 value=${narration} onInput=${e => setNarration(e.target.value)}></textarea>
             </div>
-            <div style=${{display:"flex",gap:8,alignItems:"center"}}>
-              <button class="primary" onClick=${enhanceClick} disabled=${enhancing || !prompt.trim()}>
+            <div style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+              <button class="primary" onClick=${enhanceClick} disabled=${enhancing || crafting || !prompt.trim()}>
                 ${enhancing ? "Enhancing…" : "✨ Generate cinematic prompt"}
               </button>
-              <span class="muted small">Frame-by-frame, scales with duration & voice</span>
+              <button onClick=${promptCraft} disabled=${enhancing || crafting || !prompt.trim()} title="Multi-layer reasoner (gpt-5.4) with 5 critic iterations. Honours every word of your ask, locks realism, mitigates Sora face-drift. Takes 30-90s.">
+                ${crafting ? "Crafting (30-90s)…" : "🧠 PromptCraft (deep reasoner)"}
+              </button>
+              <span class="muted small">Frame-by-frame, scales with duration &amp; voice</span>
             </div>
+            ${craftResult && html`
+              <div class="plan">
+                <div class="plan-head">
+                  <strong>PromptCraft trace</strong>
+                  <span class="pill ok">${craftResult.iterationsRun} iter</span>
+                  <span class="pill" title="Faithfulness to your exact words">F:${craftResult.finalScores?.faithfulness||"?"}</span>
+                  <span class="pill" title="Realism (no fantasy/impossible elements)">R:${craftResult.finalScores?.realism||"?"}</span>
+                  <span class="pill" title="Sora-2 compatibility (face-risk mitigation)">S:${craftResult.finalScores?.soraCompat||"?"}</span>
+                  <span class="pill" title="Frame coherence between segments">C:${craftResult.finalScores?.frameCoherence||"?"}</span>
+                  <button class="ghost small" onClick=${() => setCraftPanelOpen(o => !o)}>${craftPanelOpen ? "Hide trace" : "Show trace"}</button>
+                </div>
+                ${craftPanelOpen && html`
+                  <div style=${{padding:"8px 12px",fontSize:12}}>
+                    <div class="muted small" style=${{marginBottom:6}}>Reasoning model: <code>${craftResult.reasoningModel}</code></div>
+                    ${craftResult.iterations?.map(it => html`
+                      <details style=${{marginBottom:4}}>
+                        <summary>iter ${it.n} — F:${it.scores.faithfulness} R:${it.scores.realism} S:${it.scores.soraCompat} C:${it.scores.frameCoherence} — <em>${it.verdict}</em></summary>
+                        <pre style=${{whiteSpace:"pre-wrap",fontSize:11,marginLeft:12}}>${JSON.stringify(it.deviations, null, 2)}</pre>
+                      </details>
+                    `)}
+                    ${craftResult.plan?.framesManifest && html`
+                      <details>
+                        <summary>Frame manifest (${craftResult.plan.framesManifest.length} keyframes)</summary>
+                        <ol style=${{fontSize:11,marginLeft:18}}>${craftResult.plan.framesManifest.map(f => html`<li>t=${f.t}s seg ${f.segment}: ${f.description}</li>`)}</ol>
+                      </details>
+                    `}
+                    ${craftResult.plan?.intentContract?.extractedWords && html`
+                      <details>
+                        <summary>Word coverage (${craftResult.plan.intentContract.extractedWords.length} words tracked)</summary>
+                        <ul style=${{fontSize:11,marginLeft:18}}>${craftResult.plan.intentContract.extractedWords.map(w => html`<li><strong>${w.word}</strong> <em class="muted">[${w.category}]</em> → ${w.visualisation}</li>`)}</ul>
+                      </details>
+                    `}
+                  </div>
+                `}
+              </div>
+            `}
             ${finalPrompt && html`
               <div>
                 <label>Final prompt preview <span class="muted">(editable; only used if plan is empty)</span></label>

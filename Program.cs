@@ -877,11 +877,325 @@ Plan the {segmentCount}-segment arc as JSON now.";
     });
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// PromptCraft: multi-layer Sora-2 prompt engine.
+//
+// Pipeline (all calls go to REASONING_DEPLOYMENT, default gpt-5_4):
+//   1. PLAN  — single deep-reasoning call that outputs intentContract +
+//              identityBible + storyboard + framesManifest as one JSON.
+//   2. COMPILE — turn the plan into per-segment Sora-2 prompts.
+//   3. CRITIC×5 — score faithfulness/realism/Sora-compat/frame-coherence and
+//              refine until all axes ≥ 9 or 5 iterations exhausted.
+//
+// Two HARD locks bake into every layer's system prompt:
+//   • WORD LOCK     — every meaningful word in the user ask must be visually
+//                     represented; deviations are flagged.
+//   • REALISM LOCK  — only physically possible imagery; no fantasy creatures,
+//                     no impossible physics, no surreal elements unless the
+//                     user explicitly asked for them.
+// Plus the existing FACE-RISK rules: occlusion device per shot, non-face
+// identifiers, no close-ups unless the brief demands.
+// ─────────────────────────────────────────────────────────────────────────────
+app.MapPost("/api/promptcraft", async (PromptCraftRequest req, IHttpClientFactory hf,
+    IConfiguration cfg, CancellationToken ct) =>
+{
+    if (string.IsNullOrWhiteSpace(req.UserAsk))
+        return Results.BadRequest(new { error = "userAsk is required" });
+
+    var endpoint = Cfg(cfg, "AOAI_ENDPOINT").TrimEnd('/');
+    var key = Cfg(cfg, "AOAI_KEY");
+    var deployment = cfg["REASONING_DEPLOYMENT"] ?? "gpt-5_4";
+    var apiVersion = "2024-12-01-preview"; // supports gpt-5.x reasoning models
+    var totalSeconds = Math.Clamp(req.TotalSeconds ?? 8, 4, 60);
+    var size = req.Size ?? "1280x720";
+    var chunkSeconds = Math.Min(totalSeconds, 12);
+    var segmentCount = (int)Math.Ceiling(totalSeconds / (double)chunkSeconds);
+    var maxIter = Math.Clamp(req.MaxIterations ?? 5, 1, 8);
+    var voice = req.Voice ?? "en-US-AvaMultilingualNeural";
+    var narration = req.Narration ?? "";
+
+    var client = hf.CreateClient();
+    client.Timeout = TimeSpan.FromMinutes(4);
+
+    // Helper: one structured call to the reasoner. gpt-5.x reasoning models
+    // require max_completion_tokens (not max_tokens) and temperature must be 1.
+    async Task<JsonElement> CallReasoner(string sys, string user, int maxOut)
+    {
+        using var msg = new HttpRequestMessage(HttpMethod.Post,
+            $"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={apiVersion}");
+        msg.Headers.Add("api-key", key);
+        var payload = new Dictionary<string, object?>
+        {
+            ["messages"] = new object[] {
+                new { role = "system", content = sys },
+                new { role = "user",   content = user }
+            },
+            ["max_completion_tokens"] = maxOut,
+            ["response_format"] = new { type = "json_object" }
+        };
+        msg.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+        using var resp = await client.SendAsync(msg, ct);
+        var raw = await resp.Content.ReadAsStringAsync(ct);
+        if (!resp.IsSuccessStatusCode)
+            throw new InvalidOperationException($"Reasoner call failed ({(int)resp.StatusCode}): {raw}");
+        using var doc = JsonDocument.Parse(raw);
+        var content = doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString() ?? "{}";
+        // Reasoner may wrap in ```json``` fences occasionally; strip them.
+        content = content.Trim();
+        if (content.StartsWith("```"))
+        {
+            var nl = content.IndexOf('\n');
+            if (nl > 0) content = content[(nl + 1)..];
+            if (content.EndsWith("```")) content = content[..^3];
+            content = content.Trim();
+        }
+        return JsonDocument.Parse(content).RootElement.Clone();
+    }
+
+    // Constants pasted into every layer's system prompt — the two hard locks
+    // and the face-risk rules. Keeping these centralised guarantees no layer
+    // forgets them.
+    const string LOCKS = @"
+HARD LOCKS — violating any of these means the response is invalid:
+
+1. WORD LOCK: Every meaningful noun, adjective, verb, number, colour, location,
+   profession, prop, action, mood word, and named entity from the USER ASK
+   must be visually represented in the final video. If a user word cannot
+   be visualised (e.g. abstract concepts), embed it as ambient/symbolic
+   imagery. Maintain a deviations list naming any user word you could not
+   honour and explain why. Aim for zero deviations.
+
+2. REALISM LOCK: The video must be photorealistic. No fantasy creatures,
+   no magical effects, no impossible physics, no cartoon/anime/3D-render
+   styles, no surreal compositions, no glowing auras, no floating objects,
+   no anthropomorphic animals, no superpowers — UNLESS the user ask
+   explicitly contains words like ""fantasy"", ""magic"", ""anime"",
+   ""cartoon"", ""dream"", ""surreal"", ""sci-fi"". Default = documentary-grade
+   real-world plausibility, on real film stock, with normal physics.
+
+3. FACE-RISK MITIGATION (Sora-2 has identity drift + RAI face-block):
+   • Default framing is medium or wider (waist-up or full-body), NEVER tight
+     close-ups unless the user explicitly demanded one.
+   • Pick ONE face-occlusion device that fits the brief and use it
+     consistently: sunglasses, cap brim shadow, scarf, ¾ profile, back-of-
+     head shot, helmet visor, surgical/dust mask, beard+hair coverage, or
+     environmental occlusion (steam, rain, foreground branch). Never leave
+     the face fully exposed and centred.
+   • Identity is locked via 3-5 NON-FACE signatures: a saturated coloured
+     garment, a unique prop carried, a visible scar/tattoo with location,
+     hair ornament, distinctive footwear. These must be repeated verbatim
+     in every segment.
+   • No on-screen text, captions, logos, or watermarks ever (Sora can't
+     render text reliably).
+";
+
+    // ─── Layer 1: PLAN ────────────────────────────────────────────────────
+    // Single deep-reasoning pass that produces the full plan: intent
+    // contract (every user word categorised), identity bible, storyboard
+    // (segments with beats), and frame manifest (one keyframe per second).
+    var planSys = $@"You are the chief planner for a Sora-2 video shoot. Think step by step about the user ask, then output a SINGLE JSON object — no markdown, no prose outside JSON.
+
+{LOCKS}
+
+OUTPUT SCHEMA (must match exactly):
+{{
+  ""intentContract"": {{
+    ""userAskVerbatim"": ""<echo the user ask exactly as given>"",
+    ""extractedWords"": [
+      {{ ""word"": ""<one meaningful word/phrase from the ask>"", ""category"": ""subject|action|setting|mood|colour|prop|number|adjective|other"", ""visualisation"": ""<exactly how this will appear on screen>"" }}
+    ],
+    ""nonNegotiables"": [""<list every constraint the user implied or stated>""],
+    ""realismMode"": ""photoreal|user-permitted-stylised"",
+    ""realismJustification"": ""<one sentence: why this mode given the ask>""
+  }},
+  ""identityBible"": {{
+    ""characterAnchor"": ""<3-5 distinctive repeatable details: gender/age/hair/wardrobe/build, one sentence, pasted verbatim per segment>"",
+    ""distinctiveTraits"": ""<3-5 NON-FACE signatures, comma-separated, includes at least ONE high-contrast saturated colour element>"",
+    ""faceOcclusionDevice"": ""<the single occlusion strategy chosen, e.g. 'aviator sunglasses + cap brim shadow throughout'>"",
+    ""defaultFraming"": ""<medium-wide|medium|waist-up|full-body|over-shoulder>""
+  }},
+  ""sceneAnchor"": ""<2-3 sentences: environment, time of day, weather, palette of 3-5 anchor colours, ambient details>"",
+  ""cinematography"": ""<multi-line: Camera shot / Camera motion / Lens / Lighting / Mood — kept identical across segments>"",
+  ""voiceDescription"": ""<one sentence describing speaker timbre, age range, accent, pace>"",
+  ""backgroundSound"": ""<2-4 concrete diegetic sounds, comma-separated>"",
+  ""storyboard"": {{
+    ""totalSeconds"": {totalSeconds},
+    ""segmentCount"": {segmentCount},
+    ""chunkSeconds"": {chunkSeconds},
+    ""segments"": [
+      {{
+        ""index"": 1,
+        ""startSec"": 0,
+        ""endSec"": {chunkSeconds},
+        ""summary"": ""<one sentence>"",
+        ""beats"": [""Beat 1 (0-Xs): <ONE concrete physical action with face-occlusion preserved>"", ""Beat 2 ..."", ""... 4-6 beats""],
+        ""dialogue"": ""<verbatim narration line if spoken in this segment, else null>""
+      }}
+    ]
+  }},
+  ""framesManifest"": [
+    {{ ""t"": 0, ""segment"": 1, ""description"": ""<one line: framing, subject pose, occlusion device visible, key prop, lighting, ambient — what is on screen at this exact second>"" }}
+  ]
+}}
+
+framesManifest MUST contain one entry per second of total video (so {totalSeconds} entries total: t=0..{totalSeconds - 1}).
+storyboard.segments MUST contain exactly {segmentCount} entries.
+extractedWords MUST cover every meaningful token in the user ask — aim for thoroughness, list 10-30 words.";
+
+    var planUser = $@"USER ASK (verbatim, treat every word as a constraint):
+{req.UserAsk}
+
+Total duration: {totalSeconds}s rendered as {segmentCount} segment(s) of up to {chunkSeconds}s.
+Aspect: {size}
+Voice: {voice}
+Narration to embed verbatim (distribute across segments naturally if non-empty): {narration}
+
+Plan now. Output JSON only.";
+
+    var planJson = await CallReasoner(planSys, planUser, 8000);
+
+    // ─── Layer 2: COMPILE ─────────────────────────────────────────────────
+    // Turn the plan into Sora-2-ready per-segment prompts. Each prompt is a
+    // self-contained brief that pastes anchors verbatim then enumerates beats.
+    var compileSys = $@"You are a Sora-2 prompt compiler. Given a structured plan, produce per-segment prompts ready to send to Sora-2.
+
+{LOCKS}
+
+Each segment prompt MUST follow this template internally (but write it as flowing paragraphs, no labels):
+  [STYLE line] → [character anchor sentence] → [distinctive traits sentence] → [scene anchor sentences] → [cinematography block] → [face-occlusion device statement] → [beats as numbered actions with timestamps] → [dialogue if present] → [voice description] → [background sound] → [negative prompt: 'no on-screen text, no captions, no logos, no watermarks, no extra speakers, no duplicated limbs, no fantasy elements (unless ask permits), no impossible physics']
+
+OUTPUT SCHEMA:
+{{
+  ""segments"": [
+    {{
+      ""index"": 1,
+      ""prompt"": ""<the full Sora-2 prompt as a single string, 200-500 words, flowing paragraphs not bullet points>"",
+      ""dialogue"": ""<verbatim line or null>"",
+      ""seconds"": {chunkSeconds}
+    }}
+  ]
+}}
+
+Output JSON only.";
+
+    var compileUser = $@"PLAN:
+{planJson.GetRawText()}
+
+Compile the {segmentCount} segment prompts now. Output JSON only.";
+
+    var compiled = await CallReasoner(compileSys, compileUser, 6000);
+
+    // ─── Layer 3: CRITIC LOOP (×N) ────────────────────────────────────────
+    // Each iteration scores faithfulness, realism, Sora-compat, and frame
+    // coherence on 1-10 axes, lists deviations, and emits a refined segments
+    // array. We stop when all four axes are ≥ 9 or maxIter is reached.
+    var iterations = new List<object>();
+    var currentSegments = compiled.GetProperty("segments");
+
+    var criticSys = $@"You are a brutally honest video-prompt critic. Given the user ask, the plan, and current per-segment Sora-2 prompts, score on FOUR axes (1-10) and emit refined prompts.
+
+{LOCKS}
+
+Scoring axes:
+  • faithfulnessScore: every meaningful user word represented? Lower = more deviations.
+  • realismScore: zero unreal/fantasy/impossible elements (unless ask permits)? Lower = more violations.
+  • soraCompatScore: face-occlusion device present every segment? non-face anchors locked? no on-screen text? short dialogue? Lower = more risks.
+  • frameCoherenceScore: does segment N's last beat flow into segment N+1's first beat? identity & wardrobe identical? Lower = more breaks.
+
+OUTPUT SCHEMA:
+{{
+  ""scores"": {{ ""faithfulness"": <int>, ""realism"": <int>, ""soraCompat"": <int>, ""frameCoherence"": <int> }},
+  ""deviations"": {{
+    ""faithfulness"": [""<user word/concept missing or misrepresented>""],
+    ""realism"": [""<unreal element to remove>""],
+    ""soraCompat"": [""<face-risk or sora issue>""],
+    ""frameCoherence"": [""<continuity break>""]
+  }},
+  ""refinedSegments"": [
+    {{ ""index"": 1, ""prompt"": ""<refined prompt — surgically improved, NOT a full rewrite if axis already ≥ 9>"", ""dialogue"": ""<verbatim or null>"", ""seconds"": <int>, ""changeNote"": ""<one line: what you changed and why>"" }}
+  ],
+  ""verdict"": ""ship|refine_again""
+}}
+
+Be ruthless on faithfulness — if the user said 'red bicycle in the rain' and the prompt has a 'crimson cycle in mist', that is a deviation. Use the exact user words.
+Output JSON only.";
+
+    JsonElement finalScores = default;
+    string finalVerdict = "refine_again";
+    int iterDone = 0;
+
+    for (int i = 1; i <= maxIter; i++)
+    {
+        var criticUser = $@"USER ASK (verbatim):
+{req.UserAsk}
+
+PLAN:
+{planJson.GetRawText()}
+
+CURRENT SEGMENTS:
+{currentSegments.GetRawText()}
+
+Score, list deviations, and emit refinedSegments now. Output JSON only.";
+
+        var critique = await CallReasoner(criticSys, criticUser, 6000);
+        var scores = critique.GetProperty("scores");
+        int faith = scores.GetProperty("faithfulness").GetInt32();
+        int real = scores.GetProperty("realism").GetInt32();
+        int sora = scores.GetProperty("soraCompat").GetInt32();
+        int frame = scores.GetProperty("frameCoherence").GetInt32();
+
+        iterations.Add(new
+        {
+            n = i,
+            scores = new { faithfulness = faith, realism = real, soraCompat = sora, frameCoherence = frame },
+            deviations = critique.TryGetProperty("deviations", out var dev) ? dev.Clone() : default,
+            verdict = critique.TryGetProperty("verdict", out var v) ? v.GetString() : "refine_again"
+        });
+
+        if (critique.TryGetProperty("refinedSegments", out var refined) && refined.GetArrayLength() > 0)
+            currentSegments = refined.Clone();
+
+        finalScores = scores.Clone();
+        finalVerdict = critique.TryGetProperty("verdict", out var vv) ? (vv.GetString() ?? "refine_again") : "refine_again";
+        iterDone = i;
+
+        // Early exit: all axes ≥ 9.
+        if (faith >= 9 && real >= 9 && sora >= 9 && frame >= 9 && finalVerdict == "ship") break;
+    }
+
+    // ─── Layer 4: FINAL ASSEMBLY ──────────────────────────────────────────
+    // Assemble a single combined prompt the user can paste into the existing
+    // generator UI directly — concatenated segments with clear delimiters.
+    var combinedPrompt = new StringBuilder();
+    foreach (var seg in currentSegments.EnumerateArray())
+    {
+        if (combinedPrompt.Length > 0) combinedPrompt.AppendLine().AppendLine("---").AppendLine();
+        combinedPrompt.Append(seg.GetProperty("prompt").GetString());
+    }
+
+    return Results.Json(new
+    {
+        userAsk = req.UserAsk,
+        totalSeconds,
+        segmentCount,
+        chunkSeconds,
+        plan = planJson,
+        segments = currentSegments,
+        iterations,
+        iterationsRun = iterDone,
+        finalScores,
+        verdict = finalVerdict,
+        combinedPrompt = combinedPrompt.ToString(),
+        reasoningModel = deployment
+    });
+});
+
 app.Run();
 
 public record NarrateRequest(string Text, string? Voice);
 public record TranslateRequest(string Text, string? To);
 public record EnhanceRequest(string Prompt, string? Narration, string? Voice, int? Seconds, string? Size);
+public record PromptCraftRequest(string UserAsk, int? TotalSeconds, string? Size, string? Narration, string? Voice, int? MaxIterations);
 public record StitchRequest(string[] Urls, double? Crossfade);
 public record IdentityRequest(string VideoUrl, string? OriginalAnchor);
 public record TailRequest(string VideoUrl, double? Seconds, string? Size);
