@@ -38,10 +38,35 @@ jobs:
           set -e
           mkdir -p ${{ github.workspace }}/publish/bin
           cd /tmp
-          curl -sSL https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz -o ffmpeg.tar.xz
-          tar -xf ffmpeg.tar.xz
-          DIR=$(ls -d ffmpeg-*-amd64-static | head -1)
-          cp "$DIR/ffmpeg" ${{ github.workspace }}/publish/bin/ffmpeg
+          # The johnvansickle.com mirror occasionally returns an HTML error page instead
+          # of the tarball. Retry with backoff, validate magic bytes, and fall back to
+          # the apt-installed ffmpeg if the download stays broken.
+          download_ffmpeg() {
+            for url in \
+              "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz" \
+              "https://www.johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+            do
+              for i in 1 2 3; do
+                echo "attempt $i: $url"
+                if curl -fsSL --retry 3 --retry-delay 5 --max-time 90 "$url" -o ffmpeg.tar.xz \
+                   && file ffmpeg.tar.xz | grep -q "XZ compressed data"; then
+                  return 0
+                fi
+                sleep 5
+              done
+            done
+            return 1
+          }
+          if download_ffmpeg; then
+            tar -xf ffmpeg.tar.xz
+            DIR=$(ls -d ffmpeg-*-amd64-static | head -1)
+            cp "$DIR/ffmpeg" ${{ github.workspace }}/publish/bin/ffmpeg
+          else
+            echo "Static ffmpeg download failed; falling back to apt ffmpeg."
+            sudo apt-get update -qq
+            sudo apt-get install -y ffmpeg
+            cp "$(command -v ffmpeg)" ${{ github.workspace }}/publish/bin/ffmpeg
+          fi
           chmod +x ${{ github.workspace }}/publish/bin/ffmpeg
           ${{ github.workspace }}/publish/bin/ffmpeg -version | head -2
 

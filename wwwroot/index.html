@@ -470,15 +470,39 @@ function App() {
       setCraftPanelOpen(true);
       setFinalPrompt(j.combinedPrompt || "");
       if (Array.isArray(j.segments) && j.segments.length) {
+        // CRITICAL: map every field that buildSegmentPrompt() reads at render time.
+        // Previously we only carried characterDescriptor + distinctiveTraits; the
+        // remaining identity scaffolding (sceneAnchor, cinematography, voice,
+        // backgroundSound, style) was empty for clips 2-N which is exactly why
+        // the reporter/character drifted between segments 3 and 4.
+        const ib = j.plan?.identityBible || {};
+        const sb = j.plan?.storyboard?.segments || [];
+        const totalDur = j.totalSeconds || (j.segments[j.segments.length-1]?.seconds * j.segments.length) || 0;
         setPlan({
-          segments: j.segments.map(s => ({
-            index: s.index,
-            beats: [s.prompt],
-            dialogue: s.dialogue,
-            seconds: s.seconds
-          })),
-          characterDescriptor: j.plan?.identityBible?.characterAnchor || "",
-          distinctiveTraits: j.plan?.identityBible?.distinctiveTraits || ""
+          // Top-level identity scaffold — echoed verbatim in every clip's prompt.
+          style: "Photorealistic ultra-realistic 4K, cinematic, fully realistic physics.",
+          characterAnchor: ib.characterAnchor || "",
+          distinctiveTraits: ib.distinctiveTraits || "",
+          sceneAnchor: j.plan?.sceneAnchor || "",
+          cinematography: j.plan?.cinematography || "",
+          voiceDescription: j.plan?.voiceDescription || "",
+          backgroundSound: j.plan?.backgroundSound || "",
+          negative: "no on-screen text, no captions, no logos, no watermarks, no fantasy elements, no impossible physics, no extra speakers, no duplicated limbs",
+          // Segments — wire startSec/endSec from storyboard so render-time clamping
+          // picks the correct Sora seconds (4/8/12). Use the fully-baked PromptCraft
+          // prompt as the segment summary so buildSegmentPrompt surfaces it under
+          // the IDENTITY LOCK header.
+          segments: j.segments.map((s, i) => {
+            const sbi = sb[i] || {};
+            return {
+              index: s.index ?? (i + 1),
+              startSec: sbi.startSec ?? (i * (s.seconds || 12)),
+              endSec: sbi.endSec ?? ((i + 1) * (s.seconds || 12)),
+              summary: s.prompt,
+              beats: Array.isArray(sbi.beats) ? sbi.beats : [],
+              dialogue: s.dialogue
+            };
+          })
         });
       }
       const sc = j.finalScores || {};
