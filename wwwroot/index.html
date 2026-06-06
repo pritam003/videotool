@@ -1077,7 +1077,7 @@ function App() {
       // Show ETA up front so the wait is expected, not surprising.
       const etaSec = chunks * (chunkSize <= 4 ? 60 : chunkSize <= 8 ? 100 : 150);
       const etaMin = Math.ceil(etaSec / 60);
-      toast(`Rendering ${chunks} clip${chunks > 1 ? "s" : ""} · est. ~${etaMin} min on Sora-2 (sequential, 1 task/deployment)`);
+      toast(`Rendering ${chunks} clip${chunks > 1 ? "s" : ""} · est. ~${etaMin} min on Wan2.2 (sequential, 1 task/GPU)`);
       for (let i = 0; i < chunks; i++) {
         if (cancelRef.current) throw new Error("Cancelled by user");
         // Per-segment chunk size: in plan mode, prefer the segment's explicit
@@ -1219,7 +1219,7 @@ function App() {
     <header class="app">
       <span class="dot"></span>
       <span class="title">Sora Studio</span>
-      <span class="badge">sora-2 · ${size} · ${seconds}s</span>
+      <span class="badge">wan2.2 · ${size} · ${seconds}s</span>
       <div class="spacer"></div>
       <button class="ghost" onClick=${() => setTheme(theme === "light" ? "dark" : "light")} title="Toggle theme">
         ${theme === "light" ? "☾" : "☀"}
