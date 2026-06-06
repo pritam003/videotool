@@ -527,8 +527,8 @@ Rules:
                 new { role = "system", content = sys },
                 new { role = "user", content = contentParts.ToArray() }
             },
-            temperature = 0.2,
-            max_tokens = 700,
+            // gpt-5-mini doesn't support `max_tokens` or non-default `temperature`.
+            max_completion_tokens = 700,
             response_format = new { type = "json_object" }
         };
 
@@ -875,8 +875,8 @@ Plan the {segmentCount}-segment arc as JSON now.";
             new { role = "system", content = sys },
             new { role = "user",   content = userMsg }
         },
-        temperature = 0.7,
-        max_tokens = 2400,
+        // gpt-5-mini doesn't support `max_tokens` or non-default `temperature`.
+        max_completion_tokens = 2400,
         response_format = new { type = "json_object" }
     };
     chatMsg.Content = new StringContent(
