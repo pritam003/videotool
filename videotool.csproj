@@ -15,8 +15,9 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- Wan2.2 ComfyUI workflow template, loaded at runtime by WanClient. -->
-    <Content Include="workflows\**\*.json">
+    <!-- Wan2.2 ComfyUI workflow template, loaded at runtime by WanClient.
+         (Use Update — Web SDK already includes **/*.json by default.) -->
+    <Content Update="workflows\**\*.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>
