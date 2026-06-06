@@ -122,7 +122,7 @@ AUTH_BODY=$(cat <<JSON
       "requireAuthentication": true,
       "unauthenticatedClientAction": "RedirectToLoginPage",
       "redirectToProvider": "azureactivedirectory",
-      "excludedPaths": ["/health", "/.auth/*", "/sw.js", "/favicon.ico", "/api/push/vapid-public-key"]
+      "excludedPaths": ["/health", "/sw.js", "/favicon.ico", "/api/push/vapid-public-key"]
     },
     "identityProviders": {
       "azureActiveDirectory": {
