@@ -17,6 +17,9 @@ STORAGE_NAME="videotoolstor$(printf '%04d' $((RANDOM % 10000)))"
 STORAGE_CONTAINER="videos"
 APP_ID="054ed937-90d8-4874-94db-9cb7db9214bc"
 GROUP_ID="913b2179-36bb-4451-97cd-e420657529b7"
+# Service principal used by .github/workflows/deploy.yml OIDC login
+# (Entra app 'gh-oidc-videotool' / app id 1dbd231d-4a2a-426b-9a6b-83c7e2431648)
+GH_OIDC_SP_OBJECT_ID="ce73d4ec-336d-4725-a46e-9941c5adfc5c"
 GH_REPO="https://github.com/pritam003/videotool.git"
 GH_BRANCH="main"
 # Wan2.2 ComfyUI backend (Container App in same RG)
@@ -155,6 +158,14 @@ az webapp deployment source config \
   -g "$RG" -n "$WEBAPP_NAME" \
   --repo-url "$GH_REPO" --branch "$GH_BRANCH" --manual-integration \
   -o none
+
+echo "==> granting GH Actions OIDC SP Contributor on $RG (idempotent)"
+az role assignment create \
+  --assignee-object-id "$GH_OIDC_SP_OBJECT_ID" \
+  --assignee-principal-type ServicePrincipal \
+  --role "Contributor" \
+  --scope "/subscriptions/$SUB/resourceGroups/$RG" \
+  -o none 2>/dev/null || echo "  (role assignment already exists)"
 
 echo
 echo "==================================================================="
