@@ -38,17 +38,15 @@ public sealed class WanClient
     /// </summary>
     public async Task<string> SubmitAsync(string prompt, int seconds, int width, int height, CancellationToken ct)
     {
-        // Wan2.2-TI2V-5B: 24 fps; total frames must be of the form 4n+1; capped at ~5 s.
+        // Wan2.2-T2V-A14B (dual-stage MoE) + Lightning 4-step LoRA: native 16 fps,
+        // temporal compression factor 4 so total frame count must be 4n+1.
+        // Cap at 5 s to keep render under ~60 s and stay inside the per-clip cost budget.
         seconds = Math.Clamp(seconds, 1, 5);
-        var frames = seconds * 24 + 1; // 25, 49, 73, 97, 121 — all 4n+1.
+        var frames = seconds * 16 + 1; // 17, 33, 49, 65, 81 — all 4n+1.
 
-        // Spatial dims must be multiples of 16. Native sizes: 1280x704, 704x1280, 832x480, 480x832.
+        // Spatial dims must be multiples of 16. A14B native sizes: 1280x720, 720x1280, 832x480, 480x832.
         width = Math.Max(256, (width / 16) * 16);
         height = Math.Max(256, (height / 16) * 16);
-
-        // Snap 720 -> 704 (the native Wan2.2 height) when caller asks for 1280x720.
-        if (width == 1280 && height == 720) height = 704;
-        if (width == 720 && height == 1280) width = 704;
 
         var seed = Random.Shared.NextInt64() & 0x7FFFFFFFFFFFFFFFL;
 

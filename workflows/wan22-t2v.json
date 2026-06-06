@@ -1,19 +1,47 @@
 {
-  "3": {
-    "class_type": "KSampler",
-    "_meta": { "title": "KSampler" },
+  "37": {
+    "class_type": "UNETLoader",
+    "_meta": { "title": "Load Wan2.2 T2V-A14B HIGH-NOISE expert" },
     "inputs": {
-      "seed": __SEED__,
-      "steps": 25,
-      "cfg": 5.0,
-      "sampler_name": "uni_pc",
-      "scheduler": "simple",
-      "denoise": 1.0,
-      "model": ["12", 0],
-      "positive": ["6", 0],
-      "negative": ["7", 0],
-      "latent_image": ["10", 0]
+      "unet_name": "wan2.2_t2v_high_noise_14B_fp8_scaled.safetensors",
+      "weight_dtype": "default"
     }
+  },
+  "38": {
+    "class_type": "UNETLoader",
+    "_meta": { "title": "Load Wan2.2 T2V-A14B LOW-NOISE expert" },
+    "inputs": {
+      "unet_name": "wan2.2_t2v_low_noise_14B_fp8_scaled.safetensors",
+      "weight_dtype": "default"
+    }
+  },
+  "39": {
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": { "title": "Lightning 4-step LoRA (high-noise)" },
+    "inputs": {
+      "lora_name": "wan2.2_t2v_lightning_4steps_high.safetensors",
+      "strength_model": 1.0,
+      "model": ["37", 0]
+    }
+  },
+  "40": {
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": { "title": "Lightning 4-step LoRA (low-noise)" },
+    "inputs": {
+      "lora_name": "wan2.2_t2v_lightning_4steps_low.safetensors",
+      "strength_model": 1.0,
+      "model": ["38", 0]
+    }
+  },
+  "41": {
+    "class_type": "ModelSamplingSD3",
+    "_meta": { "title": "Model sampling shift (high)" },
+    "inputs": { "shift": 5.0, "model": ["39", 0] }
+  },
+  "42": {
+    "class_type": "ModelSamplingSD3",
+    "_meta": { "title": "Model sampling shift (low)" },
+    "inputs": { "shift": 5.0, "model": ["40", 0] }
   },
   "5": {
     "class_type": "CLIPLoader",
@@ -36,19 +64,14 @@
     "class_type": "CLIPTextEncode",
     "_meta": { "title": "Negative prompt" },
     "inputs": {
-      "text": "blurry, distorted, low quality, low resolution, bad anatomy, malformed, watermark, on-screen text, captions, logo",
+      "text": "blurry, distorted, low quality, low resolution, oversaturated, color bleed, posterized, banding, jpeg artifacts, bad anatomy, malformed, deformed face, extra limbs, watermark, on-screen text, captions, logo, ugly",
       "clip": ["5", 0]
     }
   },
   "8": {
     "class_type": "VAELoader",
-    "_meta": { "title": "Load Wan 2.2 VAE" },
-    "inputs": { "vae_name": "wan2.2_vae.safetensors" }
-  },
-  "9": {
-    "class_type": "VAEDecode",
-    "_meta": { "title": "VAE Decode" },
-    "inputs": { "samples": ["3", 0], "vae": ["8", 0] }
+    "_meta": { "title": "Load Wan 2.1 VAE (16-channel for A14B)" },
+    "inputs": { "vae_name": "wan_2.1_vae.safetensors" }
   },
   "10": {
     "class_type": "EmptyHunyuanLatentVideo",
@@ -60,30 +83,60 @@
       "batch_size": 1
     }
   },
+  "43": {
+    "class_type": "KSamplerAdvanced",
+    "_meta": { "title": "Stage 1: high-noise (steps 0-2)" },
+    "inputs": {
+      "add_noise": "enable",
+      "noise_seed": __SEED__,
+      "steps": 4,
+      "cfg": 1.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "start_at_step": 0,
+      "end_at_step": 2,
+      "return_with_leftover_noise": "enable",
+      "model": ["41", 0],
+      "positive": ["6", 0],
+      "negative": ["7", 0],
+      "latent_image": ["10", 0]
+    }
+  },
+  "44": {
+    "class_type": "KSamplerAdvanced",
+    "_meta": { "title": "Stage 2: low-noise (steps 2-4)" },
+    "inputs": {
+      "add_noise": "disable",
+      "noise_seed": __SEED__,
+      "steps": 4,
+      "cfg": 1.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "start_at_step": 2,
+      "end_at_step": 4,
+      "return_with_leftover_noise": "disable",
+      "model": ["42", 0],
+      "positive": ["6", 0],
+      "negative": ["7", 0],
+      "latent_image": ["43", 0]
+    }
+  },
+  "9": {
+    "class_type": "VAEDecode",
+    "_meta": { "title": "VAE Decode" },
+    "inputs": { "samples": ["44", 0], "vae": ["8", 0] }
+  },
   "11": {
     "class_type": "VHS_VideoCombine",
     "_meta": { "title": "Save MP4" },
     "inputs": {
       "images": ["9", 0],
-      "frame_rate": 24,
+      "frame_rate": 16,
       "loop_count": 0,
       "filename_prefix": "wan22",
       "format": "video/h264-mp4",
       "pingpong": false,
       "save_output": true
-    }
-  },
-  "12": {
-    "class_type": "ModelSamplingSD3",
-    "_meta": { "title": "Model sampling shift" },
-    "inputs": { "shift": 8.0, "model": ["13", 0] }
-  },
-  "13": {
-    "class_type": "UNETLoader",
-    "_meta": { "title": "Load Wan2.2 TI2V-5B" },
-    "inputs": {
-      "unet_name": "wan2.2_ti2v_5B_fp16.safetensors",
-      "weight_dtype": "default"
     }
   }
 }
