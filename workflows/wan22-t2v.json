@@ -42,8 +42,8 @@
   },
   "8": {
     "class_type": "VAELoader",
-    "_meta": { "title": "Load Wan VAE" },
-    "inputs": { "vae_name": "wan_2.1_vae.safetensors" }
+    "_meta": { "title": "Load Wan 2.2 VAE" },
+    "inputs": { "vae_name": "wan2.2_vae.safetensors" }
   },
   "9": {
     "class_type": "VAEDecode",
