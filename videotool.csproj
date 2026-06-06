@@ -14,4 +14,12 @@
     <PackageReference Include="WebPush" Version="1.0.12" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Wan2.2 ComfyUI workflow template, loaded at runtime by WanClient. -->
+    <Content Include="workflows\**\*.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+  </ItemGroup>
+
 </Project>

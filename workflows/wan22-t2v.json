@@ -1,0 +1,89 @@
+{
+  "3": {
+    "class_type": "KSampler",
+    "_meta": { "title": "KSampler" },
+    "inputs": {
+      "seed": __SEED__,
+      "steps": 25,
+      "cfg": 5.0,
+      "sampler_name": "uni_pc",
+      "scheduler": "simple",
+      "denoise": 1.0,
+      "model": ["12", 0],
+      "positive": ["6", 0],
+      "negative": ["7", 0],
+      "latent_image": ["10", 0]
+    }
+  },
+  "5": {
+    "class_type": "CLIPLoader",
+    "_meta": { "title": "Load CLIP (UMT5)" },
+    "inputs": {
+      "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "type": "wan",
+      "device": "default"
+    }
+  },
+  "6": {
+    "class_type": "CLIPTextEncode",
+    "_meta": { "title": "Positive prompt" },
+    "inputs": {
+      "text": __PROMPT__,
+      "clip": ["5", 0]
+    }
+  },
+  "7": {
+    "class_type": "CLIPTextEncode",
+    "_meta": { "title": "Negative prompt" },
+    "inputs": {
+      "text": "blurry, distorted, low quality, low resolution, bad anatomy, malformed, watermark, on-screen text, captions, logo",
+      "clip": ["5", 0]
+    }
+  },
+  "8": {
+    "class_type": "VAELoader",
+    "_meta": { "title": "Load Wan VAE" },
+    "inputs": { "vae_name": "wan_2.1_vae.safetensors" }
+  },
+  "9": {
+    "class_type": "VAEDecode",
+    "_meta": { "title": "VAE Decode" },
+    "inputs": { "samples": ["3", 0], "vae": ["8", 0] }
+  },
+  "10": {
+    "class_type": "EmptyHunyuanLatentVideo",
+    "_meta": { "title": "Empty video latent" },
+    "inputs": {
+      "width": __WIDTH__,
+      "height": __HEIGHT__,
+      "length": __FRAMES__,
+      "batch_size": 1
+    }
+  },
+  "11": {
+    "class_type": "VHS_VideoCombine",
+    "_meta": { "title": "Save MP4" },
+    "inputs": {
+      "images": ["9", 0],
+      "frame_rate": 24,
+      "loop_count": 0,
+      "filename_prefix": "wan22",
+      "format": "video/h264-mp4",
+      "pingpong": false,
+      "save_output": true
+    }
+  },
+  "12": {
+    "class_type": "ModelSamplingSD3",
+    "_meta": { "title": "Model sampling shift" },
+    "inputs": { "shift": 8.0, "model": ["13", 0] }
+  },
+  "13": {
+    "class_type": "UNETLoader",
+    "_meta": { "title": "Load Wan2.2 TI2V-5B" },
+    "inputs": {
+      "unet_name": "wan2.2_ti2v_5B_fp16.safetensors",
+      "weight_dtype": "default"
+    }
+  }
+}

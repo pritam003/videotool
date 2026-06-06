@@ -8,7 +8,7 @@ set -euo pipefail
 SUB="cc4e707a-06b6-43c5-85e1-3d6b406a33c2"
 TENANT="2c2d753c-7844-4a95-8ed4-3844729e0803"
 RG="rg-videotool"
-APP_LOCATION="centralus"
+APP_LOCATION="eastus"
 AOAI_LOCATION="eastus2"
 ASP_NAME="asp-videotool"
 WEBAPP_NAME="videotool-pritam003-23209"     # must be globally unique
@@ -19,6 +19,8 @@ APP_ID="054ed937-90d8-4874-94db-9cb7db9214bc"
 GROUP_ID="913b2179-36bb-4451-97cd-e420657529b7"
 GH_REPO="https://github.com/pritam003/videotool.git"
 GH_BRANCH="main"
+# Wan2.2 ComfyUI backend (Container App in same RG)
+WAN_BASE_URL="https://wan22.mangosky-166b9339.eastus.azurecontainerapps.io"
 
 echo "==> selecting subscription"
 az account set --subscription "$SUB"
@@ -49,13 +51,7 @@ az cognitiveservices account create \
   --custom-domain "$AOAI_NAME" \
   --yes -o none
 
-echo "==> creating sora-2 deployment (capacity 1, GlobalStandard)"
-az cognitiveservices account deployment create \
-  -g "$RG" -n "$AOAI_NAME" \
-  --deployment-name sora-2 \
-  --model-name sora-2 --model-version 2025-12-08 --model-format OpenAI \
-  --sku-name GlobalStandard --sku-capacity 1 \
-  -o none || echo "  (sora-2 deploy may need manual capacity request)"
+echo "==> (sora-2 deployment skipped; video generation now uses Wan2.2 Container App)"
 
 echo "==> creating gpt-5-mini deployment (capacity 50, GlobalStandard)"
 az cognitiveservices account deployment create \
@@ -92,7 +88,6 @@ az webapp config appsettings set \
   --settings \
     AOAI_ENDPOINT="$AOAI_ENDPOINT" \
     AOAI_KEY="$AOAI_KEY" \
-    AOAI_DEPLOYMENT="sora-2" \
     CHAT_DEPLOYMENT="gpt-5-mini" \
     REASONING_DEPLOYMENT="gpt-5-mini" \
     SPEECH_REGION="$AOAI_LOCATION" \
@@ -101,6 +96,7 @@ az webapp config appsettings set \
     AUTH_REQUIRED="1" \
     ALLOWED_GROUP_ID="$GROUP_ID" \
     MICROSOFT_PROVIDER_AUTHENTICATION_SECRET="$CLIENT_SECRET" \
+    WAN_BASE_URL="$WAN_BASE_URL" \
   -o none
 
 echo "==> granting webapp managed identity Storage Blob Data Contributor on storage"

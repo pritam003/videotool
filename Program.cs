@@ -7,6 +7,7 @@ using Azure.Identity;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using Azure.Storage.Sas;
+using VideoTool;
 using WebPush;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -21,6 +22,9 @@ builder.Services.AddSingleton<PromptCraftJobStore>();
 builder.Services.AddSingleton<VapidConfig>(sp => VapidConfig.LoadOrCreate(sp.GetRequiredService<ILogger<VapidConfig>>()));
 builder.Services.AddSingleton<PushSubscriptionStore>();
 builder.Services.AddSingleton<SoraJobWatcherRegistry>();
+// Wan2.2 (ComfyUI) client. Replaces the AOAI Sora-2 video path; the rest of the
+// app (frontend, push watcher, blob upload, stitch) keeps working unchanged.
+builder.Services.AddSingleton<WanClient>();
 
 var app = builder.Build();
 app.UseDefaultFiles();
@@ -153,7 +157,10 @@ app.MapGet("/api/me", (HttpRequest http) =>
 });
 
 // 1. Submit a video job. Multipart so an optional reference image/video can ride along.
-app.MapPost("/api/jobs", async (HttpRequest http, IHttpClientFactory hf, IConfiguration cfg, CancellationToken ct) =>
+// Submit a Wan2.2 text-to-video job to the ComfyUI container app. We keep the
+// Sora-shaped multipart contract so the frontend doesn't need to change, but
+// the inputReference field is silently dropped (Wan2.2-TI2V-5B is pure T2V).
+app.MapPost("/api/jobs", async (HttpRequest http, WanClient wan, CancellationToken ct) =>
 {
     if (!http.HasFormContentType)
         return Results.BadRequest(new { error = "multipart/form-data required" });
@@ -163,97 +170,74 @@ app.MapPost("/api/jobs", async (HttpRequest http, IHttpClientFactory hf, IConfig
     if (string.IsNullOrWhiteSpace(prompt))
         return Results.BadRequest(new { error = "prompt is required" });
 
-    var seconds = form["seconds"].ToString();
-    if (string.IsNullOrWhiteSpace(seconds)) seconds = "4";
+    if (!int.TryParse(form["seconds"].ToString(), out var seconds) || seconds < 1) seconds = 4;
     var size = form["size"].ToString();
     if (string.IsNullOrWhiteSpace(size)) size = "1280x720";
+    int width = 1280, height = 720;
+    var parts = size.Split('x', 2);
+    if (parts.Length == 2 && int.TryParse(parts[0], out var w) && int.TryParse(parts[1], out var h))
+    { width = w; height = h; }
 
-    var (baseUrl, apiKey, deployment) = AoaiCfg(cfg);
-
-    using var multipart = new MultipartFormDataContent();
-    multipart.Add(new StringContent(deployment), "model");
-    multipart.Add(new StringContent(prompt), "prompt");
-    multipart.Add(new StringContent(seconds), "seconds");
-    multipart.Add(new StringContent(size), "size");
-
-    var refFile = form.Files["inputReference"];
-    if (refFile is { Length: > 0 })
+    try
     {
-        var ms = new MemoryStream();
-        await refFile.CopyToAsync(ms, ct);
-        ms.Position = 0;
-        var sc = new StreamContent(ms);
-        sc.Headers.ContentType = new MediaTypeHeaderValue(
-            string.IsNullOrWhiteSpace(refFile.ContentType) ? "application/octet-stream" : refFile.ContentType);
-        multipart.Add(sc, "input_reference", refFile.FileName);
+        var id = await wan.SubmitAsync(prompt, seconds, width, height, ct);
+        // Sora-shaped { id, status } so the frontend's existing polling code keeps working.
+        return Results.Json(new { id, status = "queued" });
     }
-
-    var client = hf.CreateClient();
-    client.Timeout = TimeSpan.FromMinutes(2);
-    using var req = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/openai/v1/videos");
-    req.Headers.Add("api-key", apiKey);
-    req.Content = multipart;
-    using var resp = await client.SendAsync(req, ct);
-    var body = await resp.Content.ReadAsStringAsync(ct);
-    if (!resp.IsSuccessStatusCode)
-        return Results.Problem($"Submit failed ({(int)resp.StatusCode}): {body}");
-    return Results.Content(body, "application/json");
+    catch (Exception ex)
+    {
+        return Results.Problem($"Wan submit failed: {ex.Message}");
+    }
 });
 
-// 2. Poll job status. Returns Sora's response verbatim (id, status, progress, ...).
-app.MapGet("/api/jobs/{id}", async (string id, IHttpClientFactory hf, IConfiguration cfg, CancellationToken ct) =>
+// 2. Poll job status. Returns a Sora-shaped {id, status, progress, ...} JSON
+//    object so the frontend's existing polling loop stays unchanged. ComfyUI's
+//    /history is the source of truth for terminal states; /queue distinguishes
+//    queued vs running while the job is still in flight.
+app.MapGet("/api/jobs/{id}", async (string id, WanClient wan, CancellationToken ct) =>
 {
-    var (baseUrl, apiKey, _) = AoaiCfg(cfg);
-    var client = hf.CreateClient();
-    client.DefaultRequestHeaders.Add("api-key", apiKey);
-    // Retry transient 5xx / 429 from Sora's polling endpoint with exponential
-    // backoff. Sora occasionally returns "server had an error processing your
-    // request" mid-render; the underlying job is still alive, so a retried GET
-    // usually succeeds and the user's render survives.
-    HttpResponseMessage? resp = null;
-    string body = "";
+    // Retry transient errors with exponential backoff, mirroring the old Sora path.
     var delays = new[] { 1000, 2000, 4000, 8000 };
+    Exception? last = null;
     for (int attempt = 0; attempt <= delays.Length; attempt++)
     {
-        resp?.Dispose();
-        resp = await client.GetAsync($"{baseUrl}/openai/v1/videos/{id}", ct);
-        body = await resp.Content.ReadAsStringAsync(ct);
-        var sc = (int)resp.StatusCode;
-        var transient = sc == 429 || (sc >= 500 && sc <= 599);
-        if (!transient || attempt == delays.Length) break;
-        try { await Task.Delay(delays[attempt], ct); } catch { break; }
+        try
+        {
+            var json = await wan.GetStatusJsonAsync(id, ct);
+            return Results.Content(json, "application/json");
+        }
+        catch (Exception ex)
+        {
+            last = ex;
+            if (attempt < delays.Length) await Task.Delay(delays[attempt], ct);
+        }
     }
-    var status = resp != null ? (int)resp.StatusCode : 502;
-    resp?.Dispose();
-    return Results.Content(body, "application/json", statusCode: status);
+    return Results.Problem($"Status fetch failed after retries: {last?.Message}");
 });
 
-// 2b. Cancel an in-flight job. Forwards to Sora's cancel endpoint so we stop
-// being billed for compute on a job the user no longer wants.
-app.MapPost("/api/jobs/{id}/cancel", async (string id, IHttpClientFactory hf, IConfiguration cfg, CancellationToken ct) =>
+// 2b. Cancel an in-flight job. ComfyUI doesn't bill per-second the way Sora did,
+//     but cancelling frees the GPU for queued items.
+app.MapPost("/api/jobs/{id}/cancel", async (string id, WanClient wan, CancellationToken ct) =>
 {
-    var (baseUrl, apiKey, _) = AoaiCfg(cfg);
-    var client = hf.CreateClient();
-    client.Timeout = TimeSpan.FromSeconds(20);
-    using var msg = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/openai/v1/videos/{Uri.EscapeDataString(id)}/cancel");
-    msg.Headers.Add("api-key", apiKey);
-    msg.Content = new StringContent("{}", Encoding.UTF8, "application/json");
-    using var resp = await client.SendAsync(msg, ct);
-    var body = await resp.Content.ReadAsStringAsync(ct);
-    return Results.Content(body, "application/json", statusCode: (int)resp.StatusCode);
+    var (sc, body) = await wan.CancelAsync(id, ct);
+    return Results.Content(body, "application/json", statusCode: sc);
 });
 
-// 3. Finalize: download MP4 from Sora, upload to blob, return SAS URL.
+// 3. Finalize: download MP4 from ComfyUI's /view, stream-upload to blob, return SAS URL.
 app.MapPost("/api/jobs/{id}/finalize", async (
-    string id, IHttpClientFactory hf, IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
+    string id, WanClient wan, IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
 {
-    var (baseUrl, apiKey, _) = AoaiCfg(cfg);
-    var client = hf.CreateClient();
-    client.Timeout = TimeSpan.FromMinutes(5);
-    client.DefaultRequestHeaders.Add("api-key", apiKey);
+    // Re-fetch status to obtain the output filename + subfolder ComfyUI assigned.
+    var statusJson = await wan.GetStatusJsonAsync(id, ct);
+    using var sdoc = JsonDocument.Parse(statusJson);
+    var root = sdoc.RootElement;
+    if (!root.TryGetProperty("outputFilename", out var fnEl) || fnEl.ValueKind != JsonValueKind.String)
+        return Results.Problem("Job is not finished yet (no output filename available).");
+    var filename = fnEl.GetString()!;
+    var subfolder = root.TryGetProperty("outputSubfolder", out var sfEl) && sfEl.ValueKind == JsonValueKind.String
+        ? sfEl.GetString() : null;
 
-    using var v = await client.GetAsync($"{baseUrl}/openai/v1/videos/{id}/content?variant=video",
-        HttpCompletionOption.ResponseHeadersRead, ct);
+    using var v = await wan.DownloadAsync(filename, subfolder, ct);
     if (!v.IsSuccessStatusCode)
     {
         var err = await v.Content.ReadAsStringAsync(ct);
@@ -264,7 +248,7 @@ app.MapPost("/api/jobs/{id}/finalize", async (
     var svc = new BlobServiceClient(new Uri($"https://{account}.blob.core.windows.net"), cred);
     var container = svc.GetBlobContainerClient(cfg["STORAGE_CONTAINER"] ?? "videos");
     var name = $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{id}.mp4";
-    // Stream Sora -> Blob directly. F1's 1GB RAM was OOM-recycling the container
+    // Stream ComfyUI -> Blob directly. F1's 1GB RAM was OOM-recycling the container
     // when we buffered the full MP4 into a byte[] before upload.
     await using var src = await v.Content.ReadAsStreamAsync(ct);
     var url = await UploadAndSign(container, name, src, "video/mp4", svc, account, ct);
@@ -657,44 +641,16 @@ static async Task<IResult> SliceImpl(SliceRequest req, IHttpClientFactory hf,
     }
 }
 
-// 3d. Remix: invoke Sora-2's native remix endpoint — generates a NEW video that
-//     preserves the framework (subject identity, lighting, lens) of an existing
-//     finished video while applying narrow textual edits. Strongest single lever
-//     for cross-clip character consistency: clip 2..N "remix from clip 1" inherit
-//     the rendered character pixel-natively rather than via prompt re-description.
-//
-//     Body: { videoId: "video_xxx", prompt: "...", seconds?: 4|8|12, size?: "WxH" }
-//     Returns the Sora job object verbatim (id, status, ...) — frontend polls/finalizes
-//     identically to /api/jobs.
-app.MapPost("/api/remix", async (RemixRequest req, IHttpClientFactory hf,
-    IConfiguration cfg, CancellationToken ct) =>
-{
-    if (string.IsNullOrWhiteSpace(req.VideoId))
-        return Results.BadRequest(new { error = "videoId is required" });
-    if (string.IsNullOrWhiteSpace(req.Prompt))
-        return Results.BadRequest(new { error = "prompt is required" });
-
-    var (baseUrl, apiKey, _) = AoaiCfg(cfg);
-    var client = hf.CreateClient();
-    client.Timeout = TimeSpan.FromMinutes(2);
-
-    // Sora-2 remix payload only accepts `prompt`. The remix inherits seconds/size
-    // from the source clip; passing them returns 400 "Unknown parameter".
-    var payload = new Dictionary<string, object?>
+// 3d. Remix: NOT SUPPORTED on Wan2.2 (no native remix endpoint). Returns 410 Gone
+//     so the frontend can show a friendly "not available" message. A future
+//     implementation could fake remix via image-to-video using the source clip's
+//     last frame, but that needs a separate I2V workflow and is out of scope here.
+app.MapPost("/api/remix", (RemixRequest req) =>
+    Results.Json(new
     {
-        ["prompt"] = req.Prompt
-    };
-
-    using var msg = new HttpRequestMessage(HttpMethod.Post,
-        $"{baseUrl}/openai/v1/videos/{Uri.EscapeDataString(req.VideoId!)}/remix");
-    msg.Headers.Add("api-key", apiKey);
-    msg.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
-    using var resp = await client.SendAsync(msg, ct);
-    var body = await resp.Content.ReadAsStringAsync(ct);
-    if (!resp.IsSuccessStatusCode)
-        return Results.Problem($"Remix failed ({(int)resp.StatusCode}): {body}");
-    return Results.Content(body, "application/json");
-});
+        error = "remix is not supported on Wan2.2-TI2V-5B",
+        hint = "submit a new prompt via /api/jobs; image-to-video remix may land later"
+    }, statusCode: 410));
 
 // 4. Narrate: synthesize speech via Azure Speech, upload MP3, return SAS URL.
 app.MapPost("/api/narrate", async (NarrateRequest req, IHttpClientFactory hf,
@@ -1020,8 +976,12 @@ app.MapPost("/api/promptcraft", (PromptCraftRequest req, IHttpClientFactory hf,
     var chunkSeconds = Math.Min(totalSeconds, 12);
     var segmentCount = (int)Math.Ceiling(totalSeconds / (double)chunkSeconds);
     var maxIter = Math.Clamp(req.MaxIterations ?? 5, 1, 8);
-    var voice = req.Voice ?? "en-US-AvaMultilingualNeural";
-    var narration = req.Narration ?? "";
+    // Wan2.2-TI2V-5B has no audio output; drop dialogue/narration/voice at the
+    // input boundary so PromptCraft's compiled prompts stay focused on visuals.
+    // The old Sora-2 path used these to shape lip-synced narration; they're
+    // no-ops now but the schema is preserved for frontend compatibility.
+    var voice = "";
+    var narration = "";
 
     var jobId = Guid.NewGuid().ToString("n");
     var job = store.Create(jobId);
@@ -1458,9 +1418,7 @@ app.MapPost("/api/push/subscribe", async (HttpRequest http, PushSubscriptionStor
     // Start a one-shot watcher (idempotent: registry de-dupes by jobId).
     registry.StartWatcher(body.JobId, async stoppingToken =>
     {
-        var (baseUrl, apiKey, _) = AoaiCfg(cfg);
-        var client = hf.CreateClient();
-        client.DefaultRequestHeaders.Add("api-key", apiKey);
+        var wan = app.Services.GetRequiredService<WanClient>();
         var elapsed = 0;
         var consecutiveFails = 0;
         while (!stoppingToken.IsCancellationRequested)
@@ -1472,20 +1430,19 @@ app.MapPost("/api/push/subscribe", async (HttpRequest http, PushSubscriptionStor
             string? status = null;
             try
             {
-                using var resp = await client.GetAsync($"{baseUrl}/openai/v1/videos/{body.JobId}", stoppingToken);
-                if ((int)resp.StatusCode == 429 || ((int)resp.StatusCode >= 500 && (int)resp.StatusCode <= 599))
-                {
-                    consecutiveFails++;
-                    if (consecutiveFails >= 12) { log.LogWarning("watcher {Id}: 12× transient {Code}, giving up", body.JobId, (int)resp.StatusCode); break; }
-                    continue;
-                }
-                consecutiveFails = 0;
-                if (!resp.IsSuccessStatusCode) { log.LogWarning("watcher {Id}: non-success {Code}", body.JobId, (int)resp.StatusCode); break; }
-                using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync(stoppingToken));
+                var json = await wan.GetStatusJsonAsync(body.JobId, stoppingToken);
+                using var doc = JsonDocument.Parse(json);
                 if (doc.RootElement.TryGetProperty("status", out var s)) status = s.GetString();
+                consecutiveFails = 0;
             }
             catch (OperationCanceledException) { break; }
-            catch (Exception ex) { log.LogWarning(ex, "watcher {Id}: poll error", body.JobId); consecutiveFails++; if (consecutiveFails >= 12) break; continue; }
+            catch (Exception ex)
+            {
+                log.LogWarning(ex, "watcher {Id}: poll error", body.JobId);
+                consecutiveFails++;
+                if (consecutiveFails >= 12) break;
+                continue;
+            }
 
             if (status == "succeeded" || status == "completed")
             {
@@ -1496,7 +1453,7 @@ app.MapPost("/api/push/subscribe", async (HttpRequest http, PushSubscriptionStor
             if (status == "failed" || status == "cancelled")
             {
                 await SendPushAsync(subs, vapid, body.JobId, $"Clip {status}: {body.Label ?? body.JobId}",
-                    $"Sora job {status}. Open videotool to retry.", "videotool-clip", log);
+                    $"Wan2.2 job {status}. Open videotool to retry.", "videotool-clip", log);
                 break;
             }
         }
