@@ -568,6 +568,59 @@ app.MapPost("/api/stitch", async (StitchRequest req, IHttpClientFactory hf,
     }
 });
 
+// Lay a narration audio track over a finished film. Used by Story Chain to mux
+// the AI/user voiceover onto the stitched video. Default "replace" maps the
+// narration as the only audio stream (the silent Wan2.2 clips have none), so it
+// is safe even when the video carries no audio track. -shortest clamps to the
+// shorter of film/narration.
+app.MapPost("/api/mux-audio", async (MuxAudioRequest req, IHttpClientFactory hf,
+    IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
+{
+    if (string.IsNullOrWhiteSpace(req?.VideoUrl) || string.IsNullOrWhiteSpace(req?.AudioUrl))
+        return Results.BadRequest(new { error = "videoUrl and audioUrl are required" });
+
+    var ffmpeg = LocateFfmpeg();
+    if (ffmpeg is null)
+        return Results.Problem("ffmpeg binary not found. Expected at ./bin/ffmpeg (bundled by CI).");
+
+    var work = Path.Combine(Path.GetTempPath(), $"mux-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(work);
+    try
+    {
+        var http = hf.CreateClient();
+        http.Timeout = TimeSpan.FromMinutes(3);
+        var vIn = Path.Combine(work, "in.mp4");
+        var aIn = Path.Combine(work, "in.mp3");
+        using (var s = await http.GetStreamAsync(req.VideoUrl, ct))
+        await using (var f = File.Create(vIn)) await s.CopyToAsync(f, ct);
+        using (var s = await http.GetStreamAsync(req.AudioUrl, ct))
+        await using (var f = File.Create(aIn)) await s.CopyToAsync(f, ct);
+
+        var outPath = Path.Combine(work, "out.mp4");
+        var mode = (req.Mode ?? "replace").ToLowerInvariant();
+        string args = mode == "mix"
+            ? $"-y -i \"{vIn}\" -i \"{aIn}\" -filter_complex \"[0:a][1:a]amix=inputs=2:duration=longest[a]\" -map 0:v -map \"[a]\" -c:v copy -c:a aac -b:a 192k -movflags +faststart \"{outPath}\""
+            : $"-y -i \"{vIn}\" -i \"{aIn}\" -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 192k -shortest -movflags +faststart \"{outPath}\"";
+
+        var (ec, stderr) = await RunProcessAsync(ffmpeg, args, ct);
+        if (ec != 0 || !File.Exists(outPath))
+            return Results.Problem($"ffmpeg mux failed (exit {ec}): {stderr.Substring(0, Math.Min(stderr.Length, 1500))}");
+
+        var mp4 = await File.ReadAllBytesAsync(outPath, ct);
+        var account = Cfg(cfg, "STORAGE_ACCOUNT");
+        var svc = new BlobServiceClient(new Uri($"https://{account}.blob.core.windows.net"), cred);
+        var container = svc.GetBlobContainerClient(cfg["STORAGE_CONTAINER"] ?? "videos");
+        var name = $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-narrated.mp4";
+        using var ms = new MemoryStream(mp4);
+        var url = await UploadAndSign(container, name, ms, "video/mp4", svc, account, ct);
+        return Results.Ok(new { url, blob = name, bytes = mp4.Length });
+    }
+    finally
+    {
+        try { Directory.Delete(work, recursive: true); } catch { }
+    }
+});
+
 static string? LocateFfmpeg()
 {
     // 1. Bundled ./bin/ffmpeg next to the app DLL.
@@ -1212,6 +1265,75 @@ Produce the {clipCount}-clip storyboard ({clipSeconds}s per clip, {clipCount * c
     return Results.Ok(new { story, clipSeconds, clipCount, totalSeconds, size });
 });
 
+// Audio prompter: write a spoken voiceover script for a finished Story Chain
+// film. `prompt` (optional) steers tone/content; without it the AI narrates
+// straight from the storyboard. Output is plain English — /api/narrate will
+// translate to the chosen voice's language on synthesis.
+app.MapPost("/api/narration-script", async (NarrationScriptRequest req, IHttpClientFactory hf,
+    IConfiguration cfg, CancellationToken ct) =>
+{
+    var endpoint = Cfg(cfg, "AOAI_ENDPOINT").TrimEnd('/');
+    var key = Cfg(cfg, "AOAI_KEY");
+    var deployment = cfg["CHAT_DEPLOYMENT"] ?? "gpt-4o-mini";
+
+    var totalSeconds = Math.Clamp(req.TotalSeconds ?? 30, 3, 180);
+    var wordBudget = Math.Max(8, (int)Math.Round(totalSeconds * 2.4)); // ~145 wpm spoken
+
+    var beats = (req.Actions is { Length: > 0 })
+        ? string.Join("\n", req.Actions.Select((a, i) => $"  {i + 1}. {a}"))
+        : "(no beat list provided)";
+
+    var steer = string.IsNullOrWhiteSpace(req.Prompt)
+        ? "No extra direction was given — choose a fitting tone yourself (cinematic, natural, in keeping with the story)."
+        : $"Narration direction from the user (follow it closely): {req.Prompt}";
+
+    var sys = $@"You are a professional voiceover scriptwriter. Write the SPOKEN narration for a ~{totalSeconds}-second short film.
+
+RULES:
+- Output ONLY the words the narrator will speak. No stage directions, no scene labels, no quotation marks, no markdown.
+- Aim for about {wordBudget} words so it fits naturally in {totalSeconds} seconds when read aloud at a calm pace.
+- One flowing voiceover that matches the story's arc from start to finish. Do not enumerate clips or say 'clip one'.
+- Write in natural English (it may be translated to the target language afterwards).
+- {steer}
+
+Return ONE JSON object, no markdown: {{ ""script"": ""<the narration words>"" }}";
+
+    var user = $@"Film idea: {req.Idea}
+Title: {req.Title}
+Logline: {req.Logline}
+Beats (in order):
+{beats}
+
+Write the voiceover now. JSON only.";
+
+    var client = hf.CreateClient();
+    client.Timeout = TimeSpan.FromSeconds(60);
+    using var msg = new HttpRequestMessage(HttpMethod.Post,
+        $"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=2024-10-21");
+    msg.Headers.Add("api-key", key);
+    var payload = new
+    {
+        messages = new object[] {
+            new { role = "system", content = sys },
+            new { role = "user",   content = user }
+        },
+        max_completion_tokens = 1200,
+        response_format = new { type = "json_object" }
+    };
+    msg.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+    using var resp = await client.SendAsync(msg, ct);
+    var body = await resp.Content.ReadAsStringAsync(ct);
+    if (!resp.IsSuccessStatusCode)
+        return Results.Problem($"Narration script failed ({(int)resp.StatusCode}): {body}");
+
+    using var doc = JsonDocument.Parse(body);
+    var raw = doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString()?.Trim() ?? "{}";
+    string script = "";
+    try { using var sd = JsonDocument.Parse(raw); if (sd.RootElement.TryGetProperty("script", out var sc)) script = sc.GetString() ?? ""; }
+    catch { script = raw; }
+    return Results.Ok(new { script = script.Trim() });
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // PromptCraft: multi-layer Sora-2 prompt engine.
 //
@@ -1773,6 +1895,8 @@ public record SliceRequest(string VideoUrl, double? StartSec, double? DurationSe
 public record RemixRequest(string VideoId, string Prompt, int? Seconds, string? Size);
 public record ExtractFrameRequest(string VideoUrl, string? Size);
 public record StoryboardRequest(string Prompt, int? TotalSeconds, int? ClipSeconds, string? Size);
+public record NarrationScriptRequest(string? Idea, string? Title, string? Logline, string[]? Actions, int? TotalSeconds, string? Prompt, string? Voice);
+public record MuxAudioRequest(string VideoUrl, string AudioUrl, string? Mode);
 
 // In-memory store for PromptCraft jobs. Single-instance F1 deployment, so a
 // process-local concurrent dictionary is the simplest viable storage. Jobs

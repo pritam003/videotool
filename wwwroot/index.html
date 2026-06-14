@@ -438,17 +438,6 @@ function App() {
   const [theme, setTheme] = useTheme();
   const [voices, setVoices] = useState([]);
   const [voice, setVoice] = useState("en-US-AvaMultilingualNeural");
-  const [prompt, setPrompt] = useState("");
-  const [narration, setNarration] = useState("");
-  const [seconds, setSeconds] = useState(8);
-  const [size, setSize] = useState("1280x720");
-  const [refFile, setRefFile] = useState(null);
-  const [finalPrompt, setFinalPrompt] = useState("");
-  const [plan, setPlan] = useState(null);
-  const [segSummaries, setSegSummaries] = useState([]);
-  const [identityBible, setIdentityBible] = useState(null); // { characterDescriptor, wardrobe, sceneDescriptor, palette, lensLightingNotes, distinctiveTraits }
-  const [useRemix, setUseRemix] = useState(true); // #1: clips 2..N remix-from-clip-1 (native identity preservation)
-  const [enhancing, setEnhancing] = useState(false);
 
   // ── Story Chain (I2V continuation) ────────────────────────────────────────
   // The headline continuation feature: one user idea + one character image →
@@ -466,15 +455,14 @@ function App() {
   const scClipSec = scStory?.clipSeconds || 5;
   const scClipCount = scStory?.clips?.length || Math.ceil(scTotalSec / 5);
 
-  // PromptCraft (multi-layer reasoner): runs gpt-5.4 through 6 layers + 5 critic iterations
-  // to produce a Sora-2 prompt that honours every word of the user ask + locks realism + handles
-  // face-risk. Heavier than enhance() but much higher fidelity to the original brief.
-  const [crafting, setCrafting] = useState(false);
-  const [craftResult, setCraftResult] = useState(null); // {segments, iterations, finalScores, plan, combinedPrompt, ...}
-  const [craftPanelOpen, setCraftPanelOpen] = useState(false);
-  // Live progress driven by server. craftProgress = { phase, pct, jobId }.
-  const [craftProgress, setCraftProgress] = useState(null);
-  const craftJobIdRef = useRef(null);
+  // Narration (audio) laid over the finished film.
+  // mode: 'off' = silent · 'auto' = AI writes it · 'prompt' = AI writes it from your direction.
+  const [scNarrationMode, setScNarrationMode] = useState("off");
+  const [scNarrationPrompt, setScNarrationPrompt] = useState("");
+  const [scNarrationText, setScNarrationText] = useState(""); // editable script — the user's words win
+  const [scNarrating, setScNarrating] = useState(false);      // script generation in flight
+  const [scNarrAudio, setScNarrAudio] = useState(null);       // last voice preview { url }
+
   const [running, setRunning] = useState(false);
 
   // Identity: who is signed in (when AUTH_REQUIRED=1 on the server).
@@ -646,216 +634,6 @@ function App() {
     return groups;
   }, [voices]);
 
-  async function enhance() {
-    if (!prompt.trim()) { toast("Enter a prompt first.", true); return; }
-    setEnhancing(true);
-    try {
-      const r = await fetch("/api/enhance", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt, narration, voice, seconds, size }),
-      });
-      const j = await jsonOrThrow(r);
-      setFinalPrompt(j.enhanced || "");
-      setPlan(j.plan || null);
-      setSegSummaries([]);
-      const segCount = j.plan?.segments?.length || 0;
-      toast(segCount > 1
-        ? `Plan ready — ${segCount} segments. Edit if needed, then run.`
-        : "Final prompt generated. You can edit it before running.");
-    } catch (e) { toast("Enhance failed: " + e.message, true); }
-    finally { setEnhancing(false); }
-  }
-
-  // PromptCraft: multi-layer reasoner pass. POSTs to /api/promptcraft to start a
-  // background job, then polls GET /api/promptcraft/{jobId} every 1s for real
-  // phase + percent updates. The reasoner walks PLAN → COMPILE → CRITIC×5 with
-  // hard locks for word-faithfulness + realism + face-risk. Takes 30-120s.
-  async function promptCraft() {
-    if (!canCraft) { toast("Fill prompt, voice, duration and aspect first.", true); return; }
-    setCrafting(true);
-    setCraftResult(null);
-    setCraftProgress({ phase: "starting…", pct: 1 });
-    try {
-      const r = await fetch("/api/promptcraft", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          userAsk: prompt,
-          totalSeconds: seconds,
-          size,
-          narration,
-          voice,
-          maxIterations: 3
-        })
-      });
-      const start = await jsonOrThrow(r);
-      const jobId = start.jobId;
-      craftJobIdRef.current = jobId;
-
-      // Poll loop. ~1s cadence on the happy path; on transient failure
-      // (mobile tab-suspend killing in-flight fetches, DNS hiccup, upstream
-      // 5xx, request timeout) we keep retrying with exponential backoff for
-      // up to ~9 minutes — the PromptCraft job lives in server memory for 10
-      // minutes regardless of client state, so we want to use most of that
-      // budget. When the device is offline, we wait for the `online` event
-      // (capped by the backoff timer) instead of busy-failing.
-      let j = null;
-      let transientFails = 0;
-      const POLL_DEADLINE = Date.now() + 9 * 60 * 1000; // 9 min — under 10-min server eviction
-      while (true) {
-        if (Date.now() > POLL_DEADLINE) throw new Error("PromptCraft poll exceeded 9 minutes — giving up");
-        if (craftJobIdRef.current !== jobId) throw new Error("Cancelled");
-        let st;
-        try {
-          // 30s per-request timeout: long-running reasoner steps can take a
-          // while server-side, but a stuck connection should not block forever.
-          const sr = await fetch(`/api/promptcraft/${jobId}`, { signal: AbortSignal.timeout(30_000) });
-          if (sr.status === 429 || (sr.status >= 500 && sr.status <= 599)) {
-            transientFails++;
-            const wait = Math.min(30_000, 1000 * Math.pow(2, Math.min(transientFails - 1, 5)));
-            dbg("warn", `promptcraft poll: transient ${sr.status} (#${transientFails}) — backing off ${wait}ms`);
-            await sleep(wait);
-            continue;
-          }
-          st = await jsonOrThrow(sr);
-          transientFails = 0;
-        } catch (fetchErr) {
-          // Network-layer failure (mobile tab suspended an in-flight fetch,
-          // DNS hiccup, radio asleep, AbortSignal.timeout). The server job
-          // keeps running; we just retry with backoff and, when the browser
-          // reports we're offline, wait for the `online` event.
-          const isAbort = fetchErr.name === "AbortError" || fetchErr.name === "TimeoutError";
-          const isNet = fetchErr instanceof TypeError; // "Failed to fetch"
-          if (!isAbort && !isNet) throw fetchErr;
-          transientFails++;
-          const wait = Math.min(30_000, 1000 * Math.pow(2, Math.min(transientFails - 1, 5)));
-          const offline = (typeof navigator !== "undefined") && (navigator.onLine === false);
-          dbg("warn", `promptcraft poll: ${fetchErr.name || "fetch"} (#${transientFails})${offline ? " — offline, waiting" : ""} — backoff ${wait}ms`);
-          if (offline) {
-            // Resume as soon as connectivity returns, but no later than `wait`.
-            await new Promise((resolve) => {
-              let done = false;
-              const finish = () => { if (done) return; done = true; window.removeEventListener("online", finish); resolve(); };
-              window.addEventListener("online", finish, { once: true });
-              setTimeout(finish, wait);
-            });
-          } else {
-            await sleep(wait);
-          }
-          continue;
-        }
-        setCraftProgress({ phase: st.phase, pct: st.pct, liveIterations: st.liveIterations });
-        if (st.error) throw new Error(st.error);
-        if (st.done && st.result) { j = st.result; break; }
-        // Happy-path cadence — only sleep here, not before the fetch, so
-        // backoff branches above don't double-sleep.
-        await sleep(1000);
-      }
-
-      setCraftResult(j);
-      setCraftPanelOpen(true);
-      setFinalPrompt(j.combinedPrompt || "");
-      if (Array.isArray(j.segments) && j.segments.length) {
-        // CRITICAL: map every field that buildSegmentPrompt() reads at render time.
-        // Previously we only carried characterDescriptor + distinctiveTraits; the
-        // remaining identity scaffolding (sceneAnchor, cinematography, voice,
-        // backgroundSound, style) was empty for clips 2-N which is exactly why
-        // the reporter/character drifted between segments 3 and 4.
-        const ib = j.plan?.identityBible || {};
-        const sb = j.plan?.storyboard?.segments || [];
-        const totalDur = j.totalSeconds || (j.segments[j.segments.length-1]?.seconds * j.segments.length) || 0;
-        setPlan({
-          // Top-level identity scaffold — echoed verbatim in every clip's prompt.
-          style: "Photorealistic ultra-realistic 4K, cinematic, fully realistic physics.",
-          characterAnchor: ib.characterAnchor || "",
-          distinctiveTraits: ib.distinctiveTraits || "",
-          sceneAnchor: j.plan?.sceneAnchor || "",
-          cinematography: j.plan?.cinematography || "",
-          voiceDescription: j.plan?.voiceDescription || "",
-          backgroundSound: j.plan?.backgroundSound || "",
-          negative: "no on-screen text, no captions, no logos, no watermarks, no fantasy elements, no impossible physics, no extra speakers, no duplicated limbs",
-          // Segments — wire startSec/endSec from storyboard so render-time clamping
-          // picks the correct Sora seconds (4/8/12). Use the fully-baked PromptCraft
-          // prompt as the segment summary so buildSegmentPrompt surfaces it under
-          // the IDENTITY LOCK header.
-          segments: j.segments.map((s, i) => {
-            const sbi = sb[i] || {};
-            // Sora-2 only supports 4/8/12. Snap to the nearest supported value.
-            const rawSec = Number(s.seconds) || 12;
-            const segSec = rawSec >= 12 ? 12 : rawSec >= 8 ? 8 : 4;
-            return {
-              index: s.index ?? (i + 1),
-              seconds: segSec,
-              startSec: sbi.startSec ?? (i * segSec),
-              endSec: sbi.endSec ?? ((i + 1) * segSec),
-              summary: s.prompt,
-              beats: Array.isArray(sbi.beats) ? sbi.beats : [],
-              dialogue: s.dialogue
-            };
-          })
-        });
-      }
-      const sc = j.finalScores || {};
-      toast(`Prompt crafted in ${j.iterationsRun} iter — F:${sc.faithfulness||"?"} R:${sc.realism||"?"} S:${sc.soraCompat||"?"} C:${sc.frameCoherence||"?"}`);
-    } catch (e) { toast("PromptCraft failed: " + e.message, true); }
-    finally {
-      setCrafting(false);
-      setCraftProgress(null);
-      craftJobIdRef.current = null;
-    }
-  }
-
-  // Cancel an in-flight PromptCraft job. Tells server to abort the next
-  // reasoner call, and breaks the local poll loop immediately.
-  async function cancelCraft() {
-    const id = craftJobIdRef.current;
-    if (!id) return;
-    craftJobIdRef.current = null; // stop polling
-    try { await fetch(`/api/promptcraft/${id}/cancel`, { method: "POST" }); } catch {}
-    toast("PromptCraft cancelled.");
-  }
-
-  // Auto re-enhance when duration / aspect / voice change AFTER the user has
-  // already generated a prompt at least once. Debounced; skips if user is editing.
-  const enhanceSig = `${seconds}|${size}|${voice}`;
-  const lastEnhanceSig = useRef("");
-  const everEnhanced = useRef(false);
-  useEffect(() => {
-    if (!finalPrompt.trim()) return;          // never enhanced or cleared
-    if (!everEnhanced.current) return;        // only after user clicked once
-    if (lastEnhanceSig.current === enhanceSig) return;
-    const handle = setTimeout(() => {
-      lastEnhanceSig.current = enhanceSig;
-      enhance();
-    }, 700);
-    return () => clearTimeout(handle);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [enhanceSig]);
-  // wrap the click handler so we mark first-enhance done
-  async function enhanceClick() {
-    everEnhanced.current = true;
-    lastEnhanceSig.current = enhanceSig;
-    await enhance();
-  }
-
-  async function submitChunk(thePrompt, chunkSeconds, refOverride) {
-    const fd = new FormData();
-    fd.append("prompt", thePrompt);
-    fd.append("seconds", String(chunkSeconds));
-    fd.append("size", size);
-    const ref = refOverride || refFile;
-    if (ref) fd.append("inputReference", ref);
-    for (let attempt = 0; attempt < 8; attempt++) {
-      const r = await fetch("/api/jobs", { method: "POST", body: fd });
-      const txt = await r.text();
-      if (r.ok) return JSON.parse(txt);
-      if (txt.includes("Too many running tasks") || r.status === 429) {
-        await sleep(5000 + attempt * 2000); continue;
-      }
-      throw new Error(txt.slice(0, 400));
-    }
-    throw new Error("Sora rate limit: too many running tasks. Try again in a minute.");
-  }
-
   // Sora-2 typically takes 90–180s per 12s clip. Start with longer poll intervals
   // to avoid wasting round trips, then tighten as render approaches completion.
   // Bails out promptly if cancelRef is set (and tells Sora to cancel server-side).
@@ -914,148 +692,6 @@ function App() {
     toast("Cancelling generation…");
   }
 
-  // Build the prompt for a single segment using the structured plan + memory of
-  // earlier rendered segments + outline of later ones. Each Sora-2 render thus
-  // receives full narrative + audio + visual context of preceding/following clips.
-  // When `bible` is supplied (after clip 1 has rendered), its empirical character
-  // and scene descriptors REPLACE the LLM-imagined anchors so segments 2+ lock to
-  // what Sora actually drew, not what gpt-4o-mini hoped it would draw.
-  function buildSegmentPrompt(planObj, k, priorSummaries, bible) {
-    const segs = planObj.segments || [];
-    const seg = segs[k] || {};
-    const N = segs.length;
-    const useBible = !!bible && k >= 1;
-    // Distinctive traits string: prefer the empirical bible trait list (post clip-1)
-    // and fall back to the LLM-planned traits. These get echoed in EVERY segment
-    // verbatim as the consistency lifeline (#8).
-    const traits = (useBible && bible.distinctiveTraits) ? bible.distinctiveTraits
-                  : (planObj.distinctiveTraits || "");
-    const characterLine = useBible
-      ? `Character (LOCKED identity bible from clip 1 — match these features exactly): ${bible.characterDescriptor || planObj.characterAnchor || ""}\n  Wardrobe (identical to clip 1, every item): ${bible.wardrobe || ""}`
-      : `Character (use this exact description anywhere the speaker is referenced): ${planObj.characterAnchor || ""}`;
-    const traitsLine = traits ? `Distinctive identity markers (MUST appear in every frame, identical position and colour): ${traits}` : "";
-    const sceneLine = useBible
-      ? `Scene (locked from clip 1): ${bible.sceneDescriptor || planObj.sceneAnchor || ""}\n  Anchor palette: ${(bible.palette || []).join(", ")}\n  Lens & lighting (identical to clip 1): ${bible.lensLightingNotes || ""}`
-      : `Scene: ${planObj.sceneAnchor || ""}`;
-    const previously = priorSummaries.length === 0 ? "" :
-      "\nPreviously (already rendered, this segment continues directly from the last):\n" +
-      priorSummaries.map((s, i) => `  - Segment ${i+1} (${segs[i]?.startSec}\u2013${segs[i]?.endSec}s): ${s}`).join("\n");
-    const coming = k >= N - 1 ? "" :
-      "\nComing next (do NOT render, but pace toward it):\n" +
-      segs.slice(k+1).map((s, i) => `  - Segment ${k+2+i} (${s.startSec}\u2013${s.endSec}s): ${s.summary || ""}`).join("\n");
-    const dialogueBlock = seg.dialogue && seg.dialogue !== "null"
-      ? `\nDialogue (this segment, spoken on-screen, embed verbatim):\n${seg.dialogue}`
-      : "";
-    const continuity = k === 0 ? ""
-      : `\nContinuity directives:\n  - DIRECT CONTINUATION. The first frame matches the last frame of segment ${k} exactly.\n  - SAME character${useBible ? " — match the locked identity bible above pixel-for-pixel (face, hair, skin, every wardrobe item)" : " (use the Character anchor below verbatim)"}, SAME wardrobe, SAME environment, SAME lens & focal length, SAME lighting setup and color grade.\n  - SAME voice timbre, pitch, accent and speaking pace as the previous segment.\n  - The diegetic background sound bed continues uninterrupted: ${planObj.backgroundSound || ""}.\n  - No cut, no fade, no recap. Motion and audio pick up immediately.`;
-    return [
-      `=== IDENTITY LOCK (bit-identical across all clips — do not paraphrase) ===`,
-      `Style: ${planObj.style || ""}`,
-      ``,
-      sceneLine,
-      ``,
-      characterLine,
-      traitsLine,
-      ``,
-      `Cinematography:`,
-      planObj.cinematography || "",
-      ``,
-      `Voice: ${planObj.voiceDescription || ""}`,
-      `=== END IDENTITY LOCK ===`,
-      previously,
-      ``,
-      `This segment is segment ${k+1} of ${N} (time ${seg.startSec}\u2013${seg.endSec}s of the full ${segs[N-1]?.endSec || ""}s arc).`,
-      `Summary of this segment: ${seg.summary || ""}`,
-      `Beat-by-beat actions in this segment (perform exactly these, in order):`,
-      ...(seg.beats || []).map(b => `  - ${b}`),
-      dialogueBlock,
-      coming,
-      continuity,
-      ``,
-      `Background sound (continues across segments, render identically): ${planObj.backgroundSound || ""}`,
-      `Negative: ${planObj.negative || "no on-screen text, no captions, no logos, no watermarks, no extra speakers, no duplicated limbs"}`,
-    ].filter(Boolean).join("\n");
-  }
-
-  // Extract last frame of a video URL as a JPEG File for use as Sora input_reference.
-  // Fail-fast: single seek attempt with tight budget. The structured plan already
-  // provides strong textual continuity, so a missing image anchor is not fatal.
-  async function extractLastFrame(url, w, h) {
-    const v = document.createElement("video");
-    v.crossOrigin = "anonymous";
-    v.muted = true;
-    v.playsInline = true;
-    v.preload = "auto";
-    v.src = url;
-    await new Promise((res, rej) => {
-      const t = setTimeout(() => rej(new Error("video load timeout")), 8000);
-      v.onloadedmetadata = () => { clearTimeout(t); res(); };
-      v.onerror = () => { clearTimeout(t); rej(new Error("video load failed (CORS?)")); };
-    });
-    const dur = v.duration || 0;
-    await new Promise((res, rej) => {
-      const t = setTimeout(() => rej(new Error("video seek timeout")), 6000);
-      v.onseeked = () => { clearTimeout(t); res(); };
-      v.onerror = () => { clearTimeout(t); rej(new Error("video seek failed")); };
-      try { v.currentTime = Math.max(0, dur * 0.95); } catch (e) { clearTimeout(t); rej(e); }
-    });
-    const canvas = document.createElement("canvas");
-    canvas.width = w || v.videoWidth;
-    canvas.height = h || v.videoHeight;
-    canvas.getContext("2d").drawImage(v, 0, 0, canvas.width, canvas.height);
-    const blob = await new Promise(res => canvas.toBlob(res, "image/jpeg", 0.92));
-    if (!blob) throw new Error("canvas.toBlob returned null");
-    return new File([blob], "lastframe.jpg", { type: "image/jpeg" });
-  }
-
-  // Remix attempt: ask Sora-2 to generate clip k as a delta-edit of an earlier video.
-  // Returns the finalized clip object (same shape as runOneClip) or throws.
-  // The remix endpoint preserves character/lighting/lens natively — strongest
-  // single lever for cross-clip identity (#1).
-  async function runOneClipViaRemix(sourceVideoId, thePrompt, chunkSec, label, basePct, spanPct) {
-    setStatus(s => ({ ...s, label: `${label}: remix from clip 1, submitting`, pct: basePct }));
-    const r = await fetch("/api/remix", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ videoId: sourceVideoId, prompt: thePrompt, seconds: chunkSec, size })
-    });
-    if (!r.ok) {
-      const t = await r.text();
-      throw new Error(`remix submit ${r.status}: ${t.slice(0, 300)}`);
-    }
-    const job = JSON.parse(await r.text());
-    pushSubscribeForJob(job.id, `${label} (remix)`);
-    const etaMs = chunkSec * 15_000;
-    await poll(job.id, (st, elapsed) => {
-      const frac = Math.min(0.98, elapsed / etaMs);
-      const ss = Math.round(elapsed / 1000);
-      setStatus(s => ({ ...s, label: `${label}: remix ${st} (${ss}s)`, pct: basePct + spanPct * frac }));
-    });
-    setStatus(s => ({ ...s, label: `${label}: remix finalizing`, pct: basePct + spanPct }));
-    const fr = await fetch(`/api/jobs/${job.id}/finalize`, { method: "POST" });
-    return await jsonOrThrow(fr);
-  }
-
-  // One Sora attempt: submit + poll + finalize. Returns finalized clip object.
-  async function runOneClip(thePrompt, chunkSec, ref, label, basePct, spanPct) {
-    setStatus(s => ({ ...s, label: `${label}: ${ref ? "with anchor, " : ""}submitting`, pct: basePct }));
-    const job = await submitChunk(thePrompt, chunkSec, ref);
-    // Arm a server-side watcher that will fire a lock-screen / status-bar push
-    // notification when this Sora job completes — critical when the phone is
-    // locked and the JS poll loop is suspended by the browser.
-    pushSubscribeForJob(job.id, label);
-    // ETA: Sora-2 takes ~10s/sec of output. 12s clip ≈ 120s. Use 15s/sec as conservative ceiling.
-    const etaMs = chunkSec * 15_000;
-    await poll(job.id, (st, elapsed) => {
-      const frac = Math.min(0.98, elapsed / etaMs);
-      const ss = Math.round(elapsed / 1000);
-      setStatus(s => ({ ...s, label: `${label}: ${st} (${ss}s)`, pct: basePct + spanPct * frac }));
-    });
-    setStatus(s => ({ ...s, label: `${label}: finalizing`, pct: basePct + spanPct }));
-    const fr = await fetch(`/api/jobs/${job.id}/finalize`, { method: "POST" });
-    return await jsonOrThrow(fr);
-  }
-
   // Manual re-stitch with a chosen crossfade. Used by the "Re-stitch with crossfade" button.
   async function restitch(cfSec) {
     if (outs.length < 2) { toast("Need at least 2 clips to stitch.", true); return; }
@@ -1073,157 +709,6 @@ function App() {
       setRefreshLib(x => x + 1);
     } catch (e) { toast("Stitch failed: " + e.message, true); }
     finally { setStitching(false); }
-  }
-
-  async function run() {
-    const finalText = finalPrompt.trim() || prompt.trim();
-    if (!finalText) { toast("Enter a prompt first.", true); return; }
-    cancelRef.current = false;
-    currentJobIdRef.current = null;
-    setRunning(true); setOuts([]); setStitched(null); setSegSummaries([]); setIdentityBible(null); setStatus({ phase: "running", pct: 2, label: "submitting" });
-    try {
-      const usePlan = plan && Array.isArray(plan.segments) && plan.segments.length > 0;
-      const chunkSize = Math.min(seconds, 12);
-      const chunks = usePlan ? plan.segments.length : Math.ceil(seconds / chunkSize);
-      const [W, H] = size.split("x").map(Number);
-      const finals = [];
-      const priorSummaries = [];
-      let prevFrame = null;
-      let bible = null;
-      let firstClipVideoId = null;
-      // Show ETA up front so the wait is expected, not surprising.
-      const etaSec = chunks * (chunkSize <= 4 ? 60 : chunkSize <= 8 ? 100 : 150);
-      const etaMin = Math.ceil(etaSec / 60);
-      toast(`Rendering ${chunks} clip${chunks > 1 ? "s" : ""} · est. ~${etaMin} min on Wan2.2 (sequential, 1 task/GPU)`);
-      for (let i = 0; i < chunks; i++) {
-        if (cancelRef.current) throw new Error("Cancelled by user");
-        // Per-segment chunk size: in plan mode, prefer the segment's explicit
-        // `seconds` field (set by PromptCraft from chunkSeconds). Fall back to
-        // the endSec-startSec span only if seconds is missing. Final fallback is
-        // the user-selected chunkSize so we NEVER silently collapse to 4s.
-        let segSec = chunkSize;
-        if (usePlan) {
-          const segObj = plan.segments[i] || {};
-          const explicit = Number(segObj.seconds);
-          if (explicit === 4 || explicit === 8 || explicit === 12) {
-            segSec = explicit;
-          } else {
-            const span = (segObj.endSec ?? 0) - (segObj.startSec ?? 0);
-            segSec = span >= 12 ? 12 : span >= 8 ? 8 : span >= 4 ? 4 : chunkSize;
-          }
-        }
-        const thePrompt = usePlan
-          ? buildSegmentPrompt(plan, i, priorSummaries, bible)
-          : finalText + (i === 0 ? "" : `\n\n[Segment ${i+1}/${chunks} — DIRECT CONTINUATION of the previous segment. Same character, environment, lighting, lens, color grade. SAME voice timbre, accent, pitch, pace. Same diegetic background sound bed continues uninterrupted. First frame matches previous segment's last frame; motion and audio pick up immediately with no cut, no fade, no recap.]`);
-        const label = `clip ${i+1}/${chunks}`;
-        const basePct = 2 + (i / chunks) * 95;
-        const spanPct = (1 / chunks) * 90;
-        let fj;
-        // Strategy ladder for clips 2..N (#1 → #3 fallback chain):
-        //   1. Try Sora-2 remix from clip 1 (native identity preservation).
-        //   2. On remix failure, fall back to fresh job with 4s tail anchor.
-        //   3. On anchor rejection, retry without anchor.
-        const tryRemix = i >= 1 && usePlan && firstClipVideoId && useRemix;
-        if (tryRemix) {
-          try {
-            fj = await runOneClipViaRemix(firstClipVideoId, thePrompt, segSec, label, basePct, spanPct);
-            dbg("ok", `${label} rendered via remix from clip 1 (${firstClipVideoId})`);
-          } catch (e) {
-            dbg("warn", `${label} remix failed (${e.message}); falling back to fresh + tail anchor`);
-            fj = null;
-          }
-        }
-        if (!fj) {
-          try {
-            fj = await runOneClip(thePrompt, segSec, prevFrame, label, basePct, spanPct);
-          } catch (e) {
-            // One retry without input_reference if Sora rejects the anchor ("Job failed" right after submit).
-            if (prevFrame && /Job (failed|cancelled)/i.test(e.message)) {
-              dbg("warn", `${label} failed with anchor — retrying without input_reference`);
-              fj = await runOneClip(thePrompt, segSec, null, `${label} (retry)`, basePct, spanPct);
-            } else {
-              throw e;
-            }
-          }
-        }
-        finals.push({ ...fj, seconds: segSec, size });
-        setOuts([...finals]);
-        // Capture clip 1's videoId so subsequent clips can remix from it.
-        if (i === 0 && fj.videoId) firstClipVideoId = fj.videoId;
-        if (usePlan) {
-          const sum = plan.segments[i].summary || "";
-          priorSummaries.push(sum);
-          setSegSummaries(arr => [...arr, sum]);
-        }
-        // After clip 1 finalizes: lock identity by extracting empirical descriptors
-        // from what Sora actually drew. This replaces the imagined characterAnchor
-        // for clips 2+, which is the single biggest lever for character consistency.
-        if (i === 0 && usePlan) {
-          try {
-            setStatus(s => ({ ...s, label: `${label}: locking identity from clip 1` }));
-            const ir = await fetch("/api/identity", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ videoUrl: fj.url, originalAnchor: plan.characterAnchor || "" })
-            });
-            const ij = await jsonOrThrow(ir);
-            if (ij && ij.bible) {
-              bible = ij.bible;
-              setIdentityBible(bible);
-              dbg("ok", `identity bible locked: ${(bible.characterDescriptor || "").slice(0, 90)}\u2026`);
-            }
-          } catch (e) {
-            dbg("warn", "identity bible extraction failed; falling back to text anchor", e.message);
-          }
-        }
-        if (i < chunks - 1) {
-          // Use a JPEG last-frame as the visual anchor. The 4s MP4 tail (sent via
-          // /api/tail + Sora input_reference) is rejected by orgs that lack the
-          // "Video inpaint" capability with: "Video inpaint is not available for
-          // your organization." JPEG input_reference is universally accepted.
-          prevFrame = null;
-          try {
-            setStatus(s => ({ ...s, label: `${label}: capturing last-frame anchor` }));
-            prevFrame = await extractLastFrame(fj.url, W, H);
-            dbg("ok", `last-frame anchor captured (${prevFrame.size} bytes) for clip ${i+2}`);
-          } catch (e) {
-            dbg("warn", `last-frame extraction failed (${e.message}); continuing with plan-based continuity only`);
-            prevFrame = null;
-          }
-        }
-      }
-      setStatus({ phase: "done", pct: 100, label: "ready" });
-      setRefreshLib(x => x + 1);
-      toast("Video ready");
-      // Auto-stitch if we have multiple clips. Lossless concat by default; user can re-stitch with crossfade later.
-      if (finals.length >= 2) {
-        try {
-          setStitching(true);
-          setStatus({ phase: "running", pct: 95, label: `stitching ${finals.length} clips into one…` });
-          const r = await fetch("/api/stitch", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ urls: finals.map(f => f.url), crossfade })
-          });
-          const j = await jsonOrThrow(r);
-          setStitched({ url: j.url, clips: j.clips, crossfade: j.crossfade, bytes: j.bytes });
-          setStatus({ phase: "done", pct: 100, label: "ready (stitched)" });
-          dbg("ok", `stitched ${j.clips} clips → ${(j.bytes/1024/1024).toFixed(1)}MB combined`);
-          toast("Combined video ready");
-        } catch (e) {
-          dbg("warn", "stitch failed; individual clips still available", e.message);
-          toast("Stitch failed — clips are still available individually", true);
-        } finally { setStitching(false); }
-      }
-    } catch (e) {
-      const cancelled = cancelRef.current || /Cancelled by user/i.test(e.message || "");
-      setStatus({ phase: cancelled ? "idle" : "failed", pct: 0, label: cancelled ? "cancelled" : "error" });
-      toast(cancelled ? "Generation cancelled" : e.message.slice(0, 200), !cancelled);
-    } finally {
-      cancelRef.current = false;
-      currentJobIdRef.current = null;
-      setRunning(false);
-    }
   }
 
   // ── Story Chain (I2V continuation) orchestrator ───────────────────────────
@@ -1288,6 +773,55 @@ function App() {
       throw new Error(txt.slice(0, 400));
     }
     throw new Error("GPU did not become ready after several minutes — try again.");
+  }
+
+  // Audio prompter: ask the LLM to write a voiceover script from the storyboard
+  // (+ optional user direction in 'prompt' mode). Returns plain narration text.
+  async function fetchNarrationScript() {
+    const r = await fetch("/api/narration-script", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        idea: scPrompt,
+        title: scStory?.title || "",
+        logline: scStory?.logline || "",
+        actions: (scStory?.clips || []).map(c => c.action || c.title || ""),
+        totalSeconds: scTotalSec,
+        prompt: scNarrationMode === "prompt" ? scNarrationPrompt : "",
+        voice
+      })
+    });
+    const j = await jsonOrThrow(r);
+    return (j.script || "").trim();
+  }
+
+  // "Generate narration" button: write the script into the editable box.
+  async function genNarration() {
+    if (!scStory) { toast("Build a storyboard first.", true); return; }
+    setScNarrating(true);
+    try {
+      const script = await fetchNarrationScript();
+      setScNarrationText(script);
+      setScNarrAudio(null);
+      dbg("ok", `narration script ready (${script.split(/\s+/).filter(Boolean).length} words)`);
+      toast("Narration written — edit it freely, then render.");
+    } catch (e) {
+      toast("Narration failed: " + e.message.slice(0, 160), true);
+    } finally { setScNarrating(false); }
+  }
+
+  // "Preview voice": synthesize the current script and play it (no video).
+  async function previewNarration() {
+    const text = scNarrationText.trim();
+    if (!text) { toast("Generate or write a narration first.", true); return; }
+    try {
+      const r = await fetch("/api/narrate", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, voice })
+      });
+      const j = await jsonOrThrow(r);
+      setScNarrAudio({ url: j.url });
+      try { new Audio(j.url).play(); } catch {}
+    } catch (e) { toast("Voice preview failed: " + e.message.slice(0, 160), true); }
   }
 
   // Steps 2-4: render the chain. clip 1 from the character image; each later clip
@@ -1376,6 +910,7 @@ function App() {
 
       // Stitch the clips into the final film.
       setRefreshLib(x => x + 1);
+      let filmUrl = finals.length ? finals[finals.length - 1].url : null;
       if (finals.length >= 2) {
         setStitching(true);
         setStatus({ phase: "running", pct: 95, label: `stitching ${finals.length} clips into the film…` });
@@ -1386,12 +921,46 @@ function App() {
           });
           const j = await jsonOrThrow(r);
           setStitched({ url: j.url, clips: j.clips, crossfade: j.crossfade, bytes: j.bytes });
+          filmUrl = j.url;
           dbg("ok", `stitched ${j.clips} clips → ${(j.bytes / 1024 / 1024).toFixed(1)}MB film`);
         } catch (e) {
           dbg("warn", "stitch failed; clips still available individually", e.message);
           toast("Stitch failed — clips are available individually", true);
         } finally { setStitching(false); }
       }
+
+      // Narration: lay the AI / your voiceover over the finished film.
+      if (scNarrationMode !== "off" && filmUrl && !cancelRef.current) {
+        try {
+          let text = scNarrationText.trim();
+          if (!text) {
+            setStatus({ phase: "running", pct: 96, label: "writing narration…" });
+            text = await fetchNarrationScript();
+            setScNarrationText(text);
+          }
+          if (text) {
+            setStatus({ phase: "running", pct: 97, label: "synthesizing narrator voice…" });
+            const tr = await fetch("/api/narrate", {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ text, voice })
+            });
+            const tj = await jsonOrThrow(tr);
+            setStatus({ phase: "running", pct: 98, label: "mixing narration into the film…" });
+            const mr = await fetch("/api/mux-audio", {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ videoUrl: filmUrl, audioUrl: tj.url, mode: "replace" })
+            });
+            const mj = await jsonOrThrow(mr);
+            setStitched({ url: mj.url, clips: finals.length, crossfade, bytes: mj.bytes, narrated: true });
+            setRefreshLib(x => x + 1);
+            dbg("ok", `narration muxed → ${(mj.bytes / 1024 / 1024).toFixed(1)}MB narrated film`);
+          }
+        } catch (e) {
+          dbg("warn", "narration step failed; film kept silent: " + e.message);
+          toast("Narration step failed — film saved without voice", true);
+        }
+      }
+
       setStatus({ phase: "done", pct: 100, label: "film ready" });
       toast("Story chain complete 🎬");
     } catch (e) {
@@ -1405,15 +974,11 @@ function App() {
 
   const recentLines = dbgLines.slice(-200);
 
-  // Gate the prompt-generation buttons: every selection (prompt + voice + duration + aspect)
-  // must be present. Defaults exist but explicit truthy check protects against ""/0/null.
-  const canCraft = !!(prompt.trim() && voice && seconds && size);
-
   return html`
     <header class="app">
       <span class="dot"></span>
       <span class="title">Sora Studio</span>
-      <span class="badge">wan2.2 · ${size} · ${seconds}s</span>
+      <span class="badge">wan2.2 · ${scSize} · ${scClipCount} clips</span>
       <div class="spacer"></div>
       <button class="ghost" onClick=${() => setTheme(theme === "light" ? "dark" : "light")} title="Toggle theme">
         ${theme === "light" ? "☾" : "☀"}
@@ -1504,6 +1069,59 @@ function App() {
               `}
             </div>
 
+            <!-- STEP 3: narration (audio prompter) -->
+            <div>
+              <label>③ Narration <span class="muted small">(voiceover laid over the finished film)</span></label>
+              <div class="seg" style=${{display:"flex",gap:6,flexWrap:"wrap",margin:"4px 0 8px"}}>
+                ${[["off","🔇 Off"],["auto","🤖 AI auto"],["prompt","🎙️ AI + your direction"]].map(([v,lbl]) => html`
+                  <button key=${v} type="button" onClick=${() => setScNarrationMode(v)}
+                    class="ghost small"
+                    style=${scNarrationMode===v ? {background:"var(--accent)",color:"#fff",borderColor:"var(--accent)"} : {}}>
+                    ${lbl}
+                  </button>
+                `)}
+              </div>
+
+              ${scNarrationMode !== "off" && html`
+                <div class="stack" style=${{gap:8}}>
+                  <div>
+                    <label>Narrator voice <span class="muted small">(non-English voices auto-translate the script)</span></label>
+                    <select value=${voice} onChange=${e => setVoice(e.target.value)}>
+                      ${Object.entries(voiceGroups).map(([g, list]) => list.length > 0 && html`
+                        <optgroup label=${g} key=${g}>
+                          ${list.map(v => html`<option value=${v.shortName} key=${v.shortName}>${v.localName || v.shortName} (${v.gender || "?"})</option>`)}
+                        </optgroup>
+                      `)}
+                    </select>
+                  </div>
+
+                  ${scNarrationMode === "prompt" && html`
+                    <div>
+                      <label>Narration direction <span class="muted small">(tone, POV, what to emphasise)</span></label>
+                      <textarea rows="2" placeholder="Warm, reflective first-person voice. Build quiet wonder toward the greenhouse reveal."
+                        value=${scNarrationPrompt} onInput=${e => setScNarrationPrompt(e.target.value)}></textarea>
+                    </div>
+                  `}
+
+                  <div class="btn-row" style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                    <button onClick=${genNarration} disabled=${!scStory || scNarrating}>
+                      ${scNarrating ? "Writing…" : "✍️ Generate narration"}
+                    </button>
+                    ${scNarrationText.trim() && html`<button class="ghost" onClick=${previewNarration}>🔊 Preview voice</button>`}
+                    <span class="muted small">${scStory ? "edit the script below — your words win" : "build a storyboard first"}</span>
+                  </div>
+
+                  <div>
+                    <label>Narration script <span class="muted small">(editable — overwrite freely)</span></label>
+                    <textarea rows="4" placeholder="Generate a script, or type your own narration here. It will be spoken over the film."
+                      value=${scNarrationText} onInput=${e => setScNarrationText(e.target.value)}></textarea>
+                  </div>
+
+                  ${scNarrAudio && html`<audio src=${scNarrAudio.url} controls style=${{width:"100%"}}></audio>`}
+                </div>
+              `}
+            </div>
+
             <!-- STEP 3/4: render the chain -->
             <div class="btn-row" style=${{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
               <button class="primary" onClick=${runStoryChain}
@@ -1538,167 +1156,6 @@ function App() {
             `}
           </div>
         </div>
-
-        <div class="card">
-          <h3>Compose</h3>
-          <div class="stack">
-            <div>
-              <label>Idea / prompt</label>
-              <textarea rows="3" placeholder="A child running on a beach at sunset, crabs scattering"
-                value=${prompt} onInput=${e => setPrompt(e.target.value)}></textarea>
-            </div>
-            <div>
-              <label>Narration line (optional, in your idea language — will be translated)</label>
-              <textarea rows="2" placeholder="Help Pritam, crabs are everywhere!"
-                value=${narration} onInput=${e => setNarration(e.target.value)}></textarea>
-            </div>
-            <div class="btn-row" style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
-              <button class="primary" onClick=${enhanceClick} disabled=${!canCraft || enhancing || crafting}>
-                ${enhancing ? "Enhancing…" : "✨ Generate cinematic prompt"}
-              </button>
-              <button onClick=${promptCraft} disabled=${!canCraft || enhancing || crafting} title=${canCraft ? "Multi-layer reasoner (gpt-5.4) with 5 critic iterations. Honours every word of your ask, locks realism, mitigates Sora face-drift. Takes 30-120s." : "Fill prompt, voice, duration and aspect first."}>
-                ${crafting ? "Crafting…" : "🧠 PromptCraft (deep reasoner)"}
-              </button>
-              ${crafting && html`<button class="ghost small" onClick=${cancelCraft}>✕ Cancel</button>`}
-              <span class="muted small">Frame-by-frame, scales with duration & voice</span>
-            </div>
-            ${crafting && craftProgress && html`
-              <div style=${{marginTop:8}}>
-                <div style=${{display:"flex",justifyContent:"space-between",fontSize:12,marginBottom:4}}>
-                  <span class="muted">${craftProgress.phase || "working…"}</span>
-                  <span class="muted">${craftProgress.pct || 0}%</span>
-                </div>
-                <div class="progress"><div style=${{width: (craftProgress.pct || 0) + "%"}}></div></div>
-                ${Array.isArray(craftProgress.liveIterations) && craftProgress.liveIterations.length > 0 && html`
-                  <div class="muted small" style=${{marginTop:4}}>
-                    iter ${craftProgress.liveIterations.length} latest scores —
-                    ${(() => { const it = craftProgress.liveIterations[craftProgress.liveIterations.length-1]; return ` F:${it.scores.faithfulness} R:${it.scores.realism} S:${it.scores.soraCompat} C:${it.scores.frameCoherence} (${it.verdict})`; })()}
-                  </div>
-                `}
-              </div>
-            `}
-            ${craftResult && html`
-              <div class="plan">
-                <div class="plan-head">
-                  <strong>PromptCraft trace</strong>
-                  <span class="pill ok">${craftResult.iterationsRun} iter</span>
-                  <span class="pill" title="Faithfulness to your exact words">F:${craftResult.finalScores?.faithfulness||"?"}</span>
-                  <span class="pill" title="Realism (no fantasy/impossible elements)">R:${craftResult.finalScores?.realism||"?"}</span>
-                  <span class="pill" title="Sora-2 compatibility (face-risk mitigation)">S:${craftResult.finalScores?.soraCompat||"?"}</span>
-                  <span class="pill" title="Frame coherence between segments">C:${craftResult.finalScores?.frameCoherence||"?"}</span>
-                  <button class="ghost small" onClick=${() => setCraftPanelOpen(o => !o)}>${craftPanelOpen ? "Hide trace" : "Show trace"}</button>
-                </div>
-                ${craftPanelOpen && html`
-                  <div style=${{padding:"8px 12px",fontSize:12}}>
-                    <div class="muted small" style=${{marginBottom:6}}>Reasoning model: <code>${craftResult.reasoningModel}</code></div>
-                    ${craftResult.iterations?.map(it => html`
-                      <details style=${{marginBottom:4}}>
-                        <summary>iter ${it.n} — F:${it.scores.faithfulness} R:${it.scores.realism} S:${it.scores.soraCompat} C:${it.scores.frameCoherence} — <em>${it.verdict}</em></summary>
-                        <pre style=${{whiteSpace:"pre-wrap",fontSize:11,marginLeft:12}}>${JSON.stringify(it.deviations, null, 2)}</pre>
-                      </details>
-                    `)}
-                    ${craftResult.plan?.framesManifest && html`
-                      <details>
-                        <summary>Frame manifest (${craftResult.plan.framesManifest.length} keyframes)</summary>
-                        <ol style=${{fontSize:11,marginLeft:18}}>${craftResult.plan.framesManifest.map(f => html`<li>t=${f.t}s seg ${f.segment}: ${f.description}</li>`)}</ol>
-                      </details>
-                    `}
-                    ${craftResult.plan?.intentContract?.extractedWords && html`
-                      <details>
-                        <summary>Word coverage (${craftResult.plan.intentContract.extractedWords.length} words tracked)</summary>
-                        <ul style=${{fontSize:11,marginLeft:18}}>${craftResult.plan.intentContract.extractedWords.map(w => html`<li><strong>${w.word}</strong> <em class="muted">[${w.category}]</em> → ${w.visualisation}</li>`)}</ul>
-                      </details>
-                    `}
-                  </div>
-                `}
-              </div>
-            `}
-            ${finalPrompt && html`
-              <div>
-                <label>Final prompt preview <span class="muted">(editable; only used if plan is empty)</span></label>
-                <textarea class="final" value=${finalPrompt} onInput=${e => setFinalPrompt(e.target.value)}></textarea>
-              </div>
-            `}
-            ${plan && Array.isArray(plan.segments) && plan.segments.length > 1 && html`
-              <div class="plan">
-                <div class="plan-head">
-                  <strong>Story plan</strong>
-                  <span class="pill">${plan.segments.length} segments</span>
-                  ${identityBible && html`<span class="pill ok small" title=${identityBible.characterDescriptor || ""}>identity locked from clip 1</span>`}
-                  <span class="muted small">Each clip carries memory of earlier clips + pacing toward later ones</span>
-                </div>
-                ${plan.segments.map((s, i) => {
-                  const done = i < segSummaries.length;
-                  return html`
-                    <div class=${"plan-seg" + (done ? " done" : "")} key=${i}>
-                      <div class="plan-seg-head">
-                        <span class="pill">${i+1}</span>
-                        <span class="muted small">${s.startSec}–${s.endSec}s</span>
-                        <span class="plan-seg-summary">${s.summary || ""}</span>
-                        ${done && html`<span class="pill ok small">rendered</span>`}
-                      </div>
-                      <ul class="plan-beats">
-                        ${(s.beats || []).map((b, j) => html`<li key=${j}>${b}</li>`)}
-                      </ul>
-                      ${s.dialogue && s.dialogue !== "null" && html`<div class="plan-dialogue"><em>Dialogue:</em> ${s.dialogue}</div>`}
-                    </div>
-                  `;
-                })}
-              </div>
-            `}
-          </div>
-        </div>
-
-        <div class="card">
-          <Accordion title="Settings" defaultOpen=${true}>
-            <div class="row">
-              <div>
-                <label>Duration</label>
-                <select value=${seconds} onChange=${e => setSeconds(Number(e.target.value))}>
-                  ${DURATIONS.map(d => html`<option value=${d.v}>${d.label}</option>`)}
-                </select>
-              </div>
-              <div>
-                <label>Aspect</label>
-                <select value=${size} onChange=${e => setSize(e.target.value)}>
-                  ${SIZES.map(s => html`<option value=${s}>${s === "1280x720" ? "Landscape 16:9" : "Vertical 9:16"}</option>`)}
-                </select>
-              </div>
-            </div>
-            <div style=${{marginTop:12}}>
-              <label>Narration voice (governs language for the spoken line)</label>
-              <select value=${voice} onChange=${e => setVoice(e.target.value)}>
-                ${Object.entries(voiceGroups).map(([g, list]) => list.length > 0 && html`
-                  <optgroup label=${g} key=${g}>
-                    ${list.map(v => html`<option value=${v.shortName} key=${v.shortName}>${v.localName || v.shortName} (${v.gender || "?"})</option>`)}
-                  </optgroup>
-                `)}
-              </select>
-            </div>
-            <div style=${{marginTop:12,display:"flex",gap:8,alignItems:"flex-start"}}>
-              <input type="checkbox" id="useRemix" checked=${useRemix} onChange=${e => setUseRemix(e.target.checked)} style=${{marginTop:3}} />
-              <label htmlFor="useRemix" style=${{cursor:"pointer"}}>
-                <strong>Lock character via Sora-2 remix</strong>
-                <div class="muted small">Clips 2..N are generated as remix-edits of clip 1 (native identity preservation). Falls back to fresh + 4s tail anchor if remix fails.</div>
-              </label>
-            </div>
-          </Accordion>
-          <Accordion title="Reference image (optional)">
-            <input type="file" accept="image/*" onChange=${e => setRefFile(e.target.files[0] || null)} />
-            ${refFile && html`<div class="muted small" style=${{marginTop:6}}>${refFile.name} (${(refFile.size/1024).toFixed(0)} KB)</div>`}
-          </Accordion>
-        </div>
-
-        <div class="card">
-          <div class="btn-row" style=${{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
-            <button class="primary" onClick=${run} disabled=${running || (!prompt.trim() && !finalPrompt.trim())}>
-              ${running ? "Generating…" : "▶ Generate video"}
-            </button>
-            ${running && html`<button onClick=${cancelRun} title="Stop generation and tell Sora to cancel the active job">✕ Cancel</button>`}
-            <span class="pill ${status.phase === "failed" ? "err" : status.phase === "done" ? "ok" : ""}">${status.label}</span>
-          </div>
-          ${(running || status.pct > 0) && html`<div class="progress"><div style=${{width: status.pct + "%"}}></div></div>`}
-        </div>
       </div>
 
       <!-- RIGHT: Preview + Library -->
@@ -1730,11 +1187,11 @@ function App() {
           ${outs.length > 0 && html`
             <div class="meta">
               ${outs.map((o, i) => html`<a href=${o.url} target="_blank" rel="noopener" key=${i}>clip ${i+1}/${outs.length} ↗</a>`)}
-              <span>${seconds}s · ${size}</span>
+              <span>${scClipSec}s × ${outs.length} · ${scSize}</span>
             </div>
           `}
         </div>
-        <${Library} refreshKey=${refreshLib} onSelect=${v => { setOuts([{ url: v.url, name: v.name, seconds, size }]); setStitched(null); toast("Loaded " + v.name); }} />
+        <${Library} refreshKey=${refreshLib} onSelect=${v => { setOuts([{ url: v.url, name: v.name, seconds: scClipSec, size: scSize }]); setStitched(null); toast("Loaded " + v.name); }} />
       </div>
     </main>
 
