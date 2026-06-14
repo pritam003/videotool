@@ -35,40 +35,69 @@ jobs:
 
       - name: Bundle ffmpeg static binary (Linux x64)
         run: |
-          set -e
-          mkdir -p ${{ github.workspace }}/publish/bin
+          set -eo pipefail
+          DEST=${{ github.workspace }}/publish/bin
+          mkdir -p "$DEST"
           cd /tmp
-          # The johnvansickle.com mirror occasionally returns an HTML error page instead
-          # of the tarball. Retry with backoff, validate magic bytes, and fall back to
-          # the apt-installed ffmpeg if the download stays broken.
-          download_ffmpeg() {
-            for url in \
-              "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz" \
-              "https://www.johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
-            do
-              for i in 1 2 3; do
-                echo "attempt $i: $url"
-                if curl -fsSL --retry 3 --retry-delay 5 --max-time 90 "$url" -o ffmpeg.tar.xz \
-                   && file ffmpeg.tar.xz | grep -q "XZ compressed data"; then
-                  return 0
-                fi
-                sleep 5
-              done
-            done
-            return 1
+
+          # App Service Linux ships no ffmpeg, so we bundle a self-contained STATIC
+          # build. A dynamically-linked binary fails at runtime with
+          # "error while loading shared libraries: libavdevice.so.60" (exit 127),
+          # so every download path below must yield a static binary and we hard-gate
+          # on that before shipping.
+
+          # Primary: johnvansickle static release (occasionally serves an HTML error
+          # page instead of the tarball, hence the mirror + magic-byte validation).
+          fetch_johnvansickle() {
+            local url="$1"
+            curl -fsSL --retry 3 --retry-delay 5 --max-time 120 "$url" -o jvs.tar.xz || return 1
+            file jvs.tar.xz | grep -q "XZ compressed data" || return 1
+            tar -xf jvs.tar.xz || return 1
+            local dir; dir=$(ls -d ffmpeg-*-amd64-static 2>/dev/null | head -1) || return 1
+            [ -n "$dir" ] && cp "$dir/ffmpeg" "$DEST/ffmpeg"
           }
-          if download_ffmpeg; then
-            tar -xf ffmpeg.tar.xz
-            DIR=$(ls -d ffmpeg-*-amd64-static | head -1)
-            cp "$DIR/ffmpeg" ${{ github.workspace }}/publish/bin/ffmpeg
-          else
-            echo "Static ffmpeg download failed; falling back to apt ffmpeg."
-            sudo apt-get update -qq
-            sudo apt-get install -y ffmpeg
-            cp "$(command -v ffmpeg)" ${{ github.workspace }}/publish/bin/ffmpeg
+
+          # Fallback: BtbN FFmpeg-Builds (GitHub releases — highly available, and the
+          # linux64 builds are statically linked). Replaces the old apt fallback that
+          # shipped a broken dynamically-linked binary.
+          fetch_btbn() {
+            local url="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz"
+            curl -fsSL --retry 3 --retry-delay 5 --max-time 180 "$url" -o btbn.tar.xz || return 1
+            file btbn.tar.xz | grep -q "XZ compressed data" || return 1
+            tar -xf btbn.tar.xz || return 1
+            local dir; dir=$(ls -d ffmpeg-master-latest-linux64-gpl 2>/dev/null | head -1) || return 1
+            [ -n "$dir" ] && cp "$dir/bin/ffmpeg" "$DEST/ffmpeg"
+          }
+
+          ok=""
+          for url in \
+            "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz" \
+            "https://www.johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+          do
+            echo "trying johnvansickle: $url"
+            if fetch_johnvansickle "$url"; then ok=1; echo "got johnvansickle static build"; break; fi
+            sleep 5
+          done
+          if [ -z "$ok" ]; then
+            echo "johnvansickle unavailable; falling back to BtbN static build"
+            if fetch_btbn; then ok=1; echo "got BtbN static build"; fi
           fi
-          chmod +x ${{ github.workspace }}/publish/bin/ffmpeg
-          ${{ github.workspace }}/publish/bin/ffmpeg -version | head -2
+          [ -n "$ok" ] || { echo "ERROR: could not obtain a static ffmpeg from any source"; exit 1; }
+
+          chmod +x "$DEST/ffmpeg"
+
+          # Hard gate: reject a dynamically-linked binary so we never again ship one
+          # that crashes on App Service with a missing-shared-library error.
+          echo "linkage: $(file "$DEST/ffmpeg")"
+          if file "$DEST/ffmpeg" | grep -q "statically linked" \
+             || ldd "$DEST/ffmpeg" 2>&1 | grep -q "not a dynamic executable"; then
+            echo "verified: ffmpeg is statically linked"
+          else
+            echo "ERROR: bundled ffmpeg is dynamically linked and would crash on App Service:"
+            ldd "$DEST/ffmpeg" || true
+            exit 1
+          fi
+          "$DEST/ffmpeg" -version | head -2
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
