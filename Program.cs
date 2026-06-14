@@ -156,10 +156,14 @@ app.MapGet("/api/me", (HttpRequest http) =>
     return Results.Ok(new { authenticated = true, objectId = oid, email = name, idp });
 });
 
-// 1. Submit a video job. Multipart so an optional reference image/video can ride along.
-// Submit a Wan2.2 text-to-video job to the ComfyUI container app. We keep the
-// Sora-shaped multipart contract so the frontend doesn't need to change, but
-// the inputReference field is silently dropped (Wan2.2-TI2V-5B is pure T2V).
+// 1. Submit a video job. Multipart so an optional start image can ride along.
+//    Routing:
+//      • startImage form field (a ComfyUI input filename from /api/extract-last-frame
+//        or /api/comfy-image) → Wan2.2 IMAGE-to-video, conditioned on that frame.
+//      • inputReference file upload → uploaded to ComfyUI, then image-to-video.
+//      • neither → text-to-video (original behaviour).
+//    This is what makes the story-chain continuation real: every clip after the first
+//    is conditioned on the previous clip's last frame, so character + scene carry over.
 app.MapPost("/api/jobs", async (HttpRequest http, WanClient wan, CancellationToken ct) =>
 {
     if (!http.HasFormContentType)
@@ -178,11 +182,39 @@ app.MapPost("/api/jobs", async (HttpRequest http, WanClient wan, CancellationTok
     if (parts.Length == 2 && int.TryParse(parts[0], out var w) && int.TryParse(parts[1], out var h))
     { width = w; height = h; }
 
+    // Determine the start-image source (if any) for image-to-video.
+    var startImage = form["startImage"].ToString();
+    var refUpload = form.Files["inputReference"] ?? form.Files["startImageFile"];
+
     try
     {
-        var id = await wan.SubmitAsync(prompt, seconds, width, height, ct);
+        string id;
+        if (!string.IsNullOrWhiteSpace(startImage))
+        {
+            id = await wan.SubmitI2VAsync(prompt, startImage, seconds, width, height, ct);
+        }
+        else if (refUpload is not null && refUpload.ContentType.StartsWith("image/", StringComparison.OrdinalIgnoreCase))
+        {
+            await using var s = refUpload.OpenReadStream();
+            var name = await wan.UploadImageAsync(s, $"ref-{Guid.NewGuid():N}.png", ct);
+            id = await wan.SubmitI2VAsync(prompt, name, seconds, width, height, ct);
+        }
+        else
+        {
+            id = await wan.SubmitAsync(prompt, seconds, width, height, ct);
+        }
         // Sora-shaped { id, status } so the frontend's existing polling code keeps working.
         return Results.Json(new { id, status = "queued" });
+    }
+    catch (Exception ex) when (!ct.IsCancellationRequested && IsWarmingError(ex))
+    {
+        // GPU container is scaling from zero / activating: connection refused, client
+        // timeout, or the ingress is briefly returning 5xx during activation. Answer
+        // 503 {warming:true} so the frontend's story-chain retry loop backs off and
+        // retries (~45s cold start) instead of failing the whole chain on clip 1.
+        return Results.Json(
+            new { warming = true, error = "GPU is warming up (scale-from-zero). Retry shortly." },
+            statusCode: 503);
     }
     catch (Exception ex)
     {
@@ -253,6 +285,146 @@ app.MapPost("/api/jobs/{id}/finalize", async (
     await using var src = await v.Content.ReadAsStreamAsync(ct);
     var url = await UploadAndSign(container, name, src, "video/mp4", svc, account, ct);
     return Results.Ok(new { url, blob = name, videoId = id });
+});
+
+// ─── Story-chain (I2V continuation) image handoff ────────────────────────────
+//
+// Two endpoints feed start-images into the Wan2.2 image-to-video workflow:
+//   • /api/comfy-image      — the user's character image for clip 1.
+//   • /api/extract-last-frame — the previous clip's final frame for clips 2..N.
+// Both normalise to the exact clip W×H (scale-to-cover + centre-crop, no bars,
+// no distortion), push the PNG into ComfyUI's input dir (returning the filename
+// the I2V LoadImage node references), AND upload a blob copy so the UI can SHOW
+// the user the exact frame that hands off to the next clip.
+
+// Shared: normalise a local image to WxH PNG, upload to ComfyUI + blob, return both refs.
+static async Task<IResult> PublishFrameAsync(string srcPath, int W, int H, string tag,
+    WanClient wan, IConfiguration cfg, TokenCredential cred, string ffmpeg, CancellationToken ct)
+{
+    var outPng = Path.Combine(Path.GetDirectoryName(srcPath)!, $"frame-{Guid.NewGuid():N}.png");
+    // Scale to COVER WxH then centre-crop to exact WxH: keeps the subject centred,
+    // fills the frame (no letterbox bars for the model to animate), no aspect distortion.
+    var vf = $"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H}";
+    var (ec, err) = await RunProcessAsync(ffmpeg, $"-y -i \"{srcPath}\" -vf \"{vf}\" -frames:v 1 \"{outPng}\"", ct);
+    if (ec != 0 || !File.Exists(outPng))
+        return Results.Problem($"ffmpeg frame normalise failed (exit {ec}): {err[..Math.Min(err.Length, 800)]}");
+
+    // Push into ComfyUI input dir (unique name avoids LoadImage cache serving a stale frame).
+    string comfyName;
+    await using (var fs = File.OpenRead(outPng))
+        comfyName = await wan.UploadImageAsync(fs, $"{tag}-{Guid.NewGuid():N}.png", ct);
+
+    // Blob copy for the UI handoff preview.
+    var account = Cfg(cfg, "STORAGE_ACCOUNT");
+    var svc = new BlobServiceClient(new Uri($"https://{account}.blob.core.windows.net"), cred);
+    var container = svc.GetBlobContainerClient(cfg["STORAGE_CONTAINER"] ?? "videos");
+    var blobName = $"frames/{DateTime.UtcNow:yyyyMMdd-HHmmss}-{tag}-{Guid.NewGuid():N}.png";
+    string previewUrl;
+    await using (var fs = File.OpenRead(outPng))
+        previewUrl = await UploadAndSign(container, blobName, fs, "image/png", svc, account, ct);
+
+    return Results.Ok(new { name = comfyName, previewUrl });
+}
+
+static (int W, int H) ParseSize(string? size)
+{
+    int W = 832, H = 480; // default landscape 480p — fast, good for I2V chaining
+    if (!string.IsNullOrWhiteSpace(size))
+    {
+        var m = System.Text.RegularExpressions.Regex.Match(size!, @"^(\d+)x(\d+)$");
+        if (m.Success) { W = int.Parse(m.Groups[1].Value); H = int.Parse(m.Groups[2].Value); }
+    }
+    // Wan dims must be multiples of 16.
+    W = Math.Max(256, (W / 16) * 16);
+    H = Math.Max(256, (H / 16) * 16);
+    return (W, H);
+}
+
+// True when a submit exception looks like a scale-from-zero cold start (container not
+// up yet / ingress activating) rather than a genuine failure. Lets /api/jobs answer
+// 503 {warming:true} so the frontend retries the chain instead of aborting on clip 1.
+static bool IsWarmingError(Exception ex)
+{
+    if (ex is HttpRequestException) return true;   // connection refused / DNS / socket reset
+    if (ex is TaskCanceledException) return true;   // HttpClient timeout while the GPU activates
+    var m = ex.Message ?? string.Empty;
+    return m.Contains("(502)") || m.Contains("(503)") || m.Contains("(504)")
+        || m.Contains("ActivationFailed", StringComparison.OrdinalIgnoreCase)
+        || m.Contains("no capacity", StringComparison.OrdinalIgnoreCase);
+}
+
+// Upload + normalise the user's character image → ComfyUI input + blob preview.
+app.MapPost("/api/comfy-image", async (HttpRequest http, WanClient wan,
+    IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
+{
+    if (!http.HasFormContentType)
+        return Results.BadRequest(new { error = "multipart/form-data required" });
+    var form = await http.ReadFormAsync(ct);
+    var file = form.Files["image"];
+    if (file is null || file.Length == 0)
+        return Results.BadRequest(new { error = "image file is required" });
+
+    var ffmpeg = LocateFfmpeg();
+    if (ffmpeg is null) return Results.Problem("ffmpeg binary not found.");
+    var (W, H) = ParseSize(form["size"].ToString());
+
+    var work = Path.Combine(Path.GetTempPath(), $"charimg-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(work);
+    try
+    {
+        var inPath = Path.Combine(work, "in" + Path.GetExtension(file.FileName));
+        await using (var fs = File.Create(inPath))
+            await file.CopyToAsync(fs, ct);
+        return await PublishFrameAsync(inPath, W, H, "char", wan, cfg, cred, ffmpeg, ct);
+    }
+    catch (Exception ex) when (!ct.IsCancellationRequested && IsWarmingError(ex))
+    {
+        // First GPU touch of a chain — tolerate scale-from-zero so the UI can retry.
+        return Results.Json(
+            new { warming = true, error = "GPU is warming up (scale-from-zero). Retry shortly." },
+            statusCode: 503);
+    }
+    finally { try { Directory.Delete(work, recursive: true); } catch { } }
+});
+
+// Extract the last frame of a finalized clip → ComfyUI input + blob preview.
+// Body: { videoUrl, size? }.
+app.MapPost("/api/extract-last-frame", async (ExtractFrameRequest req, IHttpClientFactory hf,
+    WanClient wan, IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
+{
+    if (string.IsNullOrWhiteSpace(req.VideoUrl))
+        return Results.BadRequest(new { error = "videoUrl is required" });
+
+    var ffmpeg = LocateFfmpeg();
+    if (ffmpeg is null) return Results.Problem("ffmpeg binary not found.");
+    var (W, H) = ParseSize(req.Size);
+
+    var work = Path.Combine(Path.GetTempPath(), $"lastframe-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(work);
+    try
+    {
+        var local = Path.Combine(work, "in.mp4");
+        var client = hf.CreateClient();
+        client.Timeout = TimeSpan.FromMinutes(3);
+        using (var s = await client.GetStreamAsync(req.VideoUrl, ct))
+        await using (var f = File.Create(local))
+            await s.CopyToAsync(f, ct);
+
+        // Grab the FINAL frame: decode the last ~1s and -update 1 overwrites so the
+        // last written frame is the true EOF frame. Robust even when N is unknown.
+        var lastFrame = Path.Combine(work, "last.png");
+        var (ec, err) = await RunProcessAsync(ffmpeg,
+            $"-y -sseof -1 -i \"{local}\" -update 1 -q:v 1 \"{lastFrame}\"", ct);
+        if (ec != 0 || !File.Exists(lastFrame))
+        {
+            // Fallback: take the very first frame if tail seek failed (tiny/odd clip).
+            (ec, err) = await RunProcessAsync(ffmpeg, $"-y -i \"{local}\" -frames:v 1 \"{lastFrame}\"", ct);
+            if (ec != 0 || !File.Exists(lastFrame))
+                return Results.Problem($"ffmpeg last-frame extract failed (exit {ec}): {err[..Math.Min(err.Length, 800)]}");
+        }
+        return await PublishFrameAsync(lastFrame, W, H, "lf", wan, cfg, cred, ffmpeg, ct);
+    }
+    finally { try { Directory.Delete(work, recursive: true); } catch { } }
 });
 
 // 3a. List previously finalized videos (mp4 blobs in the container) with fresh SAS URLs.
@@ -943,6 +1115,104 @@ Plan the {segmentCount}-segment arc as JSON now.";
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Storyboard: story-driven per-clip prompts for the I2V continuation chain.
+//
+// The chain renders N = ceil(total / clipSeconds) clips of `clipSeconds` each
+// (5s default → 12 clips for a 1-minute film). The whole user idea is spread
+// across those clips as ONE evolving story with a beginning, development and
+// resolution — never N copies of the same shot. Each clip carries a `motionPrompt`
+// tuned for image-to-video: the FIRST frame is supplied (character image for clip
+// 1, previous clip's last frame thereafter), so the prompt describes MOTION,
+// action and camera — what CHANGES — while identity/wardrobe/scene stay locked by
+// the incoming frame. `endState` documents what the clip's final frame should show
+// so it hands off cleanly into the next clip.
+// ─────────────────────────────────────────────────────────────────────────────
+app.MapPost("/api/storyboard", async (StoryboardRequest req, IHttpClientFactory hf,
+    IConfiguration cfg, CancellationToken ct) =>
+{
+    if (string.IsNullOrWhiteSpace(req.Prompt))
+        return Results.BadRequest(new { error = "prompt is required" });
+
+    var endpoint = Cfg(cfg, "AOAI_ENDPOINT").TrimEnd('/');
+    var key = Cfg(cfg, "AOAI_KEY");
+    var deployment = cfg["CHAT_DEPLOYMENT"] ?? "gpt-4o-mini";
+
+    var clipSeconds = Math.Clamp(req.ClipSeconds ?? 5, 3, 5);
+    var totalSeconds = Math.Clamp(req.TotalSeconds ?? 60, clipSeconds, 120);
+    var clipCount = Math.Clamp((int)Math.Ceiling(totalSeconds / (double)clipSeconds), 1, 24);
+    var size = req.Size ?? "832x480";
+
+    var sys = $@"You are a film director and storyboard artist planning a SINGLE continuous short film that will be produced as a CHAIN of {clipCount} image-to-video clips, each {clipSeconds} seconds long, played back-to-back to form one ~{clipCount * clipSeconds}-second film.
+
+HOW THE PRODUCTION WORKS (critical — shapes how you must write prompts):
+- Clip 1 is generated from the user's CHARACTER IMAGE as its first frame.
+- Every later clip is generated image-to-video from the PREVIOUS clip's LAST FRAME as its first frame.
+- So the character's appearance, wardrobe, and setting are carried VISUALLY from frame to frame — you do NOT need to re-describe the character's face or clothes in detail. Instead, each clip's prompt must describe MOTION: what the character/camera DOES during these {clipSeconds} seconds, and how the shot ENDS so it flows into the next clip.
+
+STORY RULES:
+- Spread the user's idea across all {clipCount} clips as ONE evolving story: clip 1 establishes; the middle clips develop/rise; the final clip resolves. NEVER repeat the same action — each clip must MOVE THE STORY FORWARD with new action.
+- Maintain continuity: each clip begins exactly where the previous clip's endState left off (same pose, location, framing) and then progresses.
+- Photorealistic and physically plausible by default. No on-screen text, captions, logos, or watermarks.
+- Keep one consistent visual style, lens and lighting across all clips (state it once in `style`).
+
+Return ONE JSON object, no markdown, exactly this shape:
+{{
+  ""title"": ""<short film title>"",
+  ""logline"": ""<one sentence describing the whole story arc>"",
+  ""subject"": ""<one short sentence naming the main character generically, e.g. 'the young woman in the ochre blazer' — the image defines exact identity, keep this light>"",
+  ""style"": ""<one line: film stock + grade + lens + lighting, identical across all clips>"",
+  ""setting"": ""<one line: where the story takes place and how/if it travels>"",
+  ""clipSeconds"": {clipSeconds},
+  ""clipCount"": {clipCount},
+  ""clips"": [
+    {{
+      ""index"": 1,
+      ""title"": ""<3-5 word beat title>"",
+      ""action"": ""<one sentence: the distinct physical action that happens in THIS clip, advancing the story>"",
+      ""camera"": ""<one short phrase: camera movement for this clip, e.g. 'slow push-in', 'handheld follow', 'static wide'>"",
+      ""motionPrompt"": ""<40-90 words. The image-to-video prompt to render this clip. Open by stating the first frame continues seamlessly, then describe the MOTION (subject action + camera move) over {clipSeconds} seconds, then the lighting/style in a few words. Describe what CHANGES, not a static description. Do not describe the character's face/clothes in detail — the frame already shows them. End with the negative cue 'No on-screen text, captions, or watermarks.'>"",
+      ""endState"": ""<one sentence: what the LAST frame of this clip shows — the pose/position/framing that the next clip will continue from>""
+    }}
+    // ... exactly {clipCount} clips, each DISTINCT and in story order.
+  ]
+}}
+
+Output JSON only. Exactly {clipCount} clips.";
+
+    var user = $@"User film idea: {req.Prompt}
+
+Produce the {clipCount}-clip storyboard ({clipSeconds}s per clip, {clipCount * clipSeconds}s total, aspect {size}). Spread the idea into ONE continuous story — distinct action in every clip, each continuing from the previous clip's last frame. Output JSON only.";
+
+    var client = hf.CreateClient();
+    client.Timeout = TimeSpan.FromSeconds(90);
+    using var msg = new HttpRequestMessage(HttpMethod.Post,
+        $"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=2024-10-21");
+    msg.Headers.Add("api-key", key);
+    var payload = new
+    {
+        messages = new object[] {
+            new { role = "system", content = sys },
+            new { role = "user",   content = user }
+        },
+        max_completion_tokens = 4000,
+        response_format = new { type = "json_object" }
+    };
+    msg.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+    using var resp = await client.SendAsync(msg, ct);
+    var body = await resp.Content.ReadAsStringAsync(ct);
+    if (!resp.IsSuccessStatusCode)
+        return Results.Problem($"Storyboard failed ({(int)resp.StatusCode}): {body}");
+
+    using var doc = JsonDocument.Parse(body);
+    var raw = doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString()?.Trim() ?? "{}";
+    object? story;
+    try { story = JsonSerializer.Deserialize<object>(raw); }
+    catch { return Results.Problem($"Storyboard returned non-JSON: {raw[..Math.Min(raw.Length, 400)]}"); }
+
+    return Results.Ok(new { story, clipSeconds, clipCount, totalSeconds, size });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // PromptCraft: multi-layer Sora-2 prompt engine.
 //
 // Pipeline (all calls go to REASONING_DEPLOYMENT, default gpt-5_4):
@@ -1501,6 +1771,8 @@ public record IdentityRequest(string VideoUrl, string? OriginalAnchor);
 public record TailRequest(string VideoUrl, double? Seconds, string? Size);
 public record SliceRequest(string VideoUrl, double? StartSec, double? DurationSec, string? Size, bool? FromEnd);
 public record RemixRequest(string VideoId, string Prompt, int? Seconds, string? Size);
+public record ExtractFrameRequest(string VideoUrl, string? Size);
+public record StoryboardRequest(string Prompt, int? TotalSeconds, int? ClipSeconds, string? Size);
 
 // In-memory store for PromptCraft jobs. Single-instance F1 deployment, so a
 // process-local concurrent dictionary is the simplest viable storage. Jobs

@@ -17,6 +17,7 @@ public sealed class WanClient
     private readonly string _baseUrl;
     private readonly string? _authKey;
     private readonly Lazy<string> _workflowJson;
+    private readonly Lazy<string> _i2vWorkflowJson;
     private readonly ILogger<WanClient> _log;
 
     public WanClient(IHttpClientFactory hf, IConfiguration cfg, IHostEnvironment env, ILogger<WanClient> log)
@@ -29,6 +30,12 @@ public sealed class WanClient
         var workflowPath = cfg["WAN_WORKFLOW_PATH"]
             ?? Path.Combine(env.ContentRootPath, "workflows", "wan22-t2v.json");
         _workflowJson = new Lazy<string>(() => File.ReadAllText(workflowPath));
+        // Image-to-video workflow (Wan2.2 I2V-A14B + WanImageToVideo). Used for the
+        // story-chain continuation feature where each clip is conditioned on the
+        // previous clip's last frame (or the user's character image for clip 1).
+        var i2vWorkflowPath = cfg["WAN_I2V_WORKFLOW_PATH"]
+            ?? Path.Combine(env.ContentRootPath, "workflows", "wan22-i2v.json");
+        _i2vWorkflowJson = new Lazy<string>(() => File.ReadAllText(i2vWorkflowPath));
     }
 
     /// <summary>
@@ -38,27 +45,92 @@ public sealed class WanClient
     /// </summary>
     public async Task<string> SubmitAsync(string prompt, int seconds, int width, int height, CancellationToken ct)
     {
-        // Wan2.2-T2V-A14B (dual-stage MoE) + Lightning 4-step LoRA: native 16 fps,
-        // temporal compression factor 4 so total frame count must be 4n+1.
-        // Cap at 5 s to keep render under ~60 s and stay inside the per-clip cost budget.
-        seconds = Math.Clamp(seconds, 1, 5);
-        var frames = seconds * 16 + 1; // 17, 33, 49, 65, 81 — all 4n+1.
-
-        // Spatial dims must be multiples of 16. A14B native sizes: 1280x720, 720x1280, 832x480, 480x832.
-        width = Math.Max(256, (width / 16) * 16);
-        height = Math.Max(256, (height / 16) * 16);
-
-        var seed = Random.Shared.NextInt64() & 0x7FFFFFFFFFFFFFFFL;
-
+        var (frames, w, h, seed) = NormalizeDims(seconds, width, height);
         var workflow = _workflowJson.Value
             .Replace("__PROMPT__", JsonSerializer.Serialize(prompt))
-            .Replace("__WIDTH__", width.ToString(System.Globalization.CultureInfo.InvariantCulture))
-            .Replace("__HEIGHT__", height.ToString(System.Globalization.CultureInfo.InvariantCulture))
+            .Replace("__WIDTH__", w.ToString(System.Globalization.CultureInfo.InvariantCulture))
+            .Replace("__HEIGHT__", h.ToString(System.Globalization.CultureInfo.InvariantCulture))
             .Replace("__FRAMES__", frames.ToString(System.Globalization.CultureInfo.InvariantCulture))
             .Replace("__SEED__", seed.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        return await PostGraphAsync(workflow, ct);
+    }
 
+    /// <summary>
+    /// Submit a Wan2.2 image-to-video job conditioned on <paramref name="imageName"/>
+    /// (a filename already present in ComfyUI's input directory — upload it first via
+    /// <see cref="UploadImageAsync"/>). This is the engine behind the story-chain
+    /// continuation: clip 1 is conditioned on the user's character image, and every
+    /// subsequent clip is conditioned on the previous clip's extracted last frame so
+    /// the character, wardrobe and scene carry forward frame-to-frame.
+    /// </summary>
+    public async Task<string> SubmitI2VAsync(string prompt, string imageName, int seconds, int width, int height, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(imageName))
+            throw new ArgumentException("imageName is required for I2V", nameof(imageName));
+        var (frames, w, h, seed) = NormalizeDims(seconds, width, height);
+        var workflow = _i2vWorkflowJson.Value
+            .Replace("__PROMPT__", JsonSerializer.Serialize(prompt))
+            .Replace("__IMAGE__", JsonSerializer.Serialize(imageName))
+            .Replace("__WIDTH__", w.ToString(System.Globalization.CultureInfo.InvariantCulture))
+            .Replace("__HEIGHT__", h.ToString(System.Globalization.CultureInfo.InvariantCulture))
+            .Replace("__FRAMES__", frames.ToString(System.Globalization.CultureInfo.InvariantCulture))
+            .Replace("__SEED__", seed.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        return await PostGraphAsync(workflow, ct);
+    }
+
+    /// <summary>
+    /// Upload an image into ComfyUI's input directory (POST /upload/image). Returns the
+    /// final filename ComfyUI assigned (it may de-duplicate, e.g. append "(1)"), which
+    /// is what the I2V workflow's LoadImage node must reference. A unique name is used
+    /// per upload so ComfyUI's LoadImage cache never serves a stale frame mid-chain.
+    /// </summary>
+    public async Task<string> UploadImageAsync(Stream image, string filename, CancellationToken ct)
+    {
+        var http = _hf.CreateClient();
+        http.Timeout = TimeSpan.FromMinutes(2);
+        using var content = new MultipartFormDataContent();
+        var fileContent = new StreamContent(image);
+        fileContent.Headers.ContentType = new MediaTypeHeaderValue("image/png");
+        content.Add(fileContent, "image", filename);
+        // overwrite=true keeps the exact name we generated (unique per call anyway).
+        content.Add(new StringContent("true"), "overwrite");
+        content.Add(new StringContent("input"), "type");
+
+        using var req = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/upload/image") { Content = content };
+        if (!string.IsNullOrEmpty(_authKey)) req.Headers.Add("X-Wan-Auth", _authKey);
+
+        using var resp = await http.SendAsync(req, ct);
+        var respBody = await resp.Content.ReadAsStringAsync(ct);
+        if (!resp.IsSuccessStatusCode)
+            throw new InvalidOperationException($"ComfyUI image upload failed ({(int)resp.StatusCode}): {respBody}");
+
+        using var doc = JsonDocument.Parse(respBody);
+        var name = doc.RootElement.GetProperty("name").GetString()
+            ?? throw new InvalidOperationException("ComfyUI upload did not return a name");
+        // If ComfyUI placed it in a subfolder, LoadImage expects "subfolder/name".
+        if (doc.RootElement.TryGetProperty("subfolder", out var sf) && !string.IsNullOrEmpty(sf.GetString()))
+            name = $"{sf.GetString()}/{name}";
+        return name;
+    }
+
+    // Frame count must be 4n+1 (temporal compression factor 4); spatial dims multiples
+    // of 16. Seconds capped at 5 to keep each clip's render under the cost budget.
+    private static (int frames, int width, int height, long seed) NormalizeDims(int seconds, int width, int height)
+    {
+        seconds = Math.Clamp(seconds, 1, 5);
+        var frames = seconds * 16 + 1; // 17, 33, 49, 65, 81 — all 4n+1.
+        width = Math.Max(256, (width / 16) * 16);
+        height = Math.Max(256, (height / 16) * 16);
+        var seed = Random.Shared.NextInt64() & 0x7FFFFFFFFFFFFFFFL;
+        return (frames, width, height, seed);
+    }
+
+    // Shared ComfyUI /prompt POST. Wraps a substituted workflow graph as
+    // {"prompt": <graph>, "client_id": "..."} and returns the prompt_id.
+    private async Task<string> PostGraphAsync(string workflowGraphJson, CancellationToken ct)
+    {
         var clientId = $"videotool-{Guid.NewGuid():N}";
-        var body = $"{{\"prompt\":{workflow},\"client_id\":{JsonSerializer.Serialize(clientId)}}}";
+        var body = $"{{\"prompt\":{workflowGraphJson},\"client_id\":{JsonSerializer.Serialize(clientId)}}}";
 
         var http = _hf.CreateClient();
         http.Timeout = TimeSpan.FromMinutes(2);

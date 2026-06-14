@@ -1,0 +1,151 @@
+{
+  "37": {
+    "class_type": "UNETLoader",
+    "_meta": { "title": "Load Wan2.2 I2V-A14B HIGH-NOISE expert" },
+    "inputs": {
+      "unet_name": "wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors",
+      "weight_dtype": "default"
+    }
+  },
+  "38": {
+    "class_type": "UNETLoader",
+    "_meta": { "title": "Load Wan2.2 I2V-A14B LOW-NOISE expert" },
+    "inputs": {
+      "unet_name": "wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors",
+      "weight_dtype": "default"
+    }
+  },
+  "39": {
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": { "title": "I2V Lightning 4-step LoRA (high-noise)" },
+    "inputs": {
+      "lora_name": "wan2.2_i2v_lightning_4steps_high.safetensors",
+      "strength_model": 1.0,
+      "model": ["37", 0]
+    }
+  },
+  "40": {
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": { "title": "I2V Lightning 4-step LoRA (low-noise)" },
+    "inputs": {
+      "lora_name": "wan2.2_i2v_lightning_4steps_low.safetensors",
+      "strength_model": 1.0,
+      "model": ["38", 0]
+    }
+  },
+  "41": {
+    "class_type": "ModelSamplingSD3",
+    "_meta": { "title": "Model sampling shift (high)" },
+    "inputs": { "shift": 5.0, "model": ["39", 0] }
+  },
+  "42": {
+    "class_type": "ModelSamplingSD3",
+    "_meta": { "title": "Model sampling shift (low)" },
+    "inputs": { "shift": 5.0, "model": ["40", 0] }
+  },
+  "5": {
+    "class_type": "CLIPLoader",
+    "_meta": { "title": "Load CLIP (UMT5)" },
+    "inputs": {
+      "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "type": "wan",
+      "device": "default"
+    }
+  },
+  "6": {
+    "class_type": "CLIPTextEncode",
+    "_meta": { "title": "Positive prompt" },
+    "inputs": {
+      "text": __PROMPT__,
+      "clip": ["5", 0]
+    }
+  },
+  "7": {
+    "class_type": "CLIPTextEncode",
+    "_meta": { "title": "Negative prompt" },
+    "inputs": {
+      "text": "blurry, distorted, low quality, low resolution, oversaturated, color bleed, posterized, banding, jpeg artifacts, bad anatomy, malformed, deformed face, extra limbs, watermark, on-screen text, captions, logo, ugly, morphing, flickering, identity change, face swap, different person",
+      "clip": ["5", 0]
+    }
+  },
+  "8": {
+    "class_type": "VAELoader",
+    "_meta": { "title": "Load Wan 2.1 VAE (16-channel for A14B)" },
+    "inputs": { "vae_name": "wan_2.1_vae.safetensors" }
+  },
+  "50": {
+    "class_type": "LoadImage",
+    "_meta": { "title": "Load start frame (character image or previous last-frame)" },
+    "inputs": { "image": __IMAGE__ }
+  },
+  "51": {
+    "class_type": "WanImageToVideo",
+    "_meta": { "title": "Wan I2V: condition on start image" },
+    "inputs": {
+      "width": __WIDTH__,
+      "height": __HEIGHT__,
+      "length": __FRAMES__,
+      "batch_size": 1,
+      "positive": ["6", 0],
+      "negative": ["7", 0],
+      "vae": ["8", 0],
+      "start_image": ["50", 0]
+    }
+  },
+  "43": {
+    "class_type": "KSamplerAdvanced",
+    "_meta": { "title": "Stage 1: high-noise (steps 0-2)" },
+    "inputs": {
+      "add_noise": "enable",
+      "noise_seed": __SEED__,
+      "steps": 4,
+      "cfg": 1.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "start_at_step": 0,
+      "end_at_step": 2,
+      "return_with_leftover_noise": "enable",
+      "model": ["41", 0],
+      "positive": ["51", 0],
+      "negative": ["51", 1],
+      "latent_image": ["51", 2]
+    }
+  },
+  "44": {
+    "class_type": "KSamplerAdvanced",
+    "_meta": { "title": "Stage 2: low-noise (steps 2-4)" },
+    "inputs": {
+      "add_noise": "disable",
+      "noise_seed": __SEED__,
+      "steps": 4,
+      "cfg": 1.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "start_at_step": 2,
+      "end_at_step": 4,
+      "return_with_leftover_noise": "disable",
+      "model": ["42", 0],
+      "positive": ["51", 0],
+      "negative": ["51", 1],
+      "latent_image": ["43", 0]
+    }
+  },
+  "9": {
+    "class_type": "VAEDecode",
+    "_meta": { "title": "VAE Decode" },
+    "inputs": { "samples": ["44", 0], "vae": ["8", 0] }
+  },
+  "11": {
+    "class_type": "VHS_VideoCombine",
+    "_meta": { "title": "Save MP4" },
+    "inputs": {
+      "images": ["9", 0],
+      "frame_rate": 16,
+      "loop_count": 0,
+      "filename_prefix": "wan22i2v",
+      "format": "video/h264-mp4",
+      "pingpong": false,
+      "save_output": true
+    }
+  }
+}

@@ -449,6 +449,23 @@ function App() {
   const [identityBible, setIdentityBible] = useState(null); // { characterDescriptor, wardrobe, sceneDescriptor, palette, lensLightingNotes, distinctiveTraits }
   const [useRemix, setUseRemix] = useState(true); // #1: clips 2..N remix-from-clip-1 (native identity preservation)
   const [enhancing, setEnhancing] = useState(false);
+
+  // ── Story Chain (I2V continuation) ────────────────────────────────────────
+  // The headline continuation feature: one user idea + one character image →
+  // a story spread across N=ceil(total/5) clips, each rendered image-to-video
+  // from the PREVIOUS clip's last frame, so the character + scene carry forward.
+  const [scPrompt, setScPrompt] = useState("");
+  const [scTotalSec, setScTotalSec] = useState(30);     // total film length
+  const [scAspect, setScAspect] = useState("landscape"); // landscape→832x480, vertical→480x832 (480p = fast chaining)
+  const [scCharFile, setScCharFile] = useState(null);    // character image File
+  const [scCharPreview, setScCharPreview] = useState(null); // object URL for preview
+  const [scStory, setScStory] = useState(null);          // { title, logline, subject, style, setting, clips:[...] }
+  const [scBuilding, setScBuilding] = useState(false);   // storyboard generation in flight
+  const [scProgress, setScProgress] = useState([]);      // per-clip [{index,title,status,clipUrl,handoffUrl}]
+  const scSize = scAspect === "vertical" ? "480x832" : "832x480";
+  const scClipSec = scStory?.clipSeconds || 5;
+  const scClipCount = scStory?.clips?.length || Math.ceil(scTotalSec / 5);
+
   // PromptCraft (multi-layer reasoner): runs gpt-5.4 through 6 layers + 5 critic iterations
   // to produce a Sora-2 prompt that honours every word of the user ask + locks realism + handles
   // face-risk. Heavier than enhance() but much higher fidelity to the original brief.
@@ -1209,6 +1226,183 @@ function App() {
     }
   }
 
+  // ── Story Chain (I2V continuation) orchestrator ───────────────────────────
+
+  // Pick the character image + build a preview thumbnail.
+  function pickCharImage(file) {
+    if (scCharPreview) { try { URL.revokeObjectURL(scCharPreview); } catch {} }
+    setScCharFile(file || null);
+    setScCharPreview(file ? URL.createObjectURL(file) : null);
+  }
+
+  // Step 1: turn the idea into a story spread over N=ceil(total/5) clips.
+  async function buildStoryboard() {
+    if (!scPrompt.trim()) { toast("Enter a story idea first.", true); return; }
+    setScBuilding(true); setScStory(null); setScProgress([]);
+    try {
+      const r = await fetch("/api/storyboard", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: scPrompt, totalSeconds: scTotalSec, clipSeconds: 5, size: scSize })
+      });
+      const j = await jsonOrThrow(r);
+      const story = j.story || {};
+      if (!Array.isArray(story.clips) || story.clips.length === 0) throw new Error("storyboard had no clips");
+      setScStory(story);
+      dbg("ok", `storyboard: "${story.title || "untitled"}" — ${story.clips.length} clips`);
+      toast(`Storyboard ready — ${story.clips.length} clips telling one story`);
+    } catch (e) {
+      dbg("warn", "storyboard failed", e.message);
+      toast("Storyboard failed: " + e.message.slice(0, 200), true);
+    } finally { setScBuilding(false); }
+  }
+
+  // Edit a single clip's motion prompt inline (lets the user tweak the story).
+  function editClipPrompt(idx, value) {
+    setScStory(s => {
+      if (!s) return s;
+      const clips = s.clips.map(c => c.index === idx ? { ...c, motionPrompt: value } : c);
+      return { ...s, clips };
+    });
+  }
+
+  // Submit an I2V job, tolerating GPU cold-start (503 warming) and rate limits.
+  async function submitI2V(startImage, thePrompt, clipSec, label) {
+    for (let attempt = 0; attempt < 40; attempt++) {
+      if (cancelRef.current) throw new Error("Cancelled by user");
+      const fd = new FormData();
+      fd.append("prompt", thePrompt);
+      fd.append("seconds", String(clipSec));
+      fd.append("size", scSize);
+      fd.append("startImage", startImage);
+      const r = await fetch("/api/jobs", { method: "POST", body: fd });
+      const txt = await r.text();
+      if (r.ok) return JSON.parse(txt);
+      let warming = false;
+      try { warming = !!JSON.parse(txt).warming; } catch {}
+      if (r.status === 503 && (warming || /warming|starting up|cold start/i.test(txt))) {
+        setStatus(s => ({ ...s, label: `${label}: GPU warming up… (try ${attempt + 1})` }));
+        dbg("warn", `${label}: GPU cold-starting (503 warming), retrying in 15s`);
+        await sleep(15000); continue;
+      }
+      if (r.status === 429 || /Too many running tasks/i.test(txt)) { await sleep(5000 + attempt * 2000); continue; }
+      throw new Error(txt.slice(0, 400));
+    }
+    throw new Error("GPU did not become ready after several minutes — try again.");
+  }
+
+  // Steps 2-4: render the chain. clip 1 from the character image; each later clip
+  // image-to-video from the previous clip's extracted last frame. Then stitch.
+  async function runStoryChain() {
+    if (!scStory || !Array.isArray(scStory.clips) || scStory.clips.length === 0) {
+      toast("Generate a storyboard first.", true); return;
+    }
+    if (!scCharFile) { toast("Upload a character image first.", true); return; }
+    cancelRef.current = false; currentJobIdRef.current = null;
+    setRunning(true); setOuts([]); setStitched(null);
+    const clips = scStory.clips;
+    const N = clips.length;
+    const clipSec = scStory.clipSeconds || 5;
+    setScProgress(clips.map(c => ({ index: c.index, title: c.title || `clip ${c.index}`, status: "pending", clipUrl: null, handoffUrl: null })));
+    setStatus({ phase: "running", pct: 1, label: "uploading character image" });
+    const etaMin = Math.ceil((N * 70) / 60);
+    toast(`Rendering ${N}-clip story chain · est. ~${etaMin} min on Wan2.2 I2V`);
+    try {
+      // Step A — character image → ComfyUI start frame for clip 1. Retry through
+      // GPU scale-from-zero: this is the chain's first GPU touch, so the container
+      // may still be activating (~45s) and answer 503 {warming} or time out.
+      let startImage = null;
+      for (let attempt = 0; attempt < 40 && startImage === null; attempt++) {
+        if (cancelRef.current) throw new Error("Cancelled by user");
+        const cfd = new FormData(); cfd.append("image", scCharFile); cfd.append("size", scSize);
+        const cr = await fetch("/api/comfy-image", { method: "POST", body: cfd });
+        if (cr.ok) { startImage = (await cr.json()).name; break; }
+        const txt = await cr.text();
+        let warming = false; try { warming = !!JSON.parse(txt).warming; } catch {}
+        if (cr.status === 503 || warming || /warming|50[234]|timeout|ActivationFailed|no capacity/i.test(txt)) {
+          setStatus(s => ({ ...s, label: `GPU warming up… preparing character image (try ${attempt + 1})` }));
+          dbg("warn", "character upload: GPU cold-starting, retry in 15s");
+          await sleep(15000); continue;
+        }
+        throw new Error("character image upload failed: " + txt.slice(0, 300));
+      }
+      if (startImage === null) throw new Error("GPU did not become ready to accept the character image — try again.");
+      dbg("ok", `character image uploaded to GPU as ${startImage}`);
+
+      const finals = [];
+      for (let i = 0; i < N; i++) {
+        if (cancelRef.current) throw new Error("Cancelled by user");
+        const clip = clips[i];
+        const label = `clip ${i + 1}/${N}`;
+        const basePct = 2 + (i / N) * 92;
+        const spanPct = (1 / N) * 88;
+        setScProgress(p => p.map(x => x.index === clip.index ? { ...x, status: "rendering" } : x));
+        setStatus({ phase: "running", pct: basePct, label: `${label}: ${clip.title || "rendering"}` });
+
+        const thePrompt = clip.motionPrompt || clip.action || scPrompt;
+        const job = await submitI2V(startImage, thePrompt, clipSec, label);
+        pushSubscribeForJob(job.id, label);
+        const etaMs = clipSec * 16000;
+        await poll(job.id, (st, elapsed) => {
+          const frac = Math.min(0.98, elapsed / etaMs);
+          setStatus(s => ({ ...s, label: `${label}: ${st} (${Math.round(elapsed / 1000)}s)`, pct: basePct + spanPct * frac }));
+        });
+        setStatus(s => ({ ...s, label: `${label}: finalizing` }));
+        const fr = await fetch(`/api/jobs/${job.id}/finalize`, { method: "POST" });
+        const fj = await jsonOrThrow(fr);
+        finals.push({ ...fj, seconds: clipSec, size: scSize });
+        setOuts([...finals]);
+        setScProgress(p => p.map(x => x.index === clip.index ? { ...x, status: "done", clipUrl: fj.url } : x));
+        dbg("ok", `${label} rendered`);
+
+        // Capture the last frame to seed the next clip (the chain's core step).
+        if (i < N - 1) {
+          if (cancelRef.current) throw new Error("Cancelled by user");
+          setStatus(s => ({ ...s, label: `${label}: capturing handoff frame → clip ${i + 2}` }));
+          try {
+            const ef = await fetch("/api/extract-last-frame", {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ videoUrl: fj.url, size: scSize })
+            });
+            const ej = await jsonOrThrow(ef);
+            startImage = ej.name;
+            setScProgress(p => p.map(x => x.index === clip.index ? { ...x, handoffUrl: ej.previewUrl } : x));
+            dbg("ok", `handoff frame captured for clip ${i + 2}`);
+          } catch (e) {
+            dbg("warn", `last-frame extract failed (${e.message}); reusing previous start frame`);
+            // startImage stays as-is (previous frame) so the chain can still proceed.
+          }
+        }
+      }
+
+      // Stitch the clips into the final film.
+      setRefreshLib(x => x + 1);
+      if (finals.length >= 2) {
+        setStitching(true);
+        setStatus({ phase: "running", pct: 95, label: `stitching ${finals.length} clips into the film…` });
+        try {
+          const r = await fetch("/api/stitch", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ urls: finals.map(f => f.url), crossfade })
+          });
+          const j = await jsonOrThrow(r);
+          setStitched({ url: j.url, clips: j.clips, crossfade: j.crossfade, bytes: j.bytes });
+          dbg("ok", `stitched ${j.clips} clips → ${(j.bytes / 1024 / 1024).toFixed(1)}MB film`);
+        } catch (e) {
+          dbg("warn", "stitch failed; clips still available individually", e.message);
+          toast("Stitch failed — clips are available individually", true);
+        } finally { setStitching(false); }
+      }
+      setStatus({ phase: "done", pct: 100, label: "film ready" });
+      toast("Story chain complete 🎬");
+    } catch (e) {
+      const cancelled = cancelRef.current || /Cancelled by user/i.test(e.message || "");
+      setStatus({ phase: cancelled ? "idle" : "failed", pct: 0, label: cancelled ? "cancelled" : "error" });
+      toast(cancelled ? "Story chain cancelled" : e.message.slice(0, 200), !cancelled);
+    } finally {
+      cancelRef.current = false; currentJobIdRef.current = null; setRunning(false);
+    }
+  }
+
   const recentLines = dbgLines.slice(-200);
 
   // Gate the prompt-generation buttons: every selection (prompt + voice + duration + aspect)
@@ -1236,6 +1430,115 @@ function App() {
     <main>
       <!-- LEFT: Compose -->
       <div>
+        <div class="card" style=${{borderColor:"var(--accent)",borderWidth:1,borderStyle:"solid"}}>
+          <h3 style=${{display:"flex",alignItems:"center",gap:8}}>🎬 Story Chain <span class="pill ok small">I2V continuation</span></h3>
+          <p class="muted small" style=${{marginTop:-4}}>
+            One idea + one character image → a single story spread across ${scClipCount} clips.
+            Each clip is generated from the previous clip's last frame, so your character carries through the whole film.
+          </p>
+          <div class="stack">
+            <!-- STEP 1: story idea → storyboard -->
+            <div>
+              <label>① Story idea</label>
+              <textarea rows="3" placeholder="A lone astronaut explores an abandoned Martian station, discovers a flickering signal, and follows it to a hidden greenhouse still alive."
+                value=${scPrompt} onInput=${e => setScPrompt(e.target.value)}></textarea>
+            </div>
+            <div class="row">
+              <div>
+                <label>Film length</label>
+                <select value=${scTotalSec} onChange=${e => setScTotalSec(Number(e.target.value))}>
+                  <option value=${15}>15s · 3 clips</option>
+                  <option value=${30}>30s · 6 clips</option>
+                  <option value=${45}>45s · 9 clips</option>
+                  <option value=${60}>1 min · 12 clips</option>
+                </select>
+              </div>
+              <div>
+                <label>Aspect <span class="muted small">(480p, fast)</span></label>
+                <select value=${scAspect} onChange=${e => setScAspect(e.target.value)}>
+                  <option value="landscape">Landscape 16:9</option>
+                  <option value="vertical">Vertical 9:16</option>
+                </select>
+              </div>
+            </div>
+            <div class="btn-row" style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+              <button class="primary" onClick=${buildStoryboard} disabled=${scBuilding || running || !scPrompt.trim()}>
+                ${scBuilding ? "Writing story…" : "① Generate storyboard"}
+              </button>
+              <span class="muted small">${scClipCount} clips · ${scClipSec}s each · one continuous arc</span>
+            </div>
+
+            <!-- Storyboard preview (editable) -->
+            ${scStory && Array.isArray(scStory.clips) && html`
+              <div class="plan">
+                <div class="plan-head">
+                  <strong>${scStory.title || "Storyboard"}</strong>
+                  <span class="pill">${scStory.clips.length} clips</span>
+                </div>
+                ${scStory.logline && html`<div class="muted small" style=${{padding:"0 12px 8px"}}>${scStory.logline}</div>`}
+                ${scStory.clips.map((c, i) => html`
+                  <div class="plan-seg" key=${i}>
+                    <div class="plan-seg-head">
+                      <span class="pill">${i+1}</span>
+                      <span class="plan-seg-summary"><strong>${c.title || ""}</strong> — ${c.action || ""}</span>
+                      ${c.camera && html`<span class="pill small">${c.camera}</span>`}
+                    </div>
+                    <${Accordion} title="motion prompt">
+                      <textarea rows="3" style=${{fontSize:12,fontFamily:"var(--mono)"}} value=${c.motionPrompt || ""}
+                        onInput=${e => editClipPrompt(c.index, e.target.value)}></textarea>
+                    </${Accordion}>
+                  </div>
+                `)}
+              </div>
+            `}
+
+            <!-- STEP 2: character image -->
+            <div>
+              <label>② Character image <span class="muted small">(appears in every clip)</span></label>
+              <input type="file" accept="image/*" onChange=${e => pickCharImage(e.target.files[0] || null)} />
+              ${scCharPreview && html`
+                <div style=${{marginTop:8,display:"flex",alignItems:"center",gap:10}}>
+                  <img src=${scCharPreview} alt="character" style=${{width:96,height:96,objectFit:"cover",borderRadius:"var(--radius-sm)",border:"1px solid var(--border)"}} />
+                  <div class="muted small">${scCharFile?.name || ""}<br/>This is the first frame of clip 1.</div>
+                </div>
+              `}
+            </div>
+
+            <!-- STEP 3/4: render the chain -->
+            <div class="btn-row" style=${{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
+              <button class="primary" onClick=${runStoryChain}
+                disabled=${running || !scStory || !scCharFile}>
+                ${running ? "Rendering chain…" : `▶ Render ${scClipCount}-clip story`}
+              </button>
+              ${running && html`<button onClick=${cancelRun} title="Stop and cancel the active GPU job">✕ Cancel</button>`}
+              <span class="pill ${status.phase === "failed" ? "err" : status.phase === "done" ? "ok" : ""}">${status.label}</span>
+            </div>
+            ${(running || status.pct > 0) && html`<div class="progress"><div style=${{width: status.pct + "%"}}></div></div>`}
+
+            <!-- Per-clip chain visualization -->
+            ${scProgress.length > 0 && html`
+              <div style=${{display:"flex",gap:8,overflowX:"auto",padding:"8px 2px"}}>
+                ${scProgress.map((c, i) => html`
+                  <div key=${i} style=${{flex:"0 0 auto",width:120,textAlign:"center"}}>
+                    <div style=${{position:"relative",width:120,height:68,borderRadius:8,overflow:"hidden",border:"1px solid var(--border)",background:"var(--surface-2)",display:"flex",alignItems:"center",justifyContent:"center"}}>
+                      ${c.clipUrl
+                        ? html`<video src=${c.clipUrl} muted loop playsinline onMouseOver=${e=>e.target.play()} onMouseOut=${e=>e.target.pause()} style=${{width:"100%",height:"100%",objectFit:"cover"}}></video>`
+                        : html`<span style=${{fontSize:22}}>${c.status === "rendering" ? "⏳" : c.status === "failed" ? "⚠️" : "🎞️"}</span>`}
+                      <span style=${{position:"absolute",top:3,left:3,fontSize:10,padding:"1px 5px",borderRadius:6,background:"rgba(0,0,0,.6)",color:"#fff"}}>${i+1}</span>
+                    </div>
+                    <div class=${"pill small " + (c.status==="done"?"ok":c.status==="failed"?"err":"")} style=${{marginTop:4,fontSize:10}}>${c.status}</div>
+                    <div class="muted small" style=${{fontSize:10,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}} title=${c.title}>${c.title}</div>
+                    ${c.handoffUrl && html`
+                      <div class="muted small" style=${{fontSize:10,marginTop:2}}>↓ last frame</div>
+                      <img src=${c.handoffUrl} alt="handoff" style=${{width:120,height:34,objectFit:"cover",borderRadius:6,border:"1px dashed var(--accent)"}} />
+                    `}
+                  </div>
+                `)}
+              </div>
+            `}
+          </div>
+        </div>
+
         <div class="card">
           <h3>Compose</h3>
           <div class="stack">
