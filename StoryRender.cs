@@ -369,7 +369,9 @@ public sealed class StoryRenderWorker : BackgroundService
                 catch { prevFrameName = null; }
             }
 
-            // Per-clip audio: dialogue (speaker voice) + narration (narrator voice).
+            // Per-clip audio: a NARRATOR voiceover carries the story where dialogue can't, plus
+            // the character's spoken line at key beats — whichever the storyboard provides for
+            // this clip. Narration first, then dialogue; fit the shot to the audio so nothing cuts.
             if (narrating)
             {
                 try
@@ -382,20 +384,20 @@ public sealed class StoryRenderWorker : BackgroundService
                     var dVoice = (!string.IsNullOrEmpty(speakerId) && cast.TryGetValue(speakerId, out var sw) && !string.IsNullOrWhiteSpace(sw.Voice))
                         ? sw.Voice!
                         : (!string.IsNullOrWhiteSpace(spec.DialogVoice) ? spec.DialogVoice! : spec.NarratorVoice);
-
                     var style = MoodToStyle(S(clip["mood"], ""));
+
                     var tracks = new List<string>();
-                    if (dLine.Length > 0)
-                    {
-                        job.Label = $"{label}: dialogue";
-                        var dr = await PostJsonAsync("/api/narrate", new { text = dLine, voice = dVoice, style }, ct);
-                        tracks.Add(dr.GetProperty("url").GetString()!);
-                    }
                     if (nLine.Length > 0)
                     {
                         job.Label = $"{label}: narrating";
                         var nr = await PostJsonAsync("/api/narrate", new { text = nLine, voice = spec.NarratorVoice, style }, ct);
                         tracks.Add(nr.GetProperty("url").GetString()!);
+                    }
+                    if (dLine.Length > 0)
+                    {
+                        job.Label = $"{label}: dialogue";
+                        var dr = await PostJsonAsync("/api/narrate", new { text = dLine, voice = dVoice, style }, ct);
+                        tracks.Add(dr.GetProperty("url").GetString()!);
                     }
                     if (tracks.Count > 0)
                     {
@@ -406,8 +408,8 @@ public sealed class StoryRenderWorker : BackgroundService
                                 new { audioUrls = tracks.ToArray(), gapMs = 350 }, ct);
                             audioUrl = cr.GetProperty("url").GetString()!;
                         }
-                        // 'fit' holds the shot to the spoken line (lead-in + tail) instead of
-                        // truncating the audio at the fixed clip length — keeps audio in sync.
+                        // 'fit' holds the shot to the spoken audio (lead-in + tail) instead of
+                        // truncating it at the fixed clip length — keeps audio in sync.
                         var mr = await PostJsonAsync("/api/mux-audio",
                             new { videoUrl = clipUrl, audioUrl, mode = "fit" }, ct);
                         clipUrl = mr.GetProperty("url").GetString()!;
@@ -765,39 +767,47 @@ public sealed class StoryRenderWorker : BackgroundService
 /// (potentially large) storyboard JSON on every poll.</summary>
 public static class StoryJobView
 {
-    public static object Summary(StoryJob j) => new
+    public static object Summary(StoryJob j, Func<string?, string?>? resign = null)
     {
-        id = j.Id,
-        title = j.Title,
-        status = j.Status,
-        pct = Math.Round(j.Pct, 1),
-        label = j.Label,
-        resultUrl = j.ResultUrl,
-        clips = j.ClipUrls.Count,
-        error = j.Error,
-        createdAt = j.CreatedAt,
-        finishedAt = j.FinishedAt,
-        language = j.Spec.Language,
-        size = j.Spec.Size,
-        narrate = j.Spec.Narrate
-    };
+        var sign = resign ?? (u => u);
+        return new
+        {
+            id = j.Id,
+            title = j.Title,
+            status = j.Status,
+            pct = Math.Round(j.Pct, 1),
+            label = j.Label,
+            resultUrl = sign(j.ResultUrl),
+            clips = j.ClipUrls.Count,
+            error = j.Error,
+            createdAt = j.CreatedAt,
+            finishedAt = j.FinishedAt,
+            language = j.Spec.Language,
+            size = j.Spec.Size,
+            narrate = j.Spec.Narrate
+        };
+    }
 
-    public static object Full(StoryJob j) => new
+    public static object Full(StoryJob j, Func<string?, string?>? resign = null)
     {
-        id = j.Id,
-        title = j.Title,
-        status = j.Status,
-        pct = Math.Round(j.Pct, 1),
-        label = j.Label,
-        resultUrl = j.ResultUrl,
-        clipUrls = j.ClipUrls,
-        error = j.Error,
-        createdAt = j.CreatedAt,
-        finishedAt = j.FinishedAt,
-        language = j.Spec.Language,
-        size = j.Spec.Size,
-        narrate = j.Spec.Narrate,
-        crossfade = j.Spec.Crossfade
-    };
+        var sign = resign ?? (u => u);
+        return new
+        {
+            id = j.Id,
+            title = j.Title,
+            status = j.Status,
+            pct = Math.Round(j.Pct, 1),
+            label = j.Label,
+            resultUrl = sign(j.ResultUrl),
+            clipUrls = j.ClipUrls.Select(u => sign(u)).ToList(),
+            error = j.Error,
+            createdAt = j.CreatedAt,
+            finishedAt = j.FinishedAt,
+            language = j.Spec.Language,
+            size = j.Spec.Size,
+            narrate = j.Spec.Narrate,
+            crossfade = j.Spec.Crossfade
+        };
+    }
 }
 

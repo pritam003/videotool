@@ -288,15 +288,20 @@ app.MapPost("/api/story-jobs", (StorySpec spec, StoryRenderQueue queue) =>
     return Results.Json(new { id = job.Id, status = job.Status });
 });
 
-app.MapGet("/api/story-jobs", (StoryRenderQueue queue) =>
-    Results.Json(queue.List().Select(StoryJobView.Summary)));
+app.MapGet("/api/story-jobs", async (StoryRenderQueue queue, IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
+{
+    var sas = await TryStorySasAsync(cfg, cred, ct);
+    Func<string?, string?> resign = sas is { } s ? (u => ResignBlobUrl(u, s.account, s.container, s.udk)) : (u => u);
+    return Results.Json(queue.List().Select(j => StoryJobView.Summary(j, resign)));
+});
 
-app.MapGet("/api/story-jobs/{id}", (string id, StoryRenderQueue queue) =>
+app.MapGet("/api/story-jobs/{id}", async (string id, StoryRenderQueue queue, IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
 {
     var job = queue.Get(id);
-    return job is null
-        ? Results.NotFound(new { error = "no such job" })
-        : Results.Json(StoryJobView.Full(job));
+    if (job is null) return Results.NotFound(new { error = "no such job" });
+    var sas = await TryStorySasAsync(cfg, cred, ct);
+    Func<string?, string?> resign = sas is { } s ? (u => ResignBlobUrl(u, s.account, s.container, s.udk)) : (u => u);
+    return Results.Json(StoryJobView.Full(job, resign));
 });
 
 app.MapPost("/api/story-jobs/{id}/cancel", (string id, StoryRenderQueue queue) =>
@@ -577,6 +582,25 @@ app.MapGet("/api/videos", async (IConfiguration cfg, TokenCredential cred, Cance
     return Results.Ok(new { count = sorted.Count, videos = sorted });
 });
 
+// Delete a rendered video blob by name (the gallery passes the blob's name).
+app.MapDelete("/api/videos/{*name}", async (string name, IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
+{
+    if (string.IsNullOrWhiteSpace(name) || !name.EndsWith(".mp4", StringComparison.OrdinalIgnoreCase))
+        return Results.BadRequest(new { error = "a .mp4 blob name is required" });
+    try
+    {
+        var account = Cfg(cfg, "STORAGE_ACCOUNT");
+        var svc = new BlobServiceClient(new Uri($"https://{account}.blob.core.windows.net"), cred);
+        var container = svc.GetBlobContainerClient(cfg["STORAGE_CONTAINER"] ?? "videos");
+        var res = await container.GetBlobClient(name).DeleteIfExistsAsync(cancellationToken: ct);
+        return Results.Ok(new { ok = true, deleted = res.Value, name });
+    }
+    catch (Exception ex) when (!ct.IsCancellationRequested)
+    {
+        return Results.Problem($"delete failed: {ex.Message}");
+    }
+});
+
 // 3b. Stitch: concatenate N MP4 clips into a single combined MP4 with optional crossfade.
 //     Body: { urls: string[], crossfade?: number /* seconds, 0 = hard cut, 0.3-0.5 typical */ }
 //     Strategy:
@@ -824,6 +848,51 @@ app.MapPost("/api/concat-audio", async (ConcatAudioRequest req, IHttpClientFacto
         try { Directory.Delete(work, recursive: true); } catch { }
     }
 });
+
+// Re-sign a stored blob URL with a fresh short-lived SAS so persisted story-job
+// result/clip URLs (signed once at render time with a 2h SAS) keep playing afterwards.
+// Any failure (not our blob, parse error) returns the original URL unchanged.
+static string? ResignBlobUrl(string? url, string account, string container, Azure.Storage.Blobs.Models.UserDelegationKey udk)
+{
+    if (string.IsNullOrWhiteSpace(url)) return url;
+    try
+    {
+        var uri = new Uri(url);
+        if (!uri.Host.StartsWith(account + ".blob.", StringComparison.OrdinalIgnoreCase)) return url;
+        var path = uri.AbsolutePath.TrimStart('/');
+        var prefix = container + "/";
+        if (!path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return url;
+        var blobName = Uri.UnescapeDataString(path.Substring(prefix.Length));
+        var sas = new BlobSasBuilder
+        {
+            BlobContainerName = container,
+            BlobName = blobName,
+            Resource = "b",
+            ExpiresOn = DateTimeOffset.UtcNow.AddHours(6)
+        };
+        sas.SetPermissions(BlobSasPermissions.Read);
+        var token = sas.ToSasQueryParameters(udk, account).ToString();
+        return $"https://{account}.blob.core.windows.net/{container}/{Uri.EscapeDataString(blobName).Replace("%2F", "/")}?{token}";
+    }
+    catch { return url; }
+}
+
+// Fresh user-delegation SAS context for re-signing, or null if storage isn't
+// configured / reachable (callers then fall back to the stored URL).
+static async Task<(string account, string container, Azure.Storage.Blobs.Models.UserDelegationKey udk)?> TryStorySasAsync(
+    IConfiguration cfg, TokenCredential cred, CancellationToken ct)
+{
+    try
+    {
+        var account = Cfg(cfg, "STORAGE_ACCOUNT");
+        var container = cfg["STORAGE_CONTAINER"] ?? "videos";
+        var svc = new BlobServiceClient(new Uri($"https://{account}.blob.core.windows.net"), cred);
+        var udk = await svc.GetUserDelegationKeyAsync(
+            DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddHours(6), ct);
+        return (account, container, udk.Value);
+    }
+    catch { return null; }
+}
 
 static string? LocateFfmpeg()
 {
@@ -1410,25 +1479,32 @@ app.MapPost("/api/storyboard", async (StoryboardRequest req, IHttpClientFactory 
     var narrate = req.Narrate ?? true;
     var dialogDirection = (req.DialogDirection ?? "").Trim();
     var dialogGuidance = string.IsNullOrWhiteSpace(dialogDirection)
-        ? "No dialogue direction was given — invent natural, in-character lines yourself, ALWAYS in subtext (never on-the-nose). Give MOST clips a spoken line; leave dialog empty only for a rare, clearly wordless beat."
-        : $@"DIALOGUE DIRECTION from the user: ""{dialogDirection}"". Treat this as the underlying MOOD / situation to convey through SUBTEXT and behaviour across the whole film — do NOT quote it back as a spoken line (e.g. if the note is 'he is sad', NEVER write ""I'm sad""; instead let a line like 'Nobody stopped tonight.' plus the narration earn that feeling). Every spoken line in {language}, in sync with its clip's action and narration.";
+        ? "No dialogue direction was given — invent natural, in-character lines yourself where a character actually speaks, ALWAYS in subtext (never on-the-nose). Place dialogue only at the beats that need a spoken moment; leave dialog empty on the clips the narrator carries."
+        : $@"DIALOGUE DIRECTION from the user: ""{dialogDirection}"". Treat this as the underlying MOOD / situation to convey through SUBTEXT and behaviour — do NOT quote it back as a spoken line (e.g. if the note is 'he is sad', NEVER write ""I'm sad""; instead let a line like 'Nobody stopped tonight.' earn that feeling). Every spoken line in {language}, in sync with its clip.";
     var narrationRule = narrate
-        ? $@"AUDIO — write ONE film script = NARRATION (voiceover) + DIALOGUE (spoken on screen), composed TOGETHER with the visuals so sound and picture stay in sync. Write BOTH in {language} USING ITS NATIVE SCRIPT (Devanagari for Hindi, Bengali script for Bengali, etc.) — NEVER romanized/transliterated, never English; only real proper names may stay as-is.
+        ? $@"AUDIO — FIRST decide which kind of film this premise is, then use its mode:
 
-NARRATION (narrator voiceover) — write a line for EVERY clip, never leave one empty:
-- Do NOT just describe what is already on screen. Lines like 'he plays the guitar', 'he looks up and plays harder', 'he packs up and walks away' are BAD — they merely repeat the picture. Instead voice what the camera CANNOT show: the character's inner feeling, what the moment MEANS, a memory, a longing, or the story's theme.
-- Read end to end, the clips' narration must form ONE continuous, complete, flowing voiceover — like a storyteller or a poem — each line following naturally from the last, no repeats, no restating the action.
-- Keep every line short, evocative and varied (do not reuse the same sentence shape twice).
+• CONVERSATION films — two or a few people talking something through (an interview, an argument, a reunion, a negotiation, a confession, a lesson, breaking news, strangers meeting, a heart-to-heart): DIALOGUE carries the ENTIRE film. Give MOST clips a spoken line and ALTERNATE speakers turn by turn like a real back-and-forth. Use NO narration — leave every clip's `narration` an EMPTY STRING (at most you MAY put ONE short scene-setting hook on clip 1; clips 2+ stay empty).
+
+• STORY films — a journey, a montage, a myth, an emotional arc, mostly one character, or visual storytelling where people don't really converse: a NARRATOR (storyteller voiceover) carries it. Give MOST clips a narration line and let characters speak only SPARSELY, at the key emotional beats.
+
+If the premise is two named people meeting or talking it out, it is a CONVERSATION — let them TALK, don't narrate over them. Write ALL spoken text in {language} USING ITS NATIVE SCRIPT (Devanagari for Hindi, Bengali script for Bengali, etc.) — NEVER romanized/transliterated, never English; only real proper names may stay as-is.
+
+NARRATOR (story-film voiceover) — when the film is narrated:
+- Open with a short emotional HOOK that frames the story — a line of feeling or theme, NOT a description of the shot.
+- Read end to end the narration is ONE continuous, flowing storyteller voice — each line following the last, carrying the MEANING of what happens, building to a close.
+- Voice what the camera CANNOT show: inner feeling, what the moment MEANS, a memory, the theme. NEVER just describe the visible action ('he plays the guitar', 'he walks away' are BAD).
 
 DIALOGUE (words spoken on screen):
-- The EXACT words a character speaks in THIS clip — spoken words only, NO name prefix, NO quotation marks. Give MOST clips a spoken line: any clip where a present character could plausibly speak, mutter, react or address someone gets one; even a character who is ALONE can voice a thought aloud (do NOT default to silence just because they are alone or sad). Use an empty string ONLY for the rare beat that is clearly, intentionally wordless.
-- NEVER on-the-nose: a character must NEVER state their own emotion or narrate their own action. 'I'm sad', 'I'm so happy', 'Thank you', 'I look up and play' are ALL BAD. Real people speak in SUBTEXT — imply the feeling indirectly through specific, natural, in-character words (e.g. instead of 'I'm sad' a busker might say 'Nobody stopped tonight.').
-- Across the clips the spoken lines read as ONE natural, evolving exchange with real emotion and specific, human detail — never generic pleasantries.
-- For every clip that HAS a dialog line, set `speaker` to the cast id (from `cast`) of the character who says it; use an empty string when dialog is empty.
+- The EXACT words a character speaks in THIS clip — spoken words only, NO name prefix, NO quotation marks; empty string when no one speaks the beat.
+- NEVER on-the-nose: a character must NEVER state their own emotion or action ('I'm sad', 'I look up and play' are BAD). Imply feeling through specific, in-character words ('Nobody stopped tonight.').
+- For every clip that HAS dialogue, set `speaker` to the cast id (from `cast`) of who says it.
 - {dialogGuidance}
-- Keep each line very SHORT — natural, unhurried speech, not crammed. HARD LIMIT: narration + dialog TOGETHER at most about {Math.Max(6, clipSeconds * 2)} words, so the line is spoken calmly within roughly {clipSeconds} seconds. Count the words; if over, cut ruthlessly. Fewer, well-chosen words feel more cinematic than a packed line.
-- EMOTION: give every clip a one-word `mood` that matches the beat (sad, hopeful, tender, lonely, warm, anxious, joyful, calm, bittersweet, serious, longing…); it drives how the voice is PERFORMED so the film feels acted and felt, not read out. Let the mood evolve across the clips with the story's arc.
-- Keep title, style, action and motionPrompt in ENGLISH (the video model needs English). ONLY the narration and dialog fields are written in {language}'s native script."
+
+BOTH MODES:
+- Keep every spoken line SHORT and speakable — natural, unhurried. HARD LIMIT per clip: narration + dialogue TOGETHER at most about {Math.Max(6, clipSeconds * 2)} words, spoken calmly within roughly {clipSeconds} seconds. Count the words; if over, cut ruthlessly.
+- EMOTION: give every clip a one-word `mood` (sad, hopeful, tender, lonely, warm, anxious, joyful, calm, bittersweet, serious, longing…); it drives how the line is PERFORMED and the background music. Let the mood evolve across the clips with the arc.
+- Keep title, style, action and motionPrompt in ENGLISH (the video model needs English). ONLY narration and dialog are written in {language}'s native script."
         : @"AUDIO:
 - Set every clip's narration AND dialog to an empty string. The user turned voiceover off.";
 
@@ -1475,8 +1551,8 @@ Return ONE JSON object, no markdown, exactly this shape:
       ""action"": ""<one sentence: the single physical action in THIS clip>"",
       ""camera"": ""<one short phrase: camera move, e.g. 'slow push-in'>"",
       ""motionPrompt"": ""<40-110 words, ENGLISH. Name the present character(s) and briefly restate their locked look, place them in the named location, then describe the SINGLE physical action + camera move over {clipSeconds} seconds with realistic physics and natural human timing. ALWAYS state the character's facial expression/emotion; if this clip has a dialog line, say the character is speaking with natural lip movement and matching expression (do NOT write the spoken words). End with 'No on-screen text, captions, or watermarks.'>"",
-      ""narration"": ""<{language} narrator voiceover line for this clip, present tense, short>"",
-      ""dialog"": ""<{language} words a character speaks on screen in this clip — spoken words only, no name prefix; empty string if no one speaks>"",
+      ""narration"": ""<{language} narrator voiceover for THIS clip in a STORY film — the storyteller voice carrying meaning/feeling; EMPTY STRING for conversation films and for any beat the dialogue already carries>"",
+      ""dialog"": ""<{language} words a character speaks on screen in THIS clip — spoken words only, no name prefix; empty string when no one speaks this beat>"",
       ""speaker"": ""<the cast id of the single character who speaks `dialog` in this clip; empty string when dialog is empty>"",
       ""mood"": ""<ONE English word for this clip's emotional tone, used to colour the voice delivery: e.g. sad, hopeful, tender, lonely, warm, anxious, joyful, calm, bittersweet, serious, longing>"",
       ""endState"": ""<one sentence: what the last frame shows>""
@@ -1487,11 +1563,11 @@ Return ONE JSON object, no markdown, exactly this shape:
 Output JSON only. Define every character in `cast` and every place in `locations`. Exactly {clipCount} clips, each listing its characters + location.";
 
     var creativeLine = (narrate && !string.IsNullOrWhiteSpace(dialogDirection))
-        ? $"\n\nDialogue / creative direction to build the WHOLE film around: \"{dialogDirection}\" — write every spoken dialog line and the narration in {language}'s native script."
+        ? $"\n\nDialogue / creative direction to build the WHOLE film around: \"{dialogDirection}\" — weave it through the narration and the spoken lines, in {language}'s native script."
         : "";
     var user = $@"User film idea: {req.Prompt}{creativeLine}
 
-Cast the characters and locations this idea needs (support multiple characters), then produce the {clipCount}-clip storyboard ({clipSeconds}s per clip, {clipCount * clipSeconds}s total, aspect {size}) as ONE continuous, cinematic story — a single physically-plausible action per clip performed with readable facial expression and natural acting, each clip listing which cast members and location appear{(narrate ? $", plus a short {language} narrator NARRATION line and (when a character speaks) a {language} DIALOG line per clip — all in {language}'s native script, in sync with that clip's action" : ", with narration and dialog left empty")}. Output JSON only.";
+Cast the characters and locations this idea needs (support multiple characters), then produce the {clipCount}-clip storyboard ({clipSeconds}s per clip, {clipCount * clipSeconds}s total, aspect {size}) as ONE continuous, cinematic story — a single physically-plausible action per clip performed with readable facial expression and natural acting, each clip listing which cast members and location appear{(narrate ? $", plus per-clip audio chosen by the film's mode — for a STORY a {language} NARRATOR voiceover (with sparse {language} dialogue at key beats), for a CONVERSATION alternating {language} DIALOG and no narration — in {language}'s native script, in sync with each clip's action" : ", with narration and dialog left empty")}. Output JSON only.";
 
     var client = hf.CreateClient();
     client.Timeout = TimeSpan.FromSeconds(90);

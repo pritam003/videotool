@@ -395,6 +395,7 @@ function Library({ refreshKey, onSelect }) {
   const [videos, setVideos] = useState([]);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
+  const [deleting, setDeleting] = useState("");
   const load = useCallback(async () => {
     setLoading(true); setErr("");
     try {
@@ -403,6 +404,18 @@ function Library({ refreshKey, onSelect }) {
       setVideos(j.videos || []);
     } catch (e) { setErr(e.message); }
     finally { setLoading(false); }
+  }, []);
+  const del = useCallback(async (v) => {
+    if (!window.confirm("Delete this video permanently?")) return;
+    setDeleting(v.name);
+    try {
+      const path = v.name.split("/").map(encodeURIComponent).join("/");
+      const r = await fetch("/api/videos/" + path, { method: "DELETE" });
+      await jsonOrThrow(r);
+      setVideos(prev => prev.filter(x => x.name !== v.name));
+      toast("Video deleted");
+    } catch (e) { toast("Delete failed: " + (e.message || "").slice(0, 140), true); }
+    finally { setDeleting(""); }
   }, []);
   useEffect(() => { load(); }, [load, refreshKey]);
   return html`
@@ -417,17 +430,26 @@ function Library({ refreshKey, onSelect }) {
       ${!loading && videos.length === 0 && html`<div class="muted small">No videos yet. Generate one above.</div>`}
       <div class="grid">
         ${videos.map(v => html`
-          <button
-            type="button"
+          <div
             class="clip"
             key=${v.name}
+            role="button"
+            tabindex="0"
+            style=${{position:"relative",cursor:"pointer"}}
             title=${v.name + " — click to load in preview"}
-            onClick=${() => onSelect && onSelect(v)}>
+            onClick=${() => onSelect && onSelect(v)}
+            onKeyDown=${e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onSelect && onSelect(v); } }}>
             <video src=${v.url} muted preload="metadata"
               onMouseEnter=${e => { try { e.currentTarget.currentTime = 0.1; e.currentTarget.play(); } catch{} }}
               onMouseLeave=${e => { e.currentTarget.pause(); }}></video>
             <div class="name">${new Date(v.createdOn || v.lastModified).toLocaleString()}</div>
-          </button>
+            <button type="button" title="Delete this video" aria-label="Delete video"
+              disabled=${deleting === v.name}
+              onClick=${e => { e.stopPropagation(); del(v); }}
+              style=${{position:"absolute",top:6,right:6,border:"none",borderRadius:6,cursor:"pointer",background:"rgba(0,0,0,.6)",color:"#fff",fontSize:13,lineHeight:1,padding:"4px 6px"}}>
+              ${deleting === v.name ? "…" : "🗑"}
+            </button>
+          </div>
         `)}
       </div>
     </div>
