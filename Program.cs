@@ -1394,29 +1394,70 @@ Narration line to embed verbatim (already in {langName}, distribute across segme
 Plan the {segmentCount}-segment arc as JSON now.";
 
     var client = hf.CreateClient();
-    client.Timeout = TimeSpan.FromSeconds(90);
-    using var chatMsg = new HttpRequestMessage(HttpMethod.Post,
-        $"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=2024-10-21");
-    chatMsg.Headers.Add("api-key", key);
-    var payload = new
+    // Extended timeout for Azure OpenAI calls that may take 3-5 minutes on slow/loaded endpoints.
+    client.Timeout = TimeSpan.FromSeconds(600);
+    
+    // Retry up to 5 times with exponential backoff for transient errors
+    System.Text.Json.JsonDocument? chatDoc = null;
+    for (int attempt = 1; attempt <= 5 && chatDoc is null; attempt++)
     {
-        messages = new object[] {
-            new { role = "system", content = sys },
-            new { role = "user",   content = userMsg }
-        },
-        // gpt-5-mini doesn't support `max_tokens` or non-default `temperature`.
-        max_completion_tokens = 2400,
-        response_format = new { type = "json_object" }
-    };
-    chatMsg.Content = new StringContent(
-        System.Text.Json.JsonSerializer.Serialize(payload),
-        Encoding.UTF8, "application/json");
-    using var chatResp = await client.SendAsync(chatMsg, ct);
-    var chatBody = await chatResp.Content.ReadAsStringAsync(ct);
-    if (!chatResp.IsSuccessStatusCode)
-        return Results.Problem($"Enhance failed ({(int)chatResp.StatusCode}): {chatBody}");
-
-    using var chatDoc = System.Text.Json.JsonDocument.Parse(chatBody);
+        try
+        {
+            using var chatMsg = new HttpRequestMessage(HttpMethod.Post,
+                $"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=2024-10-21");
+            chatMsg.Headers.Add("api-key", key);
+            var payload = new
+            {
+                messages = new object[] {
+                    new { role = "system", content = sys },
+                    new { role = "user",   content = userMsg }
+                },
+                // gpt-4o-mini doesn't support `max_tokens` or non-default `temperature`.
+                max_completion_tokens = 2400,
+                response_format = new { type = "json_object" }
+            };
+            chatMsg.Content = new StringContent(
+                System.Text.Json.JsonSerializer.Serialize(payload),
+                Encoding.UTF8, "application/json");
+            using var chatResp = await client.SendAsync(chatMsg, ct);
+            var chatBody = await chatResp.Content.ReadAsStringAsync(ct);
+            
+            if (!chatResp.IsSuccessStatusCode)
+            {
+                var statusCode = (int)chatResp.StatusCode;
+                var isTransient = statusCode == 429 || statusCode == 408 || statusCode == 500 || statusCode == 502 || statusCode == 503 || statusCode == 504;
+                if (isTransient && attempt < 5)
+                {
+                    // Exponential backoff: 1s, 2s, 4s, 8s, 16s
+                    var delayMs = (int)Math.Pow(2, attempt - 1) * 1000;
+                    await Task.Delay(delayMs, ct);
+                    continue;
+                }
+                return Results.Problem($"Enhance failed ({statusCode}): {chatBody}");
+            }
+            
+            chatDoc = System.Text.Json.JsonDocument.Parse(chatBody);
+        }
+        catch (TaskCanceledException) when (attempt < 5)
+        {
+            // Timeout — apply exponential backoff and retry
+            var delayMs = (int)Math.Pow(2, attempt - 1) * 1000;
+            await Task.Delay(delayMs, ct);
+            continue;
+        }
+        catch (Exception ex) when (attempt < 5 && !ct.IsCancellationRequested)
+        {
+            // Other transient errors — try again with backoff
+            var delayMs = (int)Math.Pow(2, attempt - 1) * 1000;
+            await Task.Delay(delayMs, ct);
+            continue;
+        }
+    }
+    
+    if (chatDoc is null)
+        return Results.Problem("Enhance failed: Could not get response from Azure OpenAI after 5 retries");
+    
+    // Continue with parsing
     var rawContent = chatDoc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString()?.Trim() ?? "{}";
 
     // Parse the structured plan. If parsing fails, fall back to returning rawContent as the flat prompt.
@@ -1593,7 +1634,9 @@ Output JSON only. Define every character in `cast` and every place in `locations
 Cast the characters and locations this idea needs (support multiple characters), then produce the {clipCount}-clip storyboard ({clipSeconds}s per clip, {clipCount * clipSeconds}s total, aspect {size}) as ONE continuous, cinematic story — a single physically-plausible action per clip performed with readable facial expression and natural acting, each clip listing which cast members and location appear{(narrate ? $", plus per-clip audio chosen by the film's mode — for a STORY a {language} NARRATOR voiceover (with sparse {language} dialogue at key beats), for a CONVERSATION alternating {language} DIALOG and no narration — in {language}'s native script, in sync with each clip's action" : ", with narration and dialog left empty")}. Output JSON only.";
 
     var client = hf.CreateClient();
-    client.Timeout = TimeSpan.FromSeconds(90);
+    // Extended timeout for Azure OpenAI calls that may take 3-5 minutes on slow/loaded endpoints.
+    // Retry logic below handles transient 504s with exponential backoff.
+    client.Timeout = TimeSpan.FromSeconds(600);
 
     object BuildFallbackStoryboard()
     {
@@ -1671,12 +1714,13 @@ Cast the characters and locations this idea needs (support multiple characters),
     }
 
     // The storyboard JSON is large (full cast + per-clip motionPrompt + native-script
-    // narration/dialog) and gpt-5-mini is a reasoning model, so a single call can
-    // occasionally come back empty/truncated/unparseable on a transient hiccup. Try
-    // twice before dropping to the bland fallback (which carries no dialogue).
+    // narration/dialog) and gpt-4o-mini is a reasoning model, so a single call can
+    // occasionally come back empty/truncated/unparseable on a transient hiccup.
+    // Retry up to 5 times with exponential backoff (1s, 2s, 4s, 8s, 16s) to handle
+    // 504 Gateway Timeouts, 429 Too Many Requests, and other transient AOAI errors.
     //
     // Benign ideas (e.g. an adult and a child in an innocent scene) sometimes trip the
-    // Azure content filter. On a filter block we retry ONCE with `softUser` — an explicitly
+    // Azure content filter. On a filter block we retry with `softUser` — an explicitly
     // WHOLESOME reframing of the same idea. This only ever makes the request tamer (it can
     // never push genuinely unsafe content through), so it rescues false positives without
     // bypassing moderation.
@@ -1686,7 +1730,9 @@ Produce the {clipCount}-clip storyboard ({clipSeconds}s per clip, {clipCount * c
 
     System.Text.Json.Nodes.JsonNode? story = null;
     bool soften = false;
-    for (int attempt = 1; attempt <= 3 && story is null; attempt++)
+    int maxAttempts = 5;
+    int maxFilterAttempts = 2;
+    for (int attempt = 1; attempt <= maxAttempts && story is null; attempt++)
     {
         string body;
         try
@@ -1708,21 +1754,44 @@ Produce the {clipCount}-clip storyboard ({clipSeconds}s per clip, {clipCount * c
             body = await resp.Content.ReadAsStringAsync(ct);
             if (!resp.IsSuccessStatusCode)
             {
-                if (((int)resp.StatusCode == 429 || (int)resp.StatusCode >= 500) && attempt < 3) continue;
-                if ((int)resp.StatusCode == 400 &&
+                var statusCode = (int)resp.StatusCode;
+                var isTransient = statusCode == 429 || statusCode == 408 || statusCode == 500 || statusCode == 502 || statusCode == 503 || statusCode == 504;
+                if (isTransient && attempt < maxAttempts)
+                {
+                    // Exponential backoff: 1s, 2s, 4s, 8s, 16s
+                    var delayMs = (int)Math.Pow(2, attempt - 1) * 1000;
+                    await Task.Delay(delayMs, ct);
+                    continue;
+                }
+                if (statusCode == 400 &&
                     (body.Contains("content_filter") || body.Contains("ResponsibleAIPolicy")))
                 {
-                    // First filter block → retry once with the wholesome reframing.
-                    if (!soften && attempt < 3) { soften = true; continue; }
+                    // Content filter block → retry with the wholesome reframing (once).
+                    if (!soften && maxFilterAttempts > 1)
+                    {
+                        soften = true;
+                        maxFilterAttempts--;
+                        continue;
+                    }
                     return Results.Problem(statusCode: 422,
                         title: "Story blocked by content policy",
                         detail: "This idea was blocked by the content safety policy even after an automatic wholesome reframing. Try rephrasing the sensitive part — for example, state ages explicitly and make every interaction clearly innocent.");
                 }
-                return Results.Problem($"Storyboard failed ({(int)resp.StatusCode}): {body}");
+                return Results.Problem($"Storyboard failed ({statusCode}): {body}");
             }
         }
-        catch (Exception) when (attempt < 3 && !ct.IsCancellationRequested)
+        catch (TaskCanceledException) when (attempt < maxAttempts)
         {
+            // Timeout or cancellation — apply exponential backoff and retry
+            var delayMs = (int)Math.Pow(2, attempt - 1) * 1000;
+            await Task.Delay(delayMs, ct);
+            continue;
+        }
+        catch (Exception ex) when (attempt < maxAttempts && !ct.IsCancellationRequested)
+        {
+            // Other transient errors — try again with backoff
+            var delayMs = (int)Math.Pow(2, attempt - 1) * 1000;
+            await Task.Delay(delayMs, ct);
             continue;
         }
 
