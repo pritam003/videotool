@@ -1044,14 +1044,15 @@ function App() {
         setScProgress(p => p.map(x => x.index === clip.index ? { ...x, status: "rendering" } : x));
         setStatus({ phase: "running", pct: basePct, label: `${label}: ${clip.title || "rendering"}` });
 
-        // Seed selection. Clip 1 — and any clip that INTRODUCES a character not in the
-        // previous shot — is seeded from the canonical casting reference so the new face
-        // is correct. Every other clip is seeded STRICTLY from the previous clip's last
-        // frame so motion + scene continue seamlessly (the user's 5s→5s iteration).
-        const prevChars = prevClip ? new Set(prevClip.characters || []) : new Set();
-        const introducesNew = (clip.characters || []).some(id => !prevChars.has(id));
+        // Seed selection. The casting image only LOCKS THE FACE — it is NOT the start of
+        // every clip. ONLY the first clip starts from the casting reference (to inject the
+        // cast's generated/uploaded face). EVERY later clip starts from the PREVIOUS clip's
+        // last scene/frame, so the video continues from where it left off (never restarts as
+        // the portrait) while the cast keeps that same face — reinforced by the locked face
+        // descriptions restated in every prompt. We only fall back to the casting reference
+        // if last-frame extraction failed for the previous clip.
         let startImage, seedKind;
-        if (i === 0 || introducesNew || !prevFrameName) {
+        if (i === 0 || !prevFrameName) {
           startImage = await clipStartImage(clip, scStory, castMap, label);
           seedKind = "casting";
           if (!startImage) throw new Error(`${label}: no character reference available — generate the cast first`);
@@ -1181,10 +1182,11 @@ function App() {
           <h3 style=${{display:"flex",alignItems:"center",gap:8}}>🎬 Story Chain <span class="pill ok small">I2V continuation</span></h3>
           <p class="muted small" style=${{marginTop:-4}}>
             Idea → pick a voiceover (script + narration are written together, in the same
-            language, fully in sync) → cast every character in parallel → then render the clip
-            chain, where each 5s is seeded from the previous clip's last frame plus the locked
-            cast, and fed the previous + current script and narration so the story stays
-            continuous. ${`${scClipCount} clips · ${scClipSec}s each.`}
+            language, fully in sync) → cast every character in parallel → then render the chain:
+            the first clip locks in the cast's face, and every later 5s starts from the previous
+            clip's last scene (not the casting portrait) while keeping that same face, fed the
+            previous + current script and narration so the story stays continuous.
+            ${` ${scClipCount} clips · ${scClipSec}s each.`}
           </p>
           <div class="stack">
             <!-- STEP 1: story idea → storyboard -->
