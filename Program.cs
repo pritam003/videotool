@@ -1513,6 +1513,83 @@ Plan the {segmentCount}-segment arc as JSON now.";
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Generate Story Idea: AI-powered story suggestion from user input
+// ─────────────────────────────────────────────────────────────────────────────
+app.MapPost("/api/generate-story-idea", async (
+    [FromBody] JsonElement req,
+    IHttpClientFactory hf,
+    IConfiguration cfg,
+    CancellationToken ct) =>
+{
+    var userInput = req.GetProperty("userInput").GetString() ?? "";
+    if (string.IsNullOrWhiteSpace(userInput))
+        return Results.BadRequest(new { error = "userInput is required" });
+
+    var endpoint = Cfg(cfg, "AOAI_ENDPOINT").TrimEnd('/');
+    var key = Cfg(cfg, "AOAI_KEY");
+    var deployment = cfg["CHAT_DEPLOYMENT"] ?? "gpt-4o-mini";
+
+    var systemPrompt = @"You are a creative film director and storyteller. The user will give you a brief story idea or concept. 
+Your job is to expand it into a compelling, detailed story premise suitable for a short film (30-60 seconds).
+
+Return a SINGLE paragraph (3-4 sentences) that:
+1. Expands the user's idea with vivid, cinematic details
+2. Establishes the main characters, setting, and central conflict/emotion
+3. Hints at the story arc (beginning, tension, resolution)
+4. Is written in an inspiring, visual style that feels like a film treatment
+
+Keep it concise and filmable — suitable for a short video.";
+
+    var userPrompt = $@"Expand this story idea into a compelling short film premise:
+
+""{userInput}""
+
+Write it as a vivid, single paragraph film treatment.";
+
+    try
+    {
+        var client = hf.CreateClient();
+        var reqBody = new
+        {
+            messages = new[]
+            {
+                new { role = "system", content = systemPrompt },
+                new { role = "user", content = userPrompt }
+            },
+            temperature = 0.8m,
+            max_tokens = 250,
+            top_p = 0.9m
+        };
+
+        using var msg = new HttpRequestMessage(HttpMethod.Post,
+            $"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=2024-08-01-preview");
+        msg.Headers.Add("api-key", key);
+        msg.Content = new StringContent(JsonSerializer.Serialize(reqBody), Encoding.UTF8, "application/json");
+        using var resp = await client.SendAsync(msg, ct);
+        var body = await resp.Content.ReadAsStringAsync(ct);
+        
+        if (!resp.IsSuccessStatusCode)
+        {
+            Log(dbg, "warn", $"generate-story-idea AOAI call failed: {(int)resp.StatusCode} - {body.Slice(0, 200)}");
+            return Results.Ok(new { suggestion = userInput }); // graceful fallback
+        }
+
+        using var doc = JsonDocument.Parse(body);
+        var suggestion = (doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString() ?? "").Trim();
+
+        if (string.IsNullOrWhiteSpace(suggestion))
+            suggestion = userInput; // fallback
+
+        return Results.Ok(new { suggestion });
+    }
+    catch (Exception ex)
+    {
+        Log(dbg, "warn", $"generate-story-idea failed: {ex.Message.Slice(0, 100)}");
+        return Results.Ok(new { suggestion = userInput }); // graceful fallback
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Storyboard: story-driven per-clip prompts for the I2V continuation chain.
 //
 // The chain renders N = ceil(total / clipSeconds) clips of `clipSeconds` each

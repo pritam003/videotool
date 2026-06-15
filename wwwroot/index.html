@@ -640,11 +640,40 @@ function App() {
   const voiceSuggestStoryRef = useRef(null); // story we've already auto-suggested voices for
   const [, force] = useState(0);
 
-  useEffect(() => {
-    const fn = () => force(x => x + 1);
-    dbgListeners.add(fn);
-    return () => dbgListeners.delete(fn);
-  }, []);
+  // Chat state for AI story/dialog generation
+  const [chatMessages, setChatMessages] = useState([{ role: "assistant", text: "💬 Hi! Describe your story idea, and I'll help you write a compelling narrative and dialogues. Examples: 'A lonely robot finds friendship', 'Two rivals discover a secret', 'A chef's worst day turns magical'." }]);
+  const [chatInput, setChatInput] = useState("");
+  const [chatLoading, setChatLoading] = useState(false);
+
+  async function sendChatMessage() {
+    if (!chatInput.trim() || chatLoading) return;
+    const userMsg = chatInput.trim();
+    setChatInput("");
+    setChatMessages(prev => [...prev, { role: "user", text: userMsg }]);
+    setChatLoading(true);
+    try {
+      const r = await fetch("/api/generate-story-idea", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ userInput: userMsg })
+      });
+      const j = await jsonOrThrow(r);
+      const suggestion = j.suggestion || "";
+      setChatMessages(prev => [...prev, { role: "assistant", text: suggestion }]);
+      dbg("ok", "story suggestion generated");
+    } catch (e) {
+      setChatMessages(prev => [...prev, { role: "assistant", text: `❌ Error: ${e.message.slice(0, 100)}` }]);
+    } finally { setChatLoading(false); }
+  }
+
+  function applyStoryToForm(suggestion) {
+    if (suggestion.trim()) {
+      setScPrompt(suggestion);
+      setWizStep(1);
+      toast("Story idea applied! Review in step ① and continue.");
+    }
+  }
+
+
 
   // load voices
   useEffect(() => {
@@ -1623,6 +1652,41 @@ function App() {
       ` : html`
       <!-- LEFT: Compose -->
       <div key="studio-left">
+        <!-- AI Story/Dialog Chat -->
+        <div class="card" style=${{background:"linear-gradient(135deg, var(--surface) 0%, var(--surface-2) 100%)", borderColor:"#6366f1", borderWidth:1, borderStyle:"solid"}}>
+          <h3 style=${{display:"flex",alignItems:"center",gap:8}}>✨ AI Story Builder</h3>
+          <div style=${{display:"flex",flexDirection:"column",gap:8,maxHeight:"280px",overflowY:"auto",marginBottom:10,padding:"8px",background:"var(--surface-2)",borderRadius:"var(--radius-sm)"}}>
+            ${chatMessages.map((msg, i) => html`
+              <div key=${i} style=${{display:"flex",flexDirection:"column",gap:4,alignItems:msg.role==="user"?"flex-end":"flex-start"}}>
+                <div style=${{maxWidth:"85%",padding:"8px 12px",borderRadius:"var(--radius-sm)",background:msg.role==="user"?"var(--accent)":"var(--surface)",color:msg.role==="user"?"#fff":"var(--text)",fontSize:13,lineHeight:1.4,wordWrap:"break-word",whiteSpace:"pre-wrap"}}>
+                  ${msg.text}
+                </div>
+              </div>
+            `)}
+            ${chatLoading && html`
+              <div style=${{display:"flex",gap:4,alignItems:"center",color:"var(--muted)",fontSize:12}}>
+                <span>⏳ Thinking</span>
+                <span style=${{animation:"spinner 1s linear infinite"}}>⠋</span>
+              </div>
+            `}
+          </div>
+          <div style=${{display:"flex",gap:6,flexDirection:"column"}}>
+            <textarea rows="2" placeholder="e.g., 'A lonely robot finds friendship' or 'Two rivals discover a secret'" value=${chatInput}
+              onInput=${e => setChatInput(e.target.value)}
+              onKeyDown=${e => { if (e.key==="Enter" && !e.shiftKey && !chatLoading) { e.preventDefault(); sendChatMessage(); } }}
+              style=${{fontSize:12,fontFamily:"inherit"}}></textarea>
+            <div style=${{display:"flex",gap:6,flexWrap:"wrap"}}>
+              <button class="primary small" onClick=${sendChatMessage} disabled=${!chatInput.trim()||chatLoading}>
+                ${chatLoading?"Generating...":"Get Story Idea"}
+              </button>
+              ${chatMessages.length > 1 && html`
+                <button class="ghost small" onClick=${() => { const lastAssistant = [...chatMessages].reverse().find(m => m.role === "assistant"); if (lastAssistant) applyStoryToForm(lastAssistant.text.replace(/^[✨❌]/,"").trim()); }} title="Apply last suggestion">Apply Story</button>
+              `}
+            </div>
+          </div>
+        </div>
+
+        <!-- Film Wizard Card -->
         <div class="card" style=${{borderColor:"var(--accent)",borderWidth:1,borderStyle:"solid"}}>
           <h3 style=${{display:"flex",alignItems:"center",gap:8}}>🎬 Make a film <span class="pill ok small">step ${wizStep}/5</span></h3>
           <div style=${{display:"flex",gap:4,flexWrap:"wrap",margin:"6px 0 12px"}}>
@@ -1894,37 +1958,6 @@ function App() {
             </div>
           </div>
         </div>
-
-        <!-- RENDER QUEUE (durable background jobs) -->
-        <div class="card">
-          <h3 style=${{display:"flex",alignItems:"center",gap:8}}>🎞️ Render queue ${jobs.length > 0 && html`<span class="pill">${jobs.length}</span>`}</h3>
-          ${jobs.length === 0
-            ? html`<p class="muted small">No films yet. Build one on the left and submit — it renders here in the background while you start the next.</p>`
-            : html`<div class="stack" style=${{gap:8}}>
-                ${jobs.map(j => {
-                  const active = j.status === "queued" || j.status === "running";
-                  const pillCls = j.status === "succeeded" ? "ok" : (j.status === "failed" || j.status === "interrupted") ? "err" : "";
-                  return html`
-                    <div key=${j.id} style=${{border:"1px solid var(--border)",borderRadius:"var(--radius-sm)",padding:10,background:"var(--surface-2)"}}>
-                      <div style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
-                        <strong style=${{flex:"1 1 120px",fontSize:13,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}} title=${j.title}>${j.title || "Untitled"}</strong>
-                        <span class=${"pill small " + pillCls}>${j.status}</span>
-                        ${active && html`<button class="ghost small" onClick=${() => cancelJob(j.id)}>✕ Cancel</button>`}
-                      </div>
-                      ${j.label && html`<div class="muted small" style=${{margin:"4px 0"}}>${j.label}</div>`}
-                      ${active && html`<div class="progress"><div style=${{width:(j.pct || 0) + "%"}}></div></div>`}
-                      ${j.resultUrl && html`
-                        <video src=${j.resultUrl} controls loop playsinline style=${{width:"100%",borderRadius:6,marginTop:6}}></video>
-                        <div class="meta" style=${{flexWrap:"wrap"}}>
-                          <a href=${j.resultUrl} target="_blank" rel="noopener">download ↗</a>
-                          <span class="muted small">${j.narrate ? "voiced" : "silent"} · ${j.size || ""}</span>
-                        </div>
-                      `}
-                      ${j.error && !j.resultUrl && html`<div class="muted small" style=${{color:"#ef4444"}}>${j.error}</div>`}
-                    </div>`;
-                })}
-              </div>`}
-        </div>
       </div>
 
       <!-- RIGHT: Preview (the current film) -->
@@ -1959,6 +1992,37 @@ function App() {
               <span>${scClipSec}s × ${outs.length} · ${scSize}</span>
             </div>
           `}
+        </div>
+
+        <!-- RENDER QUEUE (background jobs) -->
+        <div class="card">
+          <h3 style=${{display:"flex",alignItems:"center",gap:8}}>🎞️ Render queue ${jobs.length > 0 && html`<span class="pill">${jobs.length}</span>`}</h3>
+          ${jobs.length === 0
+            ? html`<p class="muted small">No films rendering yet. Build one on the left and submit — it renders here in the background while you start the next.</p>`
+            : html`<div class="stack" style=${{gap:8}}>
+                ${jobs.map(j => {
+                  const active = j.status === "queued" || j.status === "running";
+                  const pillCls = j.status === "succeeded" ? "ok" : (j.status === "failed" || j.status === "interrupted") ? "err" : "";
+                  return html`
+                    <div key=${j.id} style=${{border:"1px solid var(--border)",borderRadius:"var(--radius-sm)",padding:10,background:"var(--surface-2)"}}>
+                      <div style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                        <strong style=${{flex:"1 1 120px",fontSize:13,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}} title=${j.title}>${j.title || "Untitled"}</strong>
+                        <span class=${"pill small " + pillCls}>${j.status}</span>
+                        ${active && html`<button class="ghost small" onClick=${() => cancelJob(j.id)}>✕ Cancel</button>`}
+                      </div>
+                      ${j.label && html`<div class="muted small" style=${{margin:"4px 0"}}>${j.label}</div>`}
+                      ${active && html`<div class="progress"><div style=${{width:(j.pct || 0) + "%"}}></div></div>`}
+                      ${j.resultUrl && html`
+                        <video src=${j.resultUrl} controls loop playsinline style=${{width:"100%",borderRadius:6,marginTop:6}}></video>
+                        <div class="meta" style=${{flexWrap:"wrap"}}>
+                          <a href=${j.resultUrl} target="_blank" rel="noopener">download ↗</a>
+                          <span class="muted small">${j.narrate ? "voiced" : "silent"} · ${j.size || ""}</span>
+                        </div>
+                      `}
+                      ${j.error && !j.resultUrl && html`<div class="muted small" style=${{color:"#ef4444"}}>${j.error}</div>`}
+                    </div>`;
+                })}
+              </div>`}
         </div>
       </div>
       `}
