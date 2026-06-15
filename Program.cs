@@ -1933,7 +1933,7 @@ Return the JSON now.";
         return Results.Ok(JsonSerializer.Deserialize<object>(result));
     
     // If all retries exhausted, return empty dialogues
-    return Results.Ok(new { dialogs = clips.Select(c => new { index = c.Index, dialog = "" }).ToList() })
+    return Results.Ok(new { dialogs = clips.Select(c => new { index = c.Index, dialog = "" }).ToList() });
 });
 
 // Audio prompter: write a spoken voiceover script for a finished Story Chain
