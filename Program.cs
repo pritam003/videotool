@@ -1274,6 +1274,7 @@ DIALOGUE (words spoken on screen):
 - The EXACT words a character speaks in THIS clip — spoken words only, NO name prefix, NO quotation marks. Give MOST clips a spoken line: any clip where a present character could plausibly speak, mutter, react or address someone gets one; even a character who is ALONE can voice a thought aloud (do NOT default to silence just because they are alone or sad). Use an empty string ONLY for the rare beat that is clearly, intentionally wordless.
 - NEVER on-the-nose: a character must NEVER state their own emotion or narrate their own action. 'I'm sad', 'I'm so happy', 'Thank you', 'I look up and play' are ALL BAD. Real people speak in SUBTEXT — imply the feeling indirectly through specific, natural, in-character words (e.g. instead of 'I'm sad' a busker might say 'Nobody stopped tonight.').
 - Across the clips the spoken lines read as ONE natural, evolving exchange with real emotion and specific, human detail — never generic pleasantries.
+- For every clip that HAS a dialog line, set `speaker` to the cast id (from `cast`) of the character who says it; use an empty string when dialog is empty.
 - {dialogGuidance}
 - Keep each line very SHORT; when a clip has BOTH narration and dialog, together they must be speakable within {clipSeconds} seconds (about {Math.Max(6, clipSeconds * 2)} words TOTAL).
 - Keep title, style, action and motionPrompt in ENGLISH (the video model needs English). ONLY the narration and dialog fields are written in {language}'s native script."
@@ -1325,6 +1326,7 @@ Return ONE JSON object, no markdown, exactly this shape:
       ""motionPrompt"": ""<40-110 words, ENGLISH. Name the present character(s) and briefly restate their locked look, place them in the named location, then describe the SINGLE physical action + camera move over {clipSeconds} seconds with realistic physics and natural human timing. ALWAYS state the character's facial expression/emotion; if this clip has a dialog line, say the character is speaking with natural lip movement and matching expression (do NOT write the spoken words). End with 'No on-screen text, captions, or watermarks.'>"",
       ""narration"": ""<{language} narrator voiceover line for this clip, present tense, short>"",
       ""dialog"": ""<{language} words a character speaks on screen in this clip — spoken words only, no name prefix; empty string if no one speaks>"",
+      ""speaker"": ""<the cast id of the single character who speaks `dialog` in this clip; empty string when dialog is empty>"",
       ""endState"": ""<one sentence: what the last frame shows>""
     }}
   ]
@@ -1369,6 +1371,7 @@ Cast the characters and locations this idea needs (support multiple characters),
                     ? "Our story begins."
                     : i == clipCount ? "And so it ends." : "The moment builds.",
                 dialog = "",
+                speaker = "",
                 endState = i == clipCount
                     ? "Final frame settles into a composed ending shot."
                     : "Final frame lands in a stable pose that can continue."
@@ -1419,8 +1422,19 @@ Cast the characters and locations this idea needs (support multiple characters),
     // narration/dialog) and gpt-5-mini is a reasoning model, so a single call can
     // occasionally come back empty/truncated/unparseable on a transient hiccup. Try
     // twice before dropping to the bland fallback (which carries no dialogue).
+    //
+    // Benign ideas (e.g. an adult and a child in an innocent scene) sometimes trip the
+    // Azure content filter. On a filter block we retry ONCE with `softUser` — an explicitly
+    // WHOLESOME reframing of the same idea. This only ever makes the request tamer (it can
+    // never push genuinely unsafe content through), so it rescues false positives without
+    // bypassing moderation.
+    var softUser = $@"Reimagine the following idea as a WHOLESOME, strictly family-friendly, non-graphic short film. Depict every character respectfully; keep all interactions clearly innocent, safe and age-appropriate; avoid any violent, sexual, self-harm or otherwise sensitive framing. Idea: {req.Prompt}{creativeLine}
+
+Produce the {clipCount}-clip storyboard ({clipSeconds}s per clip, {clipCount * clipSeconds}s total, aspect {size}) as ONE continuous, cinematic story{(narrate ? $", plus a short {language} narrator line per clip and a {language} dialog line when a character speaks, in {language}'s native script" : ", with narration and dialog left empty")}. Output JSON only.";
+
     System.Text.Json.Nodes.JsonNode? story = null;
-    for (int attempt = 1; attempt <= 2 && story is null; attempt++)
+    bool soften = false;
+    for (int attempt = 1; attempt <= 3 && story is null; attempt++)
     {
         string body;
         try
@@ -1432,7 +1446,7 @@ Cast the characters and locations this idea needs (support multiple characters),
             {
                 messages = new object[] {
                     new { role = "system", content = sys },
-                    new { role = "user",   content = user }
+                    new { role = "user",   content = soften ? softUser : user }
                 },
                 max_completion_tokens = 12000,
                 response_format = new { type = "json_object" }
@@ -1442,11 +1456,20 @@ Cast the characters and locations this idea needs (support multiple characters),
             body = await resp.Content.ReadAsStringAsync(ct);
             if (!resp.IsSuccessStatusCode)
             {
-                if (((int)resp.StatusCode == 429 || (int)resp.StatusCode >= 500) && attempt < 2) continue;
+                if (((int)resp.StatusCode == 429 || (int)resp.StatusCode >= 500) && attempt < 3) continue;
+                if ((int)resp.StatusCode == 400 &&
+                    (body.Contains("content_filter") || body.Contains("ResponsibleAIPolicy")))
+                {
+                    // First filter block → retry once with the wholesome reframing.
+                    if (!soften && attempt < 3) { soften = true; continue; }
+                    return Results.Problem(statusCode: 422,
+                        title: "Story blocked by content policy",
+                        detail: "This idea was blocked by the content safety policy even after an automatic wholesome reframing. Try rephrasing the sensitive part — for example, state ages explicitly and make every interaction clearly innocent.");
+                }
                 return Results.Problem($"Storyboard failed ({(int)resp.StatusCode}): {body}");
             }
         }
-        catch (Exception) when (attempt < 2 && !ct.IsCancellationRequested)
+        catch (Exception) when (attempt < 3 && !ct.IsCancellationRequested)
         {
             continue;
         }

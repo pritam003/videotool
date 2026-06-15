@@ -751,6 +751,13 @@ function App() {
       const story = j.story || {};
       if (!Array.isArray(story.clips) || story.clips.length === 0) throw new Error("storyboard had no clips");
       setScStory(story);
+      // Seed the editable cast from the story so the user can review it, swap in
+      // templates, edit descriptions and assign a per-character voice BEFORE casting.
+      const seedCast = (Array.isArray(story.cast) && story.cast.length
+        ? story.cast
+        : [{ id: "hero", name: "Lead", description: story.subject || scPrompt || "the main subject" }]
+      ).map(c => ({ id: c.id, name: c.name || c.id, description: c.description || "", voice: "", refName: null, previewUrl: null, status: "idle" }));
+      setScCast(seedCast);
       dbg("ok", `storyboard: "${story.title || "untitled"}" — ${story.clips.length} clips`);
       toast(`Storyboard ready — ${story.clips.length} clips telling one story`);
     } catch (e) {
@@ -945,6 +952,48 @@ function App() {
     throw new Error("GPU did not become ready to accept the image — try again.");
   }
 
+  // Predefined, production-safe cast archetypes. The user can drop one in as a new
+  // character, use one to overwrite an existing character, or just type their own
+  // description manually — all three flows feed the same editable scCast list.
+  const CAST_TEMPLATES = [
+    { label: "Young man", name: "Young man", description: "a man in his mid-20s, athletic build, warm brown skin, short black hair, expressive dark eyes, light stubble, wearing a casual jacket and jeans" },
+    { label: "Young woman", name: "Young woman", description: "a woman in her mid-20s, slim build, light brown skin, long dark wavy hair, bright eyes, wearing a simple blouse and jeans" },
+    { label: "Middle-aged man", name: "Man", description: "a man in his 40s, sturdy build, medium skin tone, neat salt-and-pepper hair, calm steady eyes, wearing a plain collared shirt" },
+    { label: "Middle-aged woman", name: "Woman", description: "a woman in her 40s, average build, medium skin tone, dark hair tied back, kind eyes, wearing a simple kurta" },
+    { label: "Elderly man", name: "Old man", description: "a man in his 70s, lean and slightly stooped, weathered tan skin, thin grey hair and a short white beard, gentle tired eyes, wearing a worn shawl" },
+    { label: "Elderly woman", name: "Old woman", description: "a woman in her 70s, small frame, soft wrinkled skin, silver hair in a neat bun, warm eyes, wearing a draped sari" },
+    { label: "Little girl", name: "Girl", description: "a girl about 7 years old, small, round cheeks, dark hair in two braids, curious bright eyes, wearing a bright cotton dress" },
+    { label: "Little boy", name: "Boy", description: "a boy about 8 years old, skinny, tousled dark hair, a gap-toothed grin, wearing a striped t-shirt and shorts" },
+    { label: "Businesswoman", name: "Executive", description: "a woman in her late 30s, poised, medium skin tone, sleek dark hair in a low bun, sharp confident eyes, wearing a tailored charcoal suit" },
+    { label: "Businessman", name: "Executive", description: "a man in his 40s, solid build, olive skin, neatly combed hair, serious expression, wearing a navy suit and tie" },
+  ];
+
+  // Append a new character to the editable cast (optionally pre-filled from a template).
+  function addCastMember(partial) {
+    setScCast(p => {
+      const base = Array.isArray(p) ? p : [];
+      let id = (partial && partial.id) || `char${base.length + 1}`;
+      while (base.some(c => c.id === id)) id += "x";
+      return [...base, {
+        id,
+        name: (partial && partial.name) || "New character",
+        description: (partial && partial.description) || "",
+        voice: "", refName: null, previewUrl: null, status: "idle"
+      }];
+    });
+  }
+  // Patch one cast member (name / description / voice). Editing the look clears its
+  // rendered reference so the user re-casts that character with the new description.
+  function updateCastMember(id, patch) {
+    const invalidates = ("name" in patch) || ("description" in patch);
+    setScCast(p => (p || []).map(c => c.id === id
+      ? { ...c, ...patch, ...(invalidates && (c.refName) ? { refName: null, previewUrl: null, status: "idle" } : {}) }
+      : c));
+  }
+  function removeCastMember(id) {
+    setScCast(p => (p || []).filter(c => c.id !== id));
+  }
+
   // Build the text prompt that renders a clean canonical portrait for one character.
   function castSnapshotPrompt(c, story) {
     const look = (c.description || "").trim();
@@ -957,11 +1006,14 @@ function App() {
   //    characters. The lead may use your uploaded image; others render from text.
   async function generateCast() {
     if (!scStory) { toast("Build a storyboard first.", true); return; }
-    let cast = Array.isArray(scStory.cast) && scStory.cast.length ? scStory.cast : null;
-    if (!cast) cast = [{ id: "hero", name: "Lead", description: scStory.subject || scPrompt || "the main subject" }];
+    // Prefer the user's edited cast (names, descriptions, templates, voices); fall back
+    // to the story's cast, then to a single lead.
+    let cast = (Array.isArray(scCast) && scCast.length) ? scCast
+      : (Array.isArray(scStory.cast) && scStory.cast.length) ? scStory.cast
+      : [{ id: "hero", name: "Lead", description: scStory.subject || scPrompt || "the main subject" }];
     cancelRef.current = false; currentJobIdRef.current = null;
     setScCasting(true);
-    setScCast(cast.map(c => ({ ...c, status: "rendering", refName: null, previewUrl: null })));
+    setScCast(cast.map(c => ({ ...c, voice: c.voice || "", status: "rendering", refName: null, previewUrl: null })));
     setStatus({ phase: "running", pct: 1, label: `casting ${cast.length} character${cast.length > 1 ? "s" : ""} in parallel…` });
     try {
       // Cast every character at once (parallel) — the user's "casting happens parallely".
@@ -1004,8 +1056,10 @@ function App() {
   // Compose a clip's text prompt: prepend the LOCKED descriptions of the
   // characters present + the location, so identity is anchored in text as well
   // as in the seed image. This reinforces consistency across the whole film.
-  function buildClipPrompt(clip, story, prevClip, narrating) {
+  function buildClipPrompt(clip, story, prevClip, narrating, castMap) {
     const castById = {}; (story.cast || []).forEach(c => castById[c.id] = c);
+    // The user-edited cast (descriptions / templates) wins over the original story cast.
+    if (castMap) Object.keys(castMap).forEach(id => { castById[id] = { ...castById[id], ...castMap[id] }; });
     const locById = {}; (story.locations || []).forEach(l => locById[l.id] = l);
     const present = (clip.characters || []).map(id => castById[id]).filter(Boolean);
     const loc = locById[clip.location];
@@ -1045,6 +1099,7 @@ function App() {
     }
     if (present.length === 1) return castMap[present[0]].refName;
     const castById = {}; (story.cast || []).forEach(c => castById[c.id] = c);
+    if (castMap) Object.keys(castMap).forEach(id => { castById[id] = { ...castById[id], ...castMap[id] }; });
     const locById = {}; (story.locations || []).forEach(l => locById[l.id] = l);
     const who = present.map(id => { const c = castById[id]; return c ? `${c.name || c.id}: ${c.description || ""}` : id; }).join(". ");
     const loc = locById[clip.location];
@@ -1106,7 +1161,7 @@ function App() {
           setScProgress(p => p.map(x => x.index === clip.index ? { ...x, startUrl: prevFramePreview } : x));
         }
 
-        const thePrompt = buildClipPrompt(clip, scStory, prevClip, narrating);
+        const thePrompt = buildClipPrompt(clip, scStory, prevClip, narrating, castMap);
         dbg("info", `${label} seed=${seedKind}`);
         const job = await submitI2V(startImage, thePrompt, clipSec, label);
         pushSubscribeForJob(job.id, label);
@@ -1142,7 +1197,10 @@ function App() {
         if (narrating && !cancelRef.current) {
           const nLine = (clip.narration || "").trim();
           const dLine = (clip.dialog || "").trim();
-          const dVoice = scDialogVoice || voice;
+          // Voice the dialogue in the SPEAKING character's own voice when we know who it is
+          // (clip.speaker, or the sole present character), else the default character voice.
+          const speakerId = clip.speaker || ((clip.characters || []).length === 1 ? clip.characters[0] : "");
+          const dVoice = (speakerId && castMap[speakerId] && castMap[speakerId].voice) || scDialogVoice || voice;
           try {
             const tracks = [];
             if (dLine) {
@@ -1305,7 +1363,7 @@ function App() {
                     </select>
                   </div>
                   <div>
-                    <label>Character voice <span class="muted small">· spoken dialogue (defaults to the narrator voice)</span></label>
+                    <label>Default character voice <span class="muted small">· dialogue fallback when a cast member has no voice set in ③. Defaults to the narrator voice.</span></label>
                     <select value=${scDialogVoice} onChange=${e => setScDialogVoice(e.target.value)}>
                       <option value="">Same as narrator</option>
                       ${Object.entries(voiceGroups).map(([g, list]) => list.length > 0 && html`
@@ -1355,10 +1413,10 @@ function App() {
                   <span class="pill">${scStory.clips.length} clips</span>
                 </div>
                 ${scStory.logline && html`<div class="muted small" style=${{padding:"0 12px 8px"}}>${scStory.logline}</div>`}
-                ${(Array.isArray(scStory.cast) && scStory.cast.length > 0) && html`
+                ${(scCast.length > 0 || (Array.isArray(scStory.cast) && scStory.cast.length > 0)) && html`
                   <div class="muted small" style=${{padding:"0 12px 8px",display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
                     <span style=${{opacity:.7}}>Cast:</span>
-                    ${scStory.cast.map((c,ci) => html`<span class="pill small" key=${ci} title=${c.description||""}>${c.name || c.id}</span>`)}
+                    ${(scCast.length ? scCast : scStory.cast).map((c,ci) => html`<span class="pill small" key=${ci} title=${c.description||""}>${c.name || c.id}${c.voice ? " 🔊" : ""}</span>`)}
                     ${Array.isArray(scStory.locations) && scStory.locations.map((l,li) => html`<span class="pill small" key=${"l"+li} title=${l.description||""} style=${{borderStyle:"dashed"}}>@ ${l.name || l.id}</span>`)}
                   </div>
                 `}
@@ -1371,7 +1429,7 @@ function App() {
                     </div>
                     ${((Array.isArray(c.characters) && c.characters.length > 0) || c.location) && html`
                       <div style=${{display:"flex",gap:4,flexWrap:"wrap",padding:"0 0 6px 30px"}}>
-                        ${(c.characters||[]).map((id,ci) => html`<span class="pill small" key=${ci}>${id}</span>`)}
+                        ${(c.characters||[]).map((id,ci) => { const nm = (scCast.find(x => x.id === id) || {}).name || id; return html`<span class="pill small" key=${ci} title=${c.speaker===id ? "speaks in this clip" : ""}>${nm}${c.speaker===id ? " 🔊" : ""}</span>`; })}
                         ${c.location && html`<span class="pill small" style=${{borderStyle:"dashed"}}>@ ${c.location}</span>`}
                       </div>
                     `}
@@ -1394,10 +1452,9 @@ function App() {
 
             <!-- STEP 2: cast (canonical character references) -->
             <div>
-              <label>③ Cast & locations <span class="muted small">(generated in parallel, before any clip)</span></label>
+              <label>③ Cast & locations <span class="muted small">(review the cast, then render references in parallel)</span></label>
               <p class="muted small" style=${{margin:"2px 0 8px"}}>
-                Optionally upload a photo for the lead; every other character is generated from the story.
-                Each character is rendered once and reused in every clip so identities stay locked.
+                Review the cast the story proposed below — edit any description, drop in a template, set a per-character voice, or add/remove characters. Optionally upload a photo for the lead. Each character is then rendered once and reused in every clip so identities stay locked.
               </p>
               <label class="muted small">Lead reference photo <span class="muted small">(optional)</span></label>
               <input type="file" accept="image/*" onChange=${e => pickCharImage(e.target.files[0] || null)} />
@@ -1405,6 +1462,53 @@ function App() {
                 <div style=${{marginTop:8,display:"flex",alignItems:"center",gap:10}}>
                   <img src=${scCharPreview} alt="lead" style=${{width:72,height:72,objectFit:"cover",borderRadius:"var(--radius-sm)",border:"1px solid var(--border)"}} />
                   <div class="muted small">${scCharFile?.name || ""}<br/>Used as the lead's reference.</div>
+                </div>
+              `}
+              ${scStory && scCast.length > 0 && html`
+                <div class="stack" style=${{gap:8,margin:"8px 0 4px"}}>
+                  <div class="muted small">
+                    <strong>Cast (${scCast.length})</strong> — edit a look, drop in a template, or pick a voice. Changing a description re-renders that character's reference.
+                  </div>
+                  ${scCast.map((c, i) => html`
+                    <div key=${c.id} style=${{border:"1px solid var(--border)",borderRadius:"var(--radius-sm)",padding:8,display:"flex",flexDirection:"column",gap:6,background:"var(--surface-2)"}}>
+                      <div style=${{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
+                        <span class="pill small" style=${{flex:"0 0 auto"}}>${i+1}</span>
+                        <input value=${c.name||""} placeholder="Name"
+                          onInput=${e => updateCastMember(c.id, { name: e.target.value })}
+                          style=${{flex:"1 1 110px",fontSize:13,fontWeight:600}} />
+                        <select value="" title="Replace this character with a predefined template"
+                          onChange=${e => { const t = CAST_TEMPLATES[+e.target.value]; if (t) updateCastMember(c.id, { name: t.name, description: t.description }); e.target.value=""; }}
+                          style=${{flex:"0 0 auto",fontSize:12}}>
+                          <option value="">Template…</option>
+                          ${CAST_TEMPLATES.map((t, ti) => html`<option value=${ti} key=${c.id+"t"+ti}>${t.label}</option>`)}
+                        </select>
+                        <button class="ghost small" title="Remove character" onClick=${() => removeCastMember(c.id)} style=${{flex:"0 0 auto"}}>✕</button>
+                      </div>
+                      <textarea rows="2" style=${{fontSize:12}} value=${c.description||""}
+                        placeholder="Locked look: age, build, skin tone, hair, wardrobe, distinguishing features"
+                        onInput=${e => updateCastMember(c.id, { description: e.target.value })}></textarea>
+                      ${scNarrationMode !== "off" && html`
+                        <div style=${{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
+                          <span class="muted small" style=${{flex:"0 0 auto"}}>🔊 Voice</span>
+                          <select value=${c.voice||""} onChange=${e => updateCastMember(c.id, { voice: e.target.value })} style=${{flex:"1 1 160px",fontSize:12}}>
+                            <option value="">Default character voice</option>
+                            ${Object.entries(voiceGroups).map(([g, list]) => list.length > 0 && html`
+                              <optgroup label=${g} key=${c.id+"g"+g}>
+                                ${list.map(v => html`<option value=${v.shortName} key=${c.id+v.shortName}>${v.localName || v.shortName} (${v.gender||"?"})</option>`)}
+                              </optgroup>
+                            `)}
+                          </select>
+                        </div>
+                      `}
+                    </div>
+                  `)}
+                  <div style=${{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
+                    <button class="ghost small" onClick=${() => addCastMember()}>+ Add character</button>
+                    <select value="" onChange=${e => { const t = CAST_TEMPLATES[+e.target.value]; if (t) addCastMember({ name: t.name, description: t.description }); e.target.value=""; }} style=${{fontSize:12}}>
+                      <option value="">+ Add from template…</option>
+                      ${CAST_TEMPLATES.map((t, ti) => html`<option value=${ti} key=${"add"+ti}>${t.label}</option>`)}
+                    </select>
+                  </div>
                 </div>
               `}
               <div class="btn-row" style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",marginTop:8}}>
