@@ -1508,8 +1508,60 @@ Write the voiceover now. JSON only.";
     }
 
     script = (script ?? "").Trim();
+
+    // Hard fallback: never fail the endpoint just because the model returned
+    // empty content. Build a usable script from storyboard metadata.
     if (string.IsNullOrWhiteSpace(script))
-        return Results.Problem("Narration script returned empty content.");
+    {
+        var seed = new List<string>();
+        if (!string.IsNullOrWhiteSpace(req.Title)) seed.Add(req.Title!.Trim());
+        if (!string.IsNullOrWhiteSpace(req.Logline)) seed.Add(req.Logline!.Trim());
+        if (req.Actions is { Length: > 0 })
+        {
+            seed.Add(string.Join(" ", req.Actions
+                .Where(a => !string.IsNullOrWhiteSpace(a))
+                .Take(6)
+                .Select(a => a!.Trim())));
+        }
+        var baseText = string.Join(" ", seed).Trim();
+        if (string.IsNullOrWhiteSpace(baseText))
+            baseText = string.IsNullOrWhiteSpace(req.Idea) ? "A short cinematic story unfolds from tension to resolution." : req.Idea!.Trim();
+
+        script = $"{baseText} The story builds steadily, holds emotional focus, and closes with a clear final moment.";
+    }
+
+    // Ensure the script language follows the selected voice locale.
+    var langPrefix = locale.Split('-')[0].ToLowerInvariant();
+    if (langPrefix != "en")
+    {
+        try
+        {
+            var region = Cfg(cfg, "SPEECH_REGION");
+            using var tmsg = new HttpRequestMessage(HttpMethod.Post,
+                $"https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to={Uri.EscapeDataString(langPrefix)}");
+            tmsg.Headers.Add("Ocp-Apim-Subscription-Key", key);
+            tmsg.Headers.Add("Ocp-Apim-Subscription-Region", region);
+            tmsg.Content = new StringContent(
+                JsonSerializer.Serialize(new[] { new { Text = script } }),
+                Encoding.UTF8, "application/json");
+            using var tresp = await client.SendAsync(tmsg, ct);
+            var tbody = await tresp.Content.ReadAsStringAsync(ct);
+            if (tresp.IsSuccessStatusCode)
+            {
+                using var tdoc = JsonDocument.Parse(tbody);
+                var translated = tdoc.RootElement[0].GetProperty("translations")[0].GetProperty("text").GetString();
+                if (!string.IsNullOrWhiteSpace(translated)) script = translated!.Trim();
+            }
+        }
+        catch
+        {
+            // If translation fails, keep the generated script so narration still works.
+        }
+    }
+
+    script = (script ?? "").Trim();
+    if (string.IsNullOrWhiteSpace(script))
+        script = "The scene unfolds with quiet tension, rises in motion and emotion, and resolves with a final cinematic beat.";
 
     return Results.Ok(new { script, locale, language = languageName });
 });
