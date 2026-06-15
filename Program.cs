@@ -1269,21 +1269,62 @@ app.MapPost("/api/translate", async (TranslateRequest req, IHttpClientFactory hf
     var key = Cfg(cfg, "AOAI_KEY");
     var region = Cfg(cfg, "SPEECH_REGION");
     var client = hf.CreateClient();
-    client.Timeout = TimeSpan.FromSeconds(30);
-    using var msg = new HttpRequestMessage(HttpMethod.Post,
-        $"https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to={Uri.EscapeDataString(req.To!)}");
-    msg.Headers.Add("Ocp-Apim-Subscription-Key", key);
-    msg.Headers.Add("Ocp-Apim-Subscription-Region", region);
-    msg.Content = new StringContent(
-        System.Text.Json.JsonSerializer.Serialize(new[] { new { Text = req.Text } }),
-        Encoding.UTF8, "application/json");
-    using var resp = await client.SendAsync(msg, ct);
-    var body = await resp.Content.ReadAsStringAsync(ct);
-    if (!resp.IsSuccessStatusCode)
-        return Results.Problem($"Translate failed ({(int)resp.StatusCode}): {body}");
-    using var doc = System.Text.Json.JsonDocument.Parse(body);
-    var translated = doc.RootElement[0].GetProperty("translations")[0].GetProperty("text").GetString();
-    return Results.Ok(new { translated, to = req.To });
+    client.Timeout = TimeSpan.FromSeconds(120); // Increased from 30s
+    
+    // Retry logic: 5 attempts with exponential backoff
+    for (int attempt = 1; attempt <= 5; attempt++)
+    {
+        try
+        {
+            using var msg = new HttpRequestMessage(HttpMethod.Post,
+                $"https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to={Uri.EscapeDataString(req.To!)}");
+            msg.Headers.Add("Ocp-Apim-Subscription-Key", key);
+            msg.Headers.Add("Ocp-Apim-Subscription-Region", region);
+            msg.Content = new StringContent(
+                System.Text.Json.JsonSerializer.Serialize(new[] { new { Text = req.Text } }),
+                Encoding.UTF8, "application/json");
+            
+            using var resp = await client.SendAsync(msg, ct);
+            var body = await resp.Content.ReadAsStringAsync(ct);
+            
+            if (!resp.IsSuccessStatusCode)
+            {
+                var isTransient = (int)resp.StatusCode == 429 || (int)resp.StatusCode == 408 
+                               || (int)resp.StatusCode >= 500;
+                if (isTransient && attempt < 5)
+                {
+                    await Task.Delay((int)Math.Pow(2, attempt - 1) * 1000, ct);
+                    continue;
+                }
+                return Results.Problem($"Translate failed ({(int)resp.StatusCode}): {body}");
+            }
+            
+            try
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(body);
+                var translated = doc.RootElement[0].GetProperty("translations")[0].GetProperty("text").GetString();
+                return Results.Ok(new { translated, to = req.To });
+            }
+            catch when (attempt < 5)
+            {
+                await Task.Delay((int)Math.Pow(2, attempt - 1) * 1000, ct);
+                continue;
+            }
+        }
+        catch (TaskCanceledException) when (attempt < 5)
+        {
+            await Task.Delay((int)Math.Pow(2, attempt - 1) * 1000, ct);
+            continue;
+        }
+        catch (Exception) when (attempt < 5)
+        {
+            await Task.Delay((int)Math.Pow(2, attempt - 1) * 1000, ct);
+            continue;
+        }
+    }
+    
+    // Final fallback
+    return Results.Problem("Translate failed after 5 retry attempts");
 });
 
 // Enhance: take user idea + narration + target voice/language and produce
@@ -1794,55 +1835,105 @@ Write the dialog for each clip index:
 Return the JSON now.";
 
     var client = hf.CreateClient();
-    client.Timeout = TimeSpan.FromSeconds(60);
-    using var msg = new HttpRequestMessage(HttpMethod.Post,
-        $"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=2024-10-21");
-    msg.Headers.Add("api-key", key);
-    var payload = new
+    client.Timeout = TimeSpan.FromSeconds(600); // 10 min timeout (increased from 60s)
+    
+    // Retry logic: 5 attempts with exponential backoff for transient errors
+    string? result = null;
+    for (int attempt = 1; attempt <= 5 && result is null; attempt++)
     {
-        messages = new object[] {
-            new { role = "system", content = sys },
-            new { role = "user",   content = user }
-        },
-        max_completion_tokens = 2000,
-        response_format = new { type = "json_object" }
-    };
-    msg.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
-    using var resp = await client.SendAsync(msg, ct);
-    var body = await resp.Content.ReadAsStringAsync(ct);
-    if (!resp.IsSuccessStatusCode)
-        return Results.Problem($"Dialogue failed ({(int)resp.StatusCode}): {body}");
-
-    string raw;
-    try
-    {
-        using var doc = JsonDocument.Parse(body);
-        raw = doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString()?.Trim() ?? "";
-    }
-    catch { raw = ""; }
-
-    var js = raw.IndexOf('{'); var je = raw.LastIndexOf('}');
-    if (js >= 0 && je > js) raw = raw.Substring(js, je - js + 1);
-
-    try
-    {
-        var node = System.Text.Json.Nodes.JsonNode.Parse(raw);
-        var arr = node?["dialogs"] as System.Text.Json.Nodes.JsonArray;
-        var outList = new List<object>();
-        if (arr is not null)
-            foreach (var d in arr)
+        try
+        {
+            var payload = new
             {
-                if (d is null) continue;
-                int.TryParse(d["index"]?.ToString(), out var idx);
-                var line = d["dialog"]?.ToString() ?? "";
-                outList.Add(new { index = idx, dialog = line });
+                messages = new object[] {
+                    new { role = "system", content = sys },
+                    new { role = "user",   content = user }
+                },
+                max_completion_tokens = 2000,
+                response_format = new { type = "json_object" }
+            };
+            
+            using var msg = new HttpRequestMessage(HttpMethod.Post,
+                $"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=2024-10-21");
+            msg.Headers.Add("api-key", key);
+            msg.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+            
+            using var resp = await client.SendAsync(msg, ct);
+            var body = await resp.Content.ReadAsStringAsync(ct);
+            
+            if (!resp.IsSuccessStatusCode)
+            {
+                var isTransient = (int)resp.StatusCode == 429 || (int)resp.StatusCode == 408 
+                               || (int)resp.StatusCode >= 500;
+                if (isTransient && attempt < 5)
+                {
+                    await Task.Delay((int)Math.Pow(2, attempt - 1) * 1000, ct);
+                    continue;
+                }
+                return Results.Problem($"Dialogue failed ({(int)resp.StatusCode}): {body}");
             }
-        return Results.Ok(new { dialogs = outList });
+
+            string raw;
+            try
+            {
+                using var doc = JsonDocument.Parse(body);
+                raw = doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString()?.Trim() ?? "";
+            }
+            catch { raw = ""; }
+
+            var js = raw.IndexOf('{'); var je = raw.LastIndexOf('}');
+            if (js >= 0 && je > js) raw = raw.Substring(js, je - js + 1);
+
+            try
+            {
+                var node = System.Text.Json.Nodes.JsonNode.Parse(raw);
+                var arr = node?["dialogs"] as System.Text.Json.Nodes.JsonArray;
+                var outList = new List<object>();
+                if (arr is not null)
+                {
+                    foreach (var d in arr)
+                    {
+                        if (d is null) continue;
+                        int.TryParse(d["index"]?.ToString(), out var idx);
+                        var line = d["dialog"]?.ToString() ?? "";
+                        outList.Add(new { index = idx, dialog = line });
+                    }
+                }
+                result = JsonSerializer.Serialize(new { dialogs = outList });
+            }
+            catch when (attempt < 5)
+            {
+                await Task.Delay((int)Math.Pow(2, attempt - 1) * 1000, ct);
+                continue;
+            }
+            catch
+            {
+                // Last attempt failed with unparseable JSON
+                result = JsonSerializer.Serialize(new { dialogs = clips.Select((c, i) => new { index = c.Index, dialog = "" }).ToList() });
+            }
+        }
+        catch (TaskCanceledException) when (attempt < 5)
+        {
+            await Task.Delay((int)Math.Pow(2, attempt - 1) * 1000, ct);
+            continue;
+        }
+        catch (Exception ex) when (attempt < 5)
+        {
+            await Task.Delay((int)Math.Pow(2, attempt - 1) * 1000, ct);
+            continue;
+        }
+        catch
+        {
+            // Final fallback: return empty dialogues for all clips
+            return Results.Ok(new { dialogs = clips.Select(c => new { index = c.Index, dialog = "" }).ToList() });
+        }
     }
-    catch
-    {
-        return Results.Problem("Dialogue model returned unparseable JSON.");
-    }
+
+    if (result is not null)
+        return Results.Ok(JsonSerializer.Deserialize<object>(result));
+    
+    // If all retries exhausted, return empty dialogues
+    return Results.Ok(new { dialogs = clips.Select(c => new { index = c.Index, dialog = "" }).ToList() })
 });
 
 // Audio prompter: write a spoken voiceover script for a finished Story Chain
@@ -1943,26 +2034,65 @@ Write the voiceover now. JSON only.";
     }
 
     var client = hf.CreateClient();
-    client.Timeout = TimeSpan.FromSeconds(60);
-    using var msg = new HttpRequestMessage(HttpMethod.Post,
-        $"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=2024-10-21");
-    msg.Headers.Add("api-key", key);
-    var payload = new
+    client.Timeout = TimeSpan.FromSeconds(600); // 10 min timeout (increased from 60s)
+    
+    // Retry logic: 5 attempts with exponential backoff
+    string? rawResult = null;
+    for (int attempt = 1; attempt <= 5 && rawResult is null; attempt++)
     {
-        messages = new object[] {
-            new { role = "system", content = sys },
-            new { role = "user",   content = user }
-        },
-        max_completion_tokens = 1200,
-        response_format = new { type = "json_object" }
-    };
-    msg.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
-    using var resp = await client.SendAsync(msg, ct);
-    var body = await resp.Content.ReadAsStringAsync(ct);
-    if (!resp.IsSuccessStatusCode)
-        return Results.Problem($"Narration script failed ({(int)resp.StatusCode}): {body}");
+        try
+        {
+            var payload = new
+            {
+                messages = new object[] {
+                    new { role = "system", content = sys },
+                    new { role = "user",   content = user }
+                },
+                max_completion_tokens = 1200,
+                response_format = new { type = "json_object" }
+            };
+            
+            using var msg = new HttpRequestMessage(HttpMethod.Post,
+                $"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=2024-10-21");
+            msg.Headers.Add("api-key", key);
+            msg.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+            
+            using var resp = await client.SendAsync(msg, ct);
+            var body = await resp.Content.ReadAsStringAsync(ct);
+            
+            if (!resp.IsSuccessStatusCode)
+            {
+                var isTransient = (int)resp.StatusCode == 429 || (int)resp.StatusCode == 408 
+                               || (int)resp.StatusCode >= 500;
+                if (isTransient && attempt < 5)
+                {
+                    await Task.Delay((int)Math.Pow(2, attempt - 1) * 1000, ct);
+                    continue;
+                }
+                return Results.Problem($"Narration script failed ({(int)resp.StatusCode}): {body}");
+            }
 
-    var raw = ExtractChatContent(body);
+            rawResult = ExtractChatContent(body);
+            if (string.IsNullOrWhiteSpace(rawResult) && attempt < 5)
+            {
+                await Task.Delay((int)Math.Pow(2, attempt - 1) * 1000, ct);
+                rawResult = null;
+                continue;
+            }
+        }
+        catch (TaskCanceledException) when (attempt < 5)
+        {
+            await Task.Delay((int)Math.Pow(2, attempt - 1) * 1000, ct);
+            continue;
+        }
+        catch (Exception ex) when (attempt < 5)
+        {
+            await Task.Delay((int)Math.Pow(2, attempt - 1) * 1000, ct);
+            continue;
+        }
+    }
+    
+    var raw = rawResult ?? "";
     string script = "";
     if (!string.IsNullOrWhiteSpace(raw))
     {
