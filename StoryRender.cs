@@ -56,6 +56,7 @@ public sealed record StorySpec
     public string ImageEngine { get; init; } = "flux"; // "flux" | "comfy"
     public int Crossfade { get; init; }
     public JsonNode? Story { get; init; }
+    public string? Idea { get; init; }      // the user's original story idea, recorded on the film for the History view
     public List<CastMemberSpec> Cast { get; init; } = new();
 }
 
@@ -432,8 +433,11 @@ public sealed class StoryRenderWorker : BackgroundService
             var cf = narrating ? 0 : spec.Crossfade;
             try
             {
+                var logline = "";
+                try { logline = spec.Story?["logline"]?.GetValue<string>() ?? ""; } catch { }
                 var r = await PostJsonAsync("/api/stitch",
-                    new { urls = finals.ToArray(), crossfade = cf, reencode = narrating }, ct);
+                    new { urls = finals.ToArray(), crossfade = cf, reencode = narrating,
+                          title = job.Title, idea = spec.Idea ?? "", logline }, ct);
                 job.ResultUrl = r.GetProperty("url").GetString();
             }
             catch (OperationCanceledException) { throw; }

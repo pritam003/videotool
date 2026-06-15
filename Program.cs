@@ -133,10 +133,12 @@ static BlobContainerClient Container(IConfiguration c, TokenCredential cred)
 // inline (cheap; no extra copy).
 static async Task<string> UploadAndSign(
     BlobContainerClient container, string blobName, Stream data, string contentType,
-    BlobServiceClient svc, string account, CancellationToken ct)
+    BlobServiceClient svc, string account, CancellationToken ct,
+    IDictionary<string, string>? metadata = null)
 {
     var blob = container.GetBlobClient(blobName);
     var opts = new BlobUploadOptions { HttpHeaders = new BlobHttpHeaders { ContentType = contentType } };
+    if (metadata is { Count: > 0 }) opts.Metadata = metadata;
     await blob.UploadAsync(data, opts, ct);
     var udk = await svc.GetUserDelegationKeyAsync(
         DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddHours(2), ct);
@@ -150,6 +152,17 @@ static async Task<string> UploadAndSign(
     sas.SetPermissions(BlobSasPermissions.Read);
     var token = sas.ToSasQueryParameters(udk.Value, account).ToString();
     return $"{blob.Uri}?{token}";
+}
+
+// Blob metadata values ride as HTTP headers, so they must be ASCII — but prompts can be
+// Hindi/Bengali/etc. Base64-encode the UTF-8 bytes so any Unicode survives the round-trip.
+static string EncodeMeta(string? v) =>
+    Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(v ?? ""));
+static string DecodeMeta(string? v)
+{
+    if (string.IsNullOrEmpty(v)) return "";
+    try { return System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(v)); }
+    catch { return ""; }
 }
 
 // ----- routes ------------------------------------------------------------
@@ -553,7 +566,7 @@ app.MapGet("/api/videos", async (IConfiguration cfg, TokenCredential cred, Cance
         DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddHours(2), ct);
 
     var items = new List<object>();
-    await foreach (var b in container.GetBlobsAsync(BlobTraits.None, BlobStates.None, cancellationToken: ct))
+    await foreach (var b in container.GetBlobsAsync(BlobTraits.Metadata, BlobStates.None, cancellationToken: ct))
     {
         if (!b.Name.EndsWith(".mp4", StringComparison.OrdinalIgnoreCase)) continue;
         var sas = new BlobSasBuilder
@@ -566,13 +579,17 @@ app.MapGet("/api/videos", async (IConfiguration cfg, TokenCredential cred, Cance
         sas.SetPermissions(BlobSasPermissions.Read);
         var token = sas.ToSasQueryParameters(udk.Value, account).ToString();
         var url = $"https://{account}.blob.core.windows.net/{container.Name}/{Uri.EscapeDataString(b.Name).Replace("%2F", "/")}?{token}";
+        string? MetaGet(string k) => b.Metadata is not null && b.Metadata.TryGetValue(k, out var raw) ? DecodeMeta(raw) : null;
         items.Add(new
         {
             name = b.Name,
             url,
             size = b.Properties.ContentLength,
             createdOn = b.Properties.CreatedOn,
-            lastModified = b.Properties.LastModified
+            lastModified = b.Properties.LastModified,
+            title = MetaGet("vt_title"),
+            prompt = MetaGet("vt_idea"),
+            logline = MetaGet("vt_logline")
         });
     }
     var sorted = items
@@ -706,7 +723,13 @@ app.MapPost("/api/stitch", async (StitchRequest req, IHttpClientFactory hf,
         var container = svc.GetBlobContainerClient(cfg["STORAGE_CONTAINER"] ?? "videos");
         var name = $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-stitched-{req.Urls.Length}clips.mp4";
         using var ms = new MemoryStream(mp4);
-        var url = await UploadAndSign(container, name, ms, "video/mp4", svc, account, ct);
+        // Record the originating prompt/title on the blob so the History view can show
+        // "made from this idea" for every saved film.
+        var meta = new Dictionary<string, string>();
+        if (!string.IsNullOrWhiteSpace(req.Title)) meta["vt_title"] = EncodeMeta(req.Title);
+        if (!string.IsNullOrWhiteSpace(req.Idea)) meta["vt_idea"] = EncodeMeta(req.Idea);
+        if (!string.IsNullOrWhiteSpace(req.Logline)) meta["vt_logline"] = EncodeMeta(req.Logline);
+        var url = await UploadAndSign(container, name, ms, "video/mp4", svc, account, ct, meta);
         return Results.Ok(new { url, blob = name, clips = req.Urls.Length, crossfade, bytes = mp4.Length });
     }
     finally
@@ -2590,7 +2613,7 @@ public record NarrateRequest(string Text, string? Voice, string? Style, string? 
 public record TranslateRequest(string Text, string? To);
 public record EnhanceRequest(string Prompt, string? Narration, string? Voice, int? Seconds, string? Size);
 public record PromptCraftRequest(string UserAsk, int? TotalSeconds, string? Size, string? Narration, string? Voice, int? MaxIterations);
-public record StitchRequest(string[] Urls, double? Crossfade, bool? Reencode);
+public record StitchRequest(string[] Urls, double? Crossfade, bool? Reencode, string? Title = null, string? Idea = null, string? Logline = null);
 public record IdentityRequest(string VideoUrl, string? OriginalAnchor);
 public record TailRequest(string VideoUrl, double? Seconds, string? Size);
 public record SliceRequest(string VideoUrl, double? StartSec, double? DurationSec, string? Size, bool? FromEnd);

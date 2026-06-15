@@ -443,6 +443,12 @@ function Library({ refreshKey, onSelect }) {
               onMouseEnter=${e => { try { e.currentTarget.currentTime = 0.1; e.currentTarget.play(); } catch{} }}
               onMouseLeave=${e => { e.currentTarget.pause(); }}></video>
             <div class="name">${new Date(v.createdOn || v.lastModified).toLocaleString()}</div>
+            ${(v.title || v.prompt) ? html`
+              <div style=${{padding:"6px 8px",borderTop:"1px solid var(--border)"}}>
+                ${v.title && html`<div style=${{fontSize:12,fontWeight:600,lineHeight:1.3,whiteSpace:"normal"}}>${v.title}</div>`}
+                ${v.prompt && html`<div class="muted" style=${{fontSize:11,lineHeight:1.35,marginTop:2,whiteSpace:"normal"}} title=${v.prompt}>${v.prompt.length > 160 ? v.prompt.slice(0,160) + "…" : v.prompt}</div>`}
+              </div>
+            ` : ""}
             <button type="button" title="Delete this video" aria-label="Delete video"
               disabled=${deleting === v.name}
               onClick=${e => { e.stopPropagation(); del(v); }}
@@ -624,6 +630,7 @@ function App() {
   const [stitching, setStitching] = useState(false);
   const [crossfade, setCrossfade] = useState(0); // seconds; 0 = lossless hard cut
   const [refreshLib, setRefreshLib] = useState(0);
+  const [page, setPage] = useState("studio"); // "studio" = compose + current film · "history" = every saved film
   const [drawerOpen, setDrawerOpen] = useState(false);
   // Cancellation: cancelRef.current=true asks the run() loop to stop after the
   // current step. currentJobIdRef holds the in-flight job id so we can
@@ -1264,6 +1271,7 @@ function App() {
         dialogVoice: scDialogVoice || "",
         imageEngine: scImageEngine,
         crossfade: crossfade,
+        idea: scPrompt,
         story: scStory,
         cast
       };
@@ -1587,6 +1595,12 @@ function App() {
       <span class="dot"></span>
       <span class="title">avideo</span>
       <span class="badge">wan2.2 · ${scSize} · ${scClipCount} clips</span>
+      <div style=${{display:"flex",gap:4,marginLeft:12}}>
+        <button class="ghost small" onClick=${() => setPage("studio")}
+          style=${page==="studio" ? {background:"var(--accent)",color:"#fff",borderColor:"var(--accent)"} : {}}>Studio</button>
+        <button class="ghost small" onClick=${() => { setPage("history"); setRefreshLib(x => x + 1); }}
+          style=${page==="history" ? {background:"var(--accent)",color:"#fff",borderColor:"var(--accent)"} : {}}>History</button>
+      </div>
       <div class="spacer"></div>
       <button class="ghost" onClick=${() => setTheme(theme === "light" ? "dark" : "light")} title="Toggle theme">
         ${theme === "light" ? "☾" : "☀"}
@@ -1601,8 +1615,14 @@ function App() {
     </header>
 
     <main>
+      ${page === "history" ? html`
+      <!-- HISTORY: every saved film, with the prompt it was made from -->
+      <div style=${{gridColumn:"1 / -1"}}>
+        <${Library} refreshKey=${refreshLib} onSelect=${v => { setOuts([{ url: v.url, name: v.name, seconds: scClipSec, size: scSize }]); setStitched(null); setPage("studio"); toast("Loaded " + v.name); }} />
+      </div>
+      ` : html`
       <!-- LEFT: Compose -->
-      <div>
+      <div key="studio-left">
         <div class="card" style=${{borderColor:"var(--accent)",borderWidth:1,borderStyle:"solid"}}>
           <h3 style=${{display:"flex",alignItems:"center",gap:8}}>🎬 Make a film <span class="pill ok small">step ${wizStep}/5</span></h3>
           <div style=${{display:"flex",gap:4,flexWrap:"wrap",margin:"6px 0 12px"}}>
@@ -1907,8 +1927,8 @@ function App() {
         </div>
       </div>
 
-      <!-- RIGHT: Preview + Library -->
-      <div>
+      <!-- RIGHT: Preview (the current film) -->
+      <div key="studio-right">
         <div class="card">
           <h3>Preview</h3>
           <div class="preview">
@@ -1940,8 +1960,8 @@ function App() {
             </div>
           `}
         </div>
-        <${Library} refreshKey=${refreshLib} onSelect=${v => { setOuts([{ url: v.url, name: v.name, seconds: scClipSec, size: scSize }]); setStitched(null); toast("Loaded " + v.name); }} />
       </div>
+      `}
     </main>
 
     <div class=${"drawer" + (drawerOpen ? " open" : "")}>
