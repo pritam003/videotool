@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>Sora Studio</title>
+<title>avideo</title>
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <link rel="preconnect" href="https://esm.sh" />
 <style>
@@ -519,7 +519,7 @@ function App() {
 
   // Web Push: register the service worker once on mount. The SW receives push
   // events from our backend and shows a lock-screen / status-bar notification
-  // when each Sora chunk completes (so the user knows to come back to the tab,
+  // when each render chunk completes (so the user knows to come back to the tab,
   // where Wake Lock + interruptible-sleep resume the next chunk). Notification
   // permission is asked lazily — only the first time `run()` is started, so we
   // never prompt unsolicited.
@@ -534,7 +534,7 @@ function App() {
     // Listen for taps on the OS notification — the SW posts a message to us so
     // we can immediately wake any pending poll sleep and re-poll the job.
     const onMsg = (e) => {
-      if (e.data?.type === "videotool:notification-click") {
+      if (e.data?.type === "avideo:notification-click" || e.data?.type === "videotool:notification-click") {
         dbg("info", `notification tapped (jobId=${e.data.jobId || "?"}) — kicking poll`);
         wakeAllSleeps();
       }
@@ -544,7 +544,7 @@ function App() {
   }, []);
 
   // Helper: ensure notification permission, ensure a PushSubscription exists,
-  // and bind it to a specific Sora job ID server-side so the server pushes a
+  // and bind it to a specific render job ID server-side so the server pushes a
   // notification when that job completes. Best-effort — silent on failure so a
   // missing-API browser (iOS Safari without PWA install, Firefox private mode)
   // never blocks the render.
@@ -588,7 +588,7 @@ function App() {
   const [refreshLib, setRefreshLib] = useState(0);
   const [drawerOpen, setDrawerOpen] = useState(false);
   // Cancellation: cancelRef.current=true asks the run() loop to stop after the
-  // current step. currentJobIdRef holds the in-flight Sora videoId so we can
+  // current step. currentJobIdRef holds the in-flight job id so we can
   // POST /api/jobs/{id}/cancel to stop server-side billing immediately.
   const cancelRef = useRef(false);
   const currentJobIdRef = useRef(null);
@@ -634,9 +634,9 @@ function App() {
     return groups;
   }, [voices]);
 
-  // Sora-2 typically takes 90–180s per 12s clip. Start with longer poll intervals
+  // Wan2.2 can take a while per clip. Start with longer poll intervals
   // to avoid wasting round trips, then tighten as render approaches completion.
-  // Bails out promptly if cancelRef is set (and tells Sora to cancel server-side).
+  // Bails out promptly if cancelRef is set (and tells backend to cancel server-side).
   async function poll(id, onProgress) {
     currentJobIdRef.current = id;
     let elapsed = 0;
@@ -649,7 +649,7 @@ function App() {
         elapsed += wait;
         if (cancelRef.current) throw new Error("Cancelled by user");
         const r = await fetch(`/api/jobs/${id}`);
-        // Tolerate transient upstream 5xx / 429 from Sora — the underlying
+        // Tolerate transient upstream 5xx / 429 — the underlying
         // render job is still alive, just the status endpoint hiccuped.
         // Bail only after several consecutive failures.
         if (r.status === 429 || (r.status >= 500 && r.status <= 599)) {
@@ -657,7 +657,7 @@ function App() {
           dbg("warn", `transient ${r.status} on /api/jobs/${id} (fail ${transientFails}/6) — keep polling`);
           if (transientFails >= 6) {
             const tx = await r.text().catch(() => "");
-            throw new Error(`Sora status endpoint returned ${r.status} 6× in a row: ${tx.slice(0, 240)}`);
+            throw new Error(`Status endpoint returned ${r.status} 6× in a row: ${tx.slice(0, 240)}`);
           }
           continue;
         }
@@ -674,7 +674,7 @@ function App() {
     }
   }
 
-  // User-initiated cancellation. Sets the cancel flag, tells Sora to stop the
+  // User-initiated cancellation. Sets the cancel flag, tells backend to stop the
   // active job (saves billing), then lets run()'s loop exit on its next check.
   async function cancelRun() {
     if (!running) return;
@@ -684,9 +684,9 @@ function App() {
     if (id) {
       try {
         await fetch(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" });
-        dbg("info", `cancel signal sent to Sora for ${id}`);
+        dbg("info", `cancel signal sent for ${id}`);
       } catch (e) {
-        dbg("warn", `failed to signal Sora cancel: ${e.message}`);
+        dbg("warn", `failed to signal cancel: ${e.message}`);
       }
     }
     toast("Cancelling generation…");
@@ -977,7 +977,7 @@ function App() {
   return html`
     <header class="app">
       <span class="dot"></span>
-      <span class="title">Sora Studio</span>
+      <span class="title">avideo</span>
       <span class="badge">wan2.2 · ${scSize} · ${scClipCount} clips</span>
       <div class="spacer"></div>
       <button class="ghost" onClick=${() => setTheme(theme === "light" ? "dark" : "light")} title="Toggle theme">

@@ -1,4 +1,4 @@
-// Service Worker for videotool.
+// Service Worker for avideo.
 //
 // Purpose: receive Web Push messages from the .NET backend and surface them as
 // OS-level notifications (lock screen + status bar) when the page is hidden,
@@ -17,10 +17,10 @@ self.addEventListener("activate", e => { e.waitUntil(self.clients.claim()); });
 
 self.addEventListener("push", event => {
   let data = {};
-  try { data = event.data ? event.data.json() : {}; } catch { data = { title: "videotool", body: event.data ? event.data.text() : "" }; }
-  const title = data.title || "videotool";
+  try { data = event.data ? event.data.json() : {}; } catch { data = { title: "avideo", body: event.data ? event.data.text() : "" }; }
+  const title = data.title || "avideo";
   const body  = data.body  || "";
-  const tag   = data.tag   || "videotool";
+  const tag   = data.tag   || "avideo";
   const opts = {
     body,
     tag,                      // same tag → replaces the previous notification
@@ -41,7 +41,7 @@ self.addEventListener("notificationclick", event => {
     for (const c of all) {
       if (c.url.includes(self.location.origin)) {
         // Hand control back to the page so it can resume polling immediately.
-        c.postMessage({ type: "videotool:notification-click", jobId: event.notification.data?.jobId });
+        c.postMessage({ type: "avideo:notification-click", jobId: event.notification.data?.jobId });
         return c.focus();
       }
     }

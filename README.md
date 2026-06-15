@@ -1,4 +1,4 @@
-# videotool
+# avideo
 
 Minimal .NET 8 web app deployed to Azure App Service via GitHub Actions (OIDC).
 
