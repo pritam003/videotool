@@ -1260,14 +1260,22 @@ app.MapPost("/api/storyboard", async (StoryboardRequest req, IHttpClientFactory 
     var narrate = req.Narrate ?? true;
     var dialogDirection = (req.DialogDirection ?? "").Trim();
     var dialogGuidance = string.IsNullOrWhiteSpace(dialogDirection)
-        ? "No dialogue direction was given — INVENT natural, in-character dialog yourself: every clip where someone would plausibly speak gets a short spoken line that fits the action and narration; leave dialog empty only when silence clearly fits."
-        : $@"DIALOGUE DIRECTION from the user — this is the dramatic SPINE of the film: build the action, narration AND dialog across the clips to honor and pay it off, every spoken line in {language} and in sync with that clip's action and narration: ""{dialogDirection}"".";
+        ? "No dialogue direction was given — invent natural, in-character lines yourself, ALWAYS in subtext (never on-the-nose); leave dialog empty wherever silence fits better than a line."
+        : $@"DIALOGUE DIRECTION from the user: ""{dialogDirection}"". Treat this as the underlying MOOD / situation to convey through SUBTEXT and behaviour across the whole film — do NOT quote it back as a spoken line (e.g. if the note is 'he is sad', NEVER write ""I'm sad""; instead let a line like 'Nobody stopped tonight.' plus the narration earn that feeling). Every spoken line in {language}, in sync with its clip's action and narration.";
     var narrationRule = narrate
-        ? $@"AUDIO — ONE FILM SCRIPT = NARRATION (voiceover) + DIALOGUE (spoken on screen), written TOGETHER with the visuals so audio and picture stay in sync. Write BOTH in {language} USING ITS NATIVE SCRIPT (for Hindi use Devanagari, for Bengali use Bengali script, etc.) — NEVER romanized/transliterated, never English; only real proper names may stay as-is:
-- narration: a SHORT narrator voiceover line for EACH clip in {language}, present tense, matched to THAT clip's on-screen action. Read end to end, the clips' narration MUST form ONE continuous, COMPLETE voiceover script that covers the WHOLE story — no repeats, each line follows from the last.
-- dialog: the EXACT words a character SPEAKS on screen in THIS clip, in {language} — spoken words only, NO name prefix, NO quotation marks. Across the clips the dialog must read as ONE natural, evolving conversation with real emotion that, together with the narration, tells the complete film. If nobody speaks in a clip, set dialog to an empty string.
+        ? $@"AUDIO — write ONE film script = NARRATION (voiceover) + DIALOGUE (spoken on screen), composed TOGETHER with the visuals so sound and picture stay in sync. Write BOTH in {language} USING ITS NATIVE SCRIPT (Devanagari for Hindi, Bengali script for Bengali, etc.) — NEVER romanized/transliterated, never English; only real proper names may stay as-is.
+
+NARRATION (narrator voiceover) — write a line for EVERY clip, never leave one empty:
+- Do NOT just describe what is already on screen. Lines like 'he plays the guitar', 'he looks up and plays harder', 'he packs up and walks away' are BAD — they merely repeat the picture. Instead voice what the camera CANNOT show: the character's inner feeling, what the moment MEANS, a memory, a longing, or the story's theme.
+- Read end to end, the clips' narration must form ONE continuous, complete, flowing voiceover — like a storyteller or a poem — each line following naturally from the last, no repeats, no restating the action.
+- Keep every line short, evocative and varied (do not reuse the same sentence shape twice).
+
+DIALOGUE (words spoken on screen):
+- The EXACT words a character speaks in THIS clip — spoken words only, NO name prefix, NO quotation marks. Use an empty string when no one speaks; silence is powerful, so most clips may be silent and only a few carry a line.
+- NEVER on-the-nose: a character must NEVER state their own emotion or narrate their own action. 'I'm sad', 'I'm so happy', 'Thank you', 'I look up and play' are ALL BAD. Real people speak in SUBTEXT — imply the feeling indirectly through specific, natural, in-character words (e.g. instead of 'I'm sad' a busker might say 'Nobody stopped tonight.').
+- Across the clips the spoken lines read as ONE natural, evolving exchange with real emotion and specific, human detail — never generic pleasantries.
 - {dialogGuidance}
-- Keep narration and dialog each very SHORT; when a clip has BOTH, together they must be speakable within {clipSeconds} seconds (about {Math.Max(6, clipSeconds * 2)} words TOTAL across the two).
+- Keep each line very SHORT; when a clip has BOTH narration and dialog, together they must be speakable within {clipSeconds} seconds (about {Math.Max(6, clipSeconds * 2)} words TOTAL).
 - Keep title, style, action and motionPrompt in ENGLISH (the video model needs English). ONLY the narration and dialog fields are written in {language}'s native script."
         : @"AUDIO:
 - Set every clip's narration AND dialog to an empty string. The user turned voiceover off.";
@@ -1481,15 +1489,16 @@ app.MapPost("/api/dialogue", async (DialogueRequest req, IHttpClientFactory hf,
     var language = string.IsNullOrWhiteSpace(req?.Language) ? "English" : req!.Language!.Trim();
     var direction = (req?.Direction ?? "").Trim();
     var directionRule = string.IsNullOrWhiteSpace(direction)
-        ? "The user gave NO direction — invent natural, in-character spoken dialogue yourself from each clip's action and narration."
-        : $@"The user's dialogue direction is the dramatic SPINE — build the spoken lines across the clips to honor and pay it off, with real emotion (every line still in {language}): ""{direction}"".";
+        ? "The user gave NO direction — invent natural, in-character spoken dialogue yourself from each clip's action and narration, always in subtext (never on-the-nose)."
+        : $@"The user's dialogue direction is ""{direction}"" — treat it as the underlying MOOD / situation to convey through SUBTEXT across the film. Do NOT quote it back as a line (if it says 'he is sad', NEVER write ""I'm sad""; imply it, e.g. 'Nobody stopped tonight.'). Every line still in {language}.";
 
     var sys = $@"You are a screenwriter writing the SPOKEN DIALOGUE for a short film, in sync with an existing storyboard and its narrator voiceover.
 Rules:
-- For EACH clip, write the EXACT words a character SPEAKS aloud on screen, in {language} USING ITS NATIVE SCRIPT (for Hindi use Devanagari, for Bengali use Bengali script, etc.) — NEVER romanized/transliterated, never English; only real proper names may stay as-is. Spoken words only — NO character-name prefix, NO quotation marks, NO stage directions.
+- For each clip that needs a line, write the EXACT words a character SPEAKS aloud on screen, in {language} USING ITS NATIVE SCRIPT (Devanagari for Hindi, Bengali script for Bengali, etc.) — NEVER romanized/transliterated, never English; only real proper names may stay as-is. Spoken words only — NO character-name prefix, NO quotation marks, NO stage directions.
+- NEVER on-the-nose: a character must NEVER state their own emotion or narrate their own action. 'I'm sad', 'I'm so happy', 'Thank you', 'I play harder' are ALL BAD. Speak in SUBTEXT — imply the feeling indirectly through specific, natural, in-character words.
+- Do NOT simply repeat the clip's narration or action back as speech; the line must add something the narration does not say.
 - Keep each line SHORT (at most 12 words) so it is speakable within the clip and does not collide with that clip's narration.
-- The dialogue MUST fit that clip's action and sit naturally alongside the clip's narration; across ALL clips it must read as ONE continuous, evolving conversation with real emotion that tells the complete film.
-- If a clip is clearly a silent moment, return an empty string for that clip's dialog.
+- Silence is powerful: only give a line to clips where someone would truly speak — return an empty string for the rest. Across the clips the lines must read as ONE continuous, evolving exchange with real emotion and specific human detail, never generic pleasantries.
 - {directionRule}
 Return ONE JSON object exactly: {{ ""dialogs"": [ {{ ""index"": <clip index>, ""dialog"": ""<{language} spoken line or empty>"" }} ] }} — one entry for EVERY clip index given, no markdown.";
 
