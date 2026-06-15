@@ -1260,7 +1260,7 @@ app.MapPost("/api/storyboard", async (StoryboardRequest req, IHttpClientFactory 
     var narrate = req.Narrate ?? true;
     var dialogDirection = (req.DialogDirection ?? "").Trim();
     var dialogGuidance = string.IsNullOrWhiteSpace(dialogDirection)
-        ? "No dialogue direction was given — invent natural, in-character lines yourself, ALWAYS in subtext (never on-the-nose); leave dialog empty wherever silence fits better than a line."
+        ? "No dialogue direction was given — invent natural, in-character lines yourself, ALWAYS in subtext (never on-the-nose). Give MOST clips a spoken line; leave dialog empty only for a rare, clearly wordless beat."
         : $@"DIALOGUE DIRECTION from the user: ""{dialogDirection}"". Treat this as the underlying MOOD / situation to convey through SUBTEXT and behaviour across the whole film — do NOT quote it back as a spoken line (e.g. if the note is 'he is sad', NEVER write ""I'm sad""; instead let a line like 'Nobody stopped tonight.' plus the narration earn that feeling). Every spoken line in {language}, in sync with its clip's action and narration.";
     var narrationRule = narrate
         ? $@"AUDIO — write ONE film script = NARRATION (voiceover) + DIALOGUE (spoken on screen), composed TOGETHER with the visuals so sound and picture stay in sync. Write BOTH in {language} USING ITS NATIVE SCRIPT (Devanagari for Hindi, Bengali script for Bengali, etc.) — NEVER romanized/transliterated, never English; only real proper names may stay as-is.
@@ -1271,7 +1271,7 @@ NARRATION (narrator voiceover) — write a line for EVERY clip, never leave one 
 - Keep every line short, evocative and varied (do not reuse the same sentence shape twice).
 
 DIALOGUE (words spoken on screen):
-- The EXACT words a character speaks in THIS clip — spoken words only, NO name prefix, NO quotation marks. Use an empty string when no one speaks; silence is powerful, so most clips may be silent and only a few carry a line.
+- The EXACT words a character speaks in THIS clip — spoken words only, NO name prefix, NO quotation marks. Give MOST clips a spoken line: any clip where a present character could plausibly speak, mutter, react or address someone gets one; even a character who is ALONE can voice a thought aloud (do NOT default to silence just because they are alone or sad). Use an empty string ONLY for the rare beat that is clearly, intentionally wordless.
 - NEVER on-the-nose: a character must NEVER state their own emotion or narrate their own action. 'I'm sad', 'I'm so happy', 'Thank you', 'I look up and play' are ALL BAD. Real people speak in SUBTEXT — imply the feeling indirectly through specific, natural, in-character words (e.g. instead of 'I'm sad' a busker might say 'Nobody stopped tonight.').
 - Across the clips the spoken lines read as ONE natural, evolving exchange with real emotion and specific, human detail — never generic pleasantries.
 - {dialogGuidance}
@@ -1341,23 +1341,6 @@ Cast the characters and locations this idea needs (support multiple characters),
 
     var client = hf.CreateClient();
     client.Timeout = TimeSpan.FromSeconds(90);
-    using var msg = new HttpRequestMessage(HttpMethod.Post,
-        $"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=2024-10-21");
-    msg.Headers.Add("api-key", key);
-    var payload = new
-    {
-        messages = new object[] {
-            new { role = "system", content = sys },
-            new { role = "user",   content = user }
-        },
-        max_completion_tokens = 8000,
-        response_format = new { type = "json_object" }
-    };
-    msg.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
-    using var resp = await client.SendAsync(msg, ct);
-    var body = await resp.Content.ReadAsStringAsync(ct);
-    if (!resp.IsSuccessStatusCode)
-        return Results.Problem($"Storyboard failed ({(int)resp.StatusCode}): {body}");
 
     object BuildFallbackStoryboard()
     {
@@ -1406,54 +1389,79 @@ Cast the characters and locations this idea needs (support multiple characters),
         };
     }
 
-    string raw = "";
-    try
+    // Pull the assistant message text out of a chat-completions response body.
+    static string ExtractContent(string body)
     {
-        using var doc = JsonDocument.Parse(body);
-        var content = doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content");
-        if (content.ValueKind == JsonValueKind.String)
+        try
         {
-            raw = content.GetString() ?? "";
-        }
-        else if (content.ValueKind == JsonValueKind.Array)
-        {
-            var sb = new StringBuilder();
-            foreach (var part in content.EnumerateArray())
+            using var doc = JsonDocument.Parse(body);
+            var content = doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content");
+            if (content.ValueKind == JsonValueKind.String)
+                return content.GetString() ?? "";
+            if (content.ValueKind == JsonValueKind.Array)
             {
-                if (part.ValueKind == JsonValueKind.String)
+                var sb = new StringBuilder();
+                foreach (var part in content.EnumerateArray())
                 {
-                    sb.Append(part.GetString());
+                    if (part.ValueKind == JsonValueKind.String) sb.Append(part.GetString());
+                    else if (part.ValueKind == JsonValueKind.Object
+                             && part.TryGetProperty("text", out var txt)
+                             && txt.ValueKind == JsonValueKind.String) sb.Append(txt.GetString());
                 }
-                else if (part.ValueKind == JsonValueKind.Object
-                         && part.TryGetProperty("text", out var txt)
-                         && txt.ValueKind == JsonValueKind.String)
-                {
-                    sb.Append(txt.GetString());
-                }
+                return sb.ToString();
             }
-            raw = sb.ToString();
         }
+        catch { }
+        return "";
     }
-    catch
+
+    // The storyboard JSON is large (full cast + per-clip motionPrompt + native-script
+    // narration/dialog) and gpt-5-mini is a reasoning model, so a single call can
+    // occasionally come back empty/truncated/unparseable on a transient hiccup. Try
+    // twice before dropping to the bland fallback (which carries no dialogue).
+    System.Text.Json.Nodes.JsonNode? story = null;
+    for (int attempt = 1; attempt <= 2 && story is null; attempt++)
     {
-        raw = "";
+        string body;
+        try
+        {
+            using var msg = new HttpRequestMessage(HttpMethod.Post,
+                $"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=2024-10-21");
+            msg.Headers.Add("api-key", key);
+            var payload = new
+            {
+                messages = new object[] {
+                    new { role = "system", content = sys },
+                    new { role = "user",   content = user }
+                },
+                max_completion_tokens = 12000,
+                response_format = new { type = "json_object" }
+            };
+            msg.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+            using var resp = await client.SendAsync(msg, ct);
+            body = await resp.Content.ReadAsStringAsync(ct);
+            if (!resp.IsSuccessStatusCode)
+            {
+                if (((int)resp.StatusCode == 429 || (int)resp.StatusCode >= 500) && attempt < 2) continue;
+                return Results.Problem($"Storyboard failed ({(int)resp.StatusCode}): {body}");
+            }
+        }
+        catch (Exception) when (attempt < 2 && !ct.IsCancellationRequested)
+        {
+            continue;
+        }
+
+        var raw = ExtractContent(body).Trim();
+        if (string.IsNullOrWhiteSpace(raw)) continue;
+        var jsonStart = raw.IndexOf('{');
+        var jsonEnd = raw.LastIndexOf('}');
+        if (jsonStart >= 0 && jsonEnd > jsonStart)
+            raw = raw.Substring(jsonStart, jsonEnd - jsonStart + 1);
+        try { story = System.Text.Json.Nodes.JsonNode.Parse(raw); }
+        catch { story = null; }
     }
 
-    raw = (raw ?? "").Trim();
-    if (string.IsNullOrWhiteSpace(raw))
-    {
-        var fallback = BuildFallbackStoryboard();
-        return Results.Ok(new { story = fallback, clipSeconds, clipCount, totalSeconds, size, fallback = true });
-    }
-
-    var jsonStart = raw.IndexOf('{');
-    var jsonEnd = raw.LastIndexOf('}');
-    if (jsonStart >= 0 && jsonEnd > jsonStart)
-        raw = raw.Substring(jsonStart, jsonEnd - jsonStart + 1);
-
-    System.Text.Json.Nodes.JsonNode? story;
-    try { story = System.Text.Json.Nodes.JsonNode.Parse(raw); }
-    catch
+    if (story is null)
     {
         var fallback = BuildFallbackStoryboard();
         return Results.Ok(new { story = fallback, clipSeconds, clipCount, totalSeconds, size, fallback = true });
@@ -1498,7 +1506,7 @@ Rules:
 - NEVER on-the-nose: a character must NEVER state their own emotion or narrate their own action. 'I'm sad', 'I'm so happy', 'Thank you', 'I play harder' are ALL BAD. Speak in SUBTEXT — imply the feeling indirectly through specific, natural, in-character words.
 - Do NOT simply repeat the clip's narration or action back as speech; the line must add something the narration does not say.
 - Keep each line SHORT (at most 12 words) so it is speakable within the clip and does not collide with that clip's narration.
-- Silence is powerful: only give a line to clips where someone would truly speak — return an empty string for the rest. Across the clips the lines must read as ONE continuous, evolving exchange with real emotion and specific human detail, never generic pleasantries.
+- Give MOST clips a spoken line: any clip where the present character could plausibly speak, mutter, react or address someone gets one; even a lone or sad character can voice a thought aloud (do NOT default to silence). Use an empty string ONLY for a rare, intentionally wordless beat. Across the clips the lines must read as ONE continuous, evolving exchange with real emotion and specific human detail, never generic pleasantries.
 - {directionRule}
 Return ONE JSON object exactly: {{ ""dialogs"": [ {{ ""index"": <clip index>, ""dialog"": ""<{language} spoken line or empty>"" }} ] }} — one entry for EVERY clip index given, no markdown.";
 
