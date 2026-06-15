@@ -1558,7 +1558,7 @@ Write it as a vivid, single paragraph film treatment.";
                 new { role = "user", content = userPrompt }
             },
             temperature = 0.8m,
-            max_tokens = 250,
+            max_completion_tokens = 250,
             top_p = 0.9m
         };
 
