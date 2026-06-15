@@ -25,6 +25,14 @@ builder.Services.AddSingleton<SoraJobWatcherRegistry>();
 // Wan2.2 (ComfyUI) client. Replaces the AOAI Sora-2 video path; the rest of the
 // app (frontend, push watcher, blob upload, stitch) keeps working unchanged.
 builder.Services.AddSingleton<WanClient>();
+// Durable server-side story render pipeline: an in-process queue + a single
+// background worker that renders a whole film (cast → clip chain → narrate →
+// mux → stitch) by reusing the app's own endpoints over localhost, so the UI is
+// freed the moment a film is submitted. InternalAuth lets those self-calls past
+// the Easy Auth middleware.
+builder.Services.AddSingleton<InternalAuth>();
+builder.Services.AddSingleton<StoryRenderQueue>();
+builder.Services.AddHostedService<StoryRenderWorker>();
 
 var app = builder.Build();
 app.UseDefaultFiles();
@@ -40,6 +48,9 @@ app.UseStaticFiles();
 var _authRequired = string.Equals(app.Configuration["AUTH_REQUIRED"], "1", StringComparison.Ordinal)
                   || string.Equals(app.Configuration["AUTH_REQUIRED"], "true", StringComparison.OrdinalIgnoreCase);
 var _allowedGroupId = app.Configuration["ALLOWED_GROUP_ID"];
+// Per-process secret the background render worker presents on its localhost
+// self-calls so it bypasses the Easy Auth gate (it has no signed-in principal).
+var _internalToken = app.Services.GetRequiredService<InternalAuth>().Token;
 static bool IsPublicAuthPath(PathString p) =>
     p.StartsWithSegments("/health") ||
     p.StartsWithSegments("/.auth") ||
@@ -50,6 +61,10 @@ if (_authRequired)
 {
     app.Use(async (ctx, next) =>
     {
+        // Internal localhost self-calls from the background render worker.
+        var internalTok = ctx.Request.Headers["X-Internal-Token"].ToString();
+        if (!string.IsNullOrEmpty(internalTok) && string.Equals(internalTok, _internalToken, StringComparison.Ordinal))
+        { await next(); return; }
         if (IsPublicAuthPath(ctx.Request.Path)) { await next(); return; }
         var oid = ctx.Request.Headers["X-MS-CLIENT-PRINCIPAL-ID"].ToString();
         if (string.IsNullOrEmpty(oid))
@@ -254,6 +269,38 @@ app.MapPost("/api/jobs/{id}/cancel", async (string id, WanClient wan, Cancellati
     var (sc, body) = await wan.CancelAsync(id, ct);
     return Results.Content(body, "application/json", statusCode: sc);
 });
+
+// ----- Story render jobs: durable server-side background pipeline ----------
+// The UI submits a finalized storyboard + cast + voice choices; a single
+// background worker renders the entire film (cast → clip chain → narrate → mux →
+// stitch) while the UI is freed to compose the next one. Jobs are persisted to
+// blob so finished films reappear after an idle recycle. Cancel is the only
+// interrupt — it stops the in-flight GPU clip and ends the job.
+app.MapPost("/api/story-jobs", (StorySpec spec, StoryRenderQueue queue) =>
+{
+    if (spec?.Story is null)
+        return Results.BadRequest(new { error = "story spec is required" });
+    if (spec.Story["clips"] is not System.Text.Json.Nodes.JsonArray clips || clips.Count == 0)
+        return Results.BadRequest(new { error = "storyboard has no clips" });
+    string title = "Untitled film";
+    try { var t = spec.Story["title"]?.GetValue<string>(); if (!string.IsNullOrWhiteSpace(t)) title = t!; } catch { }
+    var job = queue.Enqueue(spec, title);
+    return Results.Json(new { id = job.Id, status = job.Status });
+});
+
+app.MapGet("/api/story-jobs", (StoryRenderQueue queue) =>
+    Results.Json(queue.List().Select(StoryJobView.Summary)));
+
+app.MapGet("/api/story-jobs/{id}", (string id, StoryRenderQueue queue) =>
+{
+    var job = queue.Get(id);
+    return job is null
+        ? Results.NotFound(new { error = "no such job" })
+        : Results.Json(StoryJobView.Full(job));
+});
+
+app.MapPost("/api/story-jobs/{id}/cancel", (string id, StoryRenderQueue queue) =>
+    queue.Cancel(id) ? Results.Json(new { ok = true }) : Results.NotFound(new { error = "no such job" }));
 
 // 3. Finalize: download MP4 from ComfyUI's /view, stream-upload to blob, return SAS URL.
 app.MapPost("/api/jobs/{id}/finalize", async (

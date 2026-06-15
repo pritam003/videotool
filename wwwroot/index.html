@@ -473,6 +473,12 @@ function App() {
   // the cast references, and the two paths work independently.
   const [scImageEngine, setScImageEngine] = useState("flux");
 
+  // One-step-at-a-time wizard: 1 idea · 2 language+voiceover · 3 story · 4 voices · 5 cast · 6 render.
+  const [wizStep, setWizStep] = useState(1);
+  // Background render queue (server-side jobs): each submitted film renders on the
+  // server and reports back here, so the wizard is freed the moment you submit.
+  const [jobs, setJobs] = useState([]);
+
   const [running, setRunning] = useState(false);
 
   // Identity: who is signed in (when AUTH_REQUIRED=1 on the server).
@@ -1101,6 +1107,123 @@ function App() {
     setScCast(prev => suggestCastVoices((prev || []).map(c => ({ ...c, voice: "" }))));
   }
 
+  // Predefined voice "bundles" per language — a one-click cast of distinct voices.
+  // Applying one sets the narrator to the first voice and gives every character a
+  // distinct voice from the bundle (cycled). Only voices that actually exist in the
+  // loaded catalogue are used.
+  const VOICE_BUNDLES = {
+    "en-US": [
+      { label: "Warm storyteller", voices: ["en-US-AvaMultilingualNeural", "en-US-AndrewMultilingualNeural", "en-US-EmmaMultilingualNeural", "en-US-BrianMultilingualNeural"] },
+      { label: "Classic studio", voices: ["en-US-JennyNeural", "en-US-GuyNeural", "en-US-AriaNeural", "en-US-DavisNeural"] },
+    ],
+    "en-IN": [
+      { label: "Indian English", voices: ["en-IN-NeerjaNeural", "en-IN-PrabhatNeural", "en-IN-AnanyaNeural", "en-IN-AaravNeural"] },
+    ],
+    "hi-IN": [
+      { label: "Hindi ensemble", voices: ["hi-IN-SwaraNeural", "hi-IN-MadhurNeural", "hi-IN-AnanyaNeural", "hi-IN-AaravNeural"] },
+    ],
+    "bn-IN": [
+      { label: "Bengali pair", voices: ["bn-IN-TanishaaNeural", "bn-IN-BashkarNeural"] },
+    ],
+  };
+  function bundlesForCurrentLanguage() {
+    const loc = String(voice || "en-US").split("-").slice(0, 2).join("-");
+    return VOICE_BUNDLES[loc] || VOICE_BUNDLES["en-US"];
+  }
+  function applyVoiceBundle(bundle) {
+    const avail = new Set(voices.map(v => v.shortName));
+    const pool = (bundle.voices || []).filter(s => avail.has(s));
+    if (!pool.length) { toast("That bundle isn't available for the loaded voices.", true); return; }
+    setVoice(pool[0]);
+    voiceSuggestStoryRef.current = scStory; // we've set voices explicitly; don't auto-overwrite
+    setScCast(prev => (prev || []).map((c, i) => ({ ...c, voice: pool[i % pool.length] })));
+    dbg("ok", `applied voice bundle "${bundle.label}" (${pool.length} voices)`);
+    toast(`Voice bundle “${bundle.label}” applied`);
+  }
+
+  // ── Background render queue ────────────────────────────────────────────
+  async function refreshJobs() {
+    try {
+      const r = await fetch("/api/story-jobs");
+      if (r.ok) setJobs(await r.json());
+    } catch { /* transient — keep last list */ }
+  }
+  async function cancelJob(id) {
+    try { await fetch(`/api/story-jobs/${id}/cancel`, { method: "POST" }); dbg("info", `cancel requested for ${id}`); }
+    catch (e) { dbg("warn", `cancel failed: ${e.message}`); }
+    refreshJobs();
+  }
+
+  function resetWizard() {
+    setWizStep(1);
+    setScStory(null); setScCast([]); setScProgress([]);
+    setScCharFile(null); setScCharPreview(null); setScNarrAudio(null);
+    setScPrompt(""); setScDialogPrompt("");
+    voiceSuggestStoryRef.current = null;
+  }
+
+  // Submit the finalized film to the SERVER-SIDE pipeline. Returns immediately so the
+  // UI is freed to compose another; the render runs in the background and shows up in
+  // the queue below. This is the only place a film is dispatched.
+  async function submitStoryJob() {
+    if (!scStory || !Array.isArray(scStory.clips) || !scStory.clips.length) {
+      toast("Generate the story first.", true); return;
+    }
+    const narrating = scNarrationMode !== "off";
+    let cast = (scCast || []).map(c => ({
+      id: c.id, name: c.name || c.id, description: c.description || "",
+      voice: narrating ? (c.voice || "") : "", refName: c.refName || null
+    }));
+    if (!cast.length) { toast("Add at least one character first.", true); return; }
+
+    setScCasting(true);
+    try {
+      // If a lead photo was uploaded, normalize it now so the worker uses that exact face.
+      if (scCharFile && cast[0] && !cast[0].refName) {
+        try {
+          toast("Preparing your lead reference…");
+          const ref = await uploadCharImage(scCharFile, "Lead");
+          cast[0] = { ...cast[0], refName: ref.name };
+        } catch (e) {
+          dbg("warn", `lead upload failed (${e.message}); the lead will be generated instead`);
+        }
+      }
+      const spec = {
+        language: narrating ? voiceLanguage(voice) : "English",
+        size: scSize,
+        clipSeconds: Math.min(5, Math.max(3, Number(scStory.clipSeconds) || 5)),
+        narrate: narrating,
+        narratorVoice: voice,
+        dialogVoice: scDialogVoice || "",
+        imageEngine: scImageEngine,
+        crossfade: crossfade,
+        story: scStory,
+        cast
+      };
+      const r = await fetch("/api/story-jobs", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(spec)
+      });
+      const j = await jsonOrThrow(r);
+      dbg("ok", `film queued: ${j.id} — "${scStory.title || "film"}"`);
+      toast(`Queued “${scStory.title || "film"}” 🎬 — rendering in the background`);
+      await refreshJobs();
+      resetWizard();
+    } catch (e) {
+      toast("Submit failed: " + e.message.slice(0, 160), true);
+    } finally { setScCasting(false); }
+  }
+
+  // Wizard step gating: which steps are reachable right now.
+  const wizCanNext = {
+    1: () => !!scPrompt.trim(),
+    2: () => true,
+    3: () => !!(scStory && Array.isArray(scStory.clips) && scStory.clips.length),
+    4: () => true,
+    5: () => true,
+  };
+  function wizNext() { if (wizStep < 6 && (wizCanNext[wizStep] ? wizCanNext[wizStep]() : true)) setWizStep(wizStep + 1); }
+  function wizBack() { if (wizStep > 1) setWizStep(wizStep - 1); }
+
   // ── Casting phase: generate ONE canonical reference image per character BEFORE
   //    any clip is rendered, so every clip can be seeded from a stable identity
   //    (instead of the previous clip's degrading last frame). Supports multiple
@@ -1382,6 +1505,17 @@ function App() {
 
   const recentLines = dbgLines.slice(-200);
 
+  // Poll the server-side render queue so finished films appear automatically; the
+  // steady 3s poll also keeps the F1 app warm so background renders don't get
+  // recycled mid-flight while a tab is open.
+  useEffect(() => {
+    refreshJobs();
+    const iv = setInterval(refreshJobs, 3000);
+    return () => clearInterval(iv);
+  }, []);
+  // Advance to the story-review step automatically once a storyboard is generated.
+  useEffect(() => { if (scStory && wizStep === 2) setWizStep(3); }, [scStory]);
+
   return html`
     <header class="app">
       <span class="dot"></span>
@@ -1404,21 +1538,29 @@ function App() {
       <!-- LEFT: Compose -->
       <div>
         <div class="card" style=${{borderColor:"var(--accent)",borderWidth:1,borderStyle:"solid"}}>
-          <h3 style=${{display:"flex",alignItems:"center",gap:8}}>🎬 Story Chain <span class="pill ok small">I2V continuation</span></h3>
-          <p class="muted small" style=${{marginTop:-4}}>
-            Idea → pick a voiceover (script + narration are written together, in the same
-            language, fully in sync) → cast every character in parallel → then render the chain:
-            the first clip locks in the cast's face, and every later 5s starts from the previous
-            clip's last scene (not the casting portrait) while keeping that same face, fed the
-            previous + current script and narration so the story stays continuous.
-            ${` ${scClipCount} clips · ${scClipSec}s each.`}
-          </p>
+          <h3 style=${{display:"flex",alignItems:"center",gap:8}}>🎬 Make a film <span class="pill ok small">step ${wizStep}/6</span></h3>
+          <div style=${{display:"flex",gap:4,flexWrap:"wrap",margin:"6px 0 12px"}}>
+            ${[[1,"Idea"],[2,"Language"],[3,"Story"],[4,"Voices"],[5,"Cast"],[6,"Render"]].map(([n,lbl]) => html`
+              <button key=${n} type="button" class="ghost small" title=${lbl}
+                onClick=${() => { if (n <= wizStep) setWizStep(n); }}
+                style=${{flex:"1 1 0",minWidth:48,fontSize:11,padding:"4px 2px",cursor:n<=wizStep?"pointer":"default",...(wizStep===n ? {background:"var(--accent)",color:"#fff",borderColor:"var(--accent)"} : {}),...(n<wizStep ? {opacity:.85} : n>wizStep ? {opacity:.45} : {})}}>
+                ${n}. ${lbl}
+              </button>
+            `)}
+          </div>
           <div class="stack">
-            <!-- STEP 1: story idea → storyboard -->
+            <!-- STEP 1: story idea + dialogue idea + length/aspect -->
+            ${wizStep === 1 && html`
             <div>
               <label>① Story idea</label>
               <textarea rows="3" placeholder="A lone astronaut explores an abandoned Martian station, discovers a flickering signal, and follows it to a hidden greenhouse still alive."
                 value=${scPrompt} onInput=${e => setScPrompt(e.target.value)}></textarea>
+            </div>
+            <div>
+              <label>Dialogue idea <span class="muted small">· optional — what they talk about / the tone. Leave empty to auto-write in sync with the story.</span></label>
+              <textarea rows="2" style=${{fontSize:13}} value=${scDialogPrompt}
+                onInput=${e => setScDialogPrompt(e.target.value)}
+                placeholder="e.g. Two friends bicker playfully about who saw the signal first."></textarea>
             </div>
             <div class="row">
               <div>
@@ -1438,10 +1580,12 @@ function App() {
                 </select>
               </div>
             </div>
-            <!-- STEP 2: AI voiceover — chosen BEFORE writing the story so the script and
+            `}
+            <!-- STEP 2: language / voiceover — chosen BEFORE writing so the script and
                  narration are generated together, in one language, in sync. -->
+            ${wizStep === 2 && html`
             <div>
-              <label>② AI voiceover <span class="muted small">(narration + dialogue written together, same language, in sync)</span></label>
+              <label>② Language &amp; voiceover <span class="muted small">(the whole script is written in the chosen language)</span></label>
               <div class="seg" style=${{display:"flex",gap:6,flexWrap:"wrap",margin:"4px 0 8px"}}>
                 ${[["off","🔇 No voiceover"],["auto","🎙️ AI voiceover"]].map(([v,lbl]) => html`
                   <button key=${v} type="button" onClick=${() => setScNarrationMode(v)}
@@ -1451,10 +1595,10 @@ function App() {
                   </button>
                 `)}
               </div>
-              ${scNarrationMode !== "off" && html`
+              ${scNarrationMode !== "off" ? html`
                 <div class="stack" style=${{gap:8}}>
                   <div>
-                    <label>Narrator voice <span class="muted small">· language: <strong>${voiceLanguage(voice)}</strong> — the whole script is written in this language</span></label>
+                    <label>Language / narrator voice <span class="muted small">· language: <strong>${voiceLanguage(voice)}</strong></span></label>
                     <select value=${voice} onChange=${e => setVoice(e.target.value)}>
                       ${Object.entries(voiceGroups).map(([g, list]) => list.length > 0 && html`
                         <optgroup label=${g} key=${g}>
@@ -1464,7 +1608,7 @@ function App() {
                     </select>
                   </div>
                   <div>
-                    <label>Default character voice <span class="muted small">· dialogue fallback when a cast member has no voice set in ③. Defaults to the narrator voice.</span></label>
+                    <label>Default character voice <span class="muted small">· dialogue fallback when a cast member has no voice set in step 4</span></label>
                     <select value=${scDialogVoice} onChange=${e => setScDialogVoice(e.target.value)}>
                       <option value="">Same as narrator</option>
                       ${Object.entries(voiceGroups).map(([g, list]) => list.length > 0 && html`
@@ -1474,40 +1618,32 @@ function App() {
                       `)}
                     </select>
                   </div>
-                  <div>
-                    <label>Dialogue direction <span class="muted small">· optional — what characters talk about / tone. Leave empty to auto-write in sync with the story.</span></label>
-                    <textarea rows="2" style=${{fontSize:13}} value=${scDialogPrompt}
-                      onInput=${e => setScDialogPrompt(e.target.value)}
-                      placeholder="e.g. Lena teases her friend for being late; keep it playful. Leave empty and dialogue is written automatically, in sync with the story + narration."></textarea>
-                    ${scStory && html`
-                      <div class="btn-row" style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",marginTop:6}}>
-                        <button class="ghost" onClick=${genDialogue} disabled=${scDialoging || running}>
-                          ${scDialoging ? "Writing dialogue…" : "✍️ Generate dialogue"}
-                        </button>
-                        <span class="muted small">rewrites every clip's dialogue from the story + narration</span>
-                      </div>
-                    `}
-                  </div>
-                  ${scStory && html`
-                    <div class="btn-row" style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
-                      <button class="ghost" onClick=${previewNarration}>🔊 Preview voice</button>
-                      <span class="muted small">per-clip lines are in the storyboard below — edit any freely</span>
-                    </div>
-                  `}
-                  ${scNarrAudio && html`<audio src=${scNarrAudio.url} controls style=${{width:"100%"}}></audio>`}
                 </div>
-              `}
+              ` : html`<p class="muted small">The film will be silent. You can still type on-screen dialogue in step 3 — it just won't be spoken.</p>`}
             </div>
 
             <div class="btn-row" style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
-              <button class="primary" onClick=${buildStoryboard} disabled=${scBuilding || running || !scPrompt.trim()}>
-                ${scBuilding ? "Writing story…" : (scNarrationMode !== "off" ? "① Generate story + voiceover" : "① Generate storyboard")}
+              <button class="primary" onClick=${buildStoryboard} disabled=${scBuilding || !scPrompt.trim()}>
+                ${scBuilding ? "Writing story…" : (scNarrationMode !== "off" ? "Generate story + voiceover →" : "Generate storyboard →")}
               </button>
               <span class="muted small">${scClipCount} clips · ${scClipSec}s each · one continuous arc</span>
             </div>
+            `}
 
-            <!-- Storyboard preview (editable) -->
-            ${scStory && Array.isArray(scStory.clips) && html`
+            <!-- STEP 3: story, narration & dialogue review (editable) -->
+            ${wizStep === 3 && (!scStory ? html`<p class="muted small">Generate the story in step 2 first.</p>` : html`
+              <div>
+                <label>③ Story, narration &amp; dialogue <span class="muted small">· generated — review &amp; edit anything below</span></label>
+              </div>
+              ${scNarrationMode !== "off" && html`
+                <div class="btn-row" style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                  <button class="ghost" onClick=${genDialogue} disabled=${scDialoging}>${scDialoging ? "Writing dialogue…" : "✍️ Regenerate dialogue"}</button>
+                  <button class="ghost" onClick=${previewNarration}>🔊 Preview voice</button>
+                  <button class="ghost" onClick=${buildStoryboard} disabled=${scBuilding}>${scBuilding ? "Rewriting…" : "↻ Rewrite story"}</button>
+                </div>
+                ${scNarrAudio && html`<audio src=${scNarrAudio.url} controls style=${{width:"100%"}}></audio>`}
+              `}
+              ${Array.isArray(scStory.clips) && html`
               <div class="plan">
                 <div class="plan-head">
                   <strong>${scStory.title || "Storyboard"}</strong>
@@ -1549,20 +1685,60 @@ function App() {
                   </div>
                 `)}
               </div>
-            `}
+              `}
+            `)}
 
-            <!-- STEP 2: cast (canonical character references) -->
+            <!-- STEP 4: voices (per character) -->
+            ${wizStep === 4 && (scNarrationMode === "off" ? html`<p class="muted small">Voiceover is off, so there are no voices to pick. Continue to casting →</p>` : html`
+              <div>
+                <label>④ Voices <span class="muted small">· a distinct voice per character, in ${voiceLanguage(voice)}</span></label>
+                <div style=${{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center",margin:"6px 0 8px"}}>
+                  <span class="muted small">Suggested bundles:</span>
+                  ${bundlesForCurrentLanguage().map((b,bi) => html`<button key=${bi} class="ghost small" onClick=${() => applyVoiceBundle(b)} disabled=${!voices.length}>${b.label}</button>`)}
+                  <button class="ghost small" onClick=${resuggestVoices} disabled=${!voices.length}>↻ Auto-suggest by character</button>
+                </div>
+                <div class="stack" style=${{gap:8}}>
+                  <div>
+                    <label class="muted small">Narrator voice</label>
+                    <select value=${voice} onChange=${e => setVoice(e.target.value)}>
+                      ${Object.entries(voiceGroups).map(([g, list]) => list.length > 0 && html`
+                        <optgroup label=${g} key=${"nv" + g}>
+                          ${list.map(v => html`<option value=${v.shortName} key=${"nv" + v.shortName}>${v.localName || v.shortName} (${v.gender || "?"})</option>`)}
+                        </optgroup>
+                      `)}
+                    </select>
+                  </div>
+                  ${(scCast || []).length === 0 ? html`<p class="muted small">No named characters — only the narrator speaks.</p>` : (scCast || []).map((c,i) => html`
+                    <div key=${c.id} style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                      <span class="pill small" style=${{flex:"0 0 auto"}}>${i+1}</span>
+                      <strong style=${{flex:"0 0 auto",fontSize:13}}>${c.name || c.id}</strong>
+                      <select style=${{flex:"1 1 160px"}} value=${c.voice || ""} onChange=${e => updateCastMember(c.id, { voice: e.target.value })}>
+                        <option value="">Default character voice</option>
+                        ${Object.entries(voiceGroups).map(([g, list]) => list.length > 0 && html`
+                          <optgroup label=${g} key=${"cv" + c.id + g}>
+                            ${list.map(v => html`<option value=${v.shortName} key=${"cv" + c.id + v.shortName}>${v.localName || v.shortName} (${v.gender || "?"})</option>`)}
+                          </optgroup>
+                        `)}
+                      </select>
+                    </div>
+                  `)}
+                </div>
+              </div>
+            `)}
+
+            <!-- STEP 5: cast (canonical character references) -->
+            ${wizStep === 5 && html`
             <div>
-              <label>③ Cast & locations <span class="muted small">(review the cast, then render references in parallel)</span></label>
+              <label>⑤ Characters <span class="muted small">(upload a face for the lead, or let AI generate everyone — carried across every clip)</span></label>
               <p class="muted small" style=${{margin:"2px 0 8px"}}>
-                Review the cast the story proposed below — edit any description, drop in a template, set a per-character voice, or add/remove characters. Optionally upload a photo for the lead. Each character is then rendered once and reused in every clip so identities stay locked.
+                Review the cast the story proposed — edit any description, drop in a template, or add/remove characters. Optionally upload a photo for the lead. Each character is rendered once and reused in every clip so identities stay locked.
               </p>
               <div style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",margin:"0 0 10px"}}>
                 <span class="muted small" style=${{flex:"0 0 auto"}}>Portrait engine</span>
                 <div class="seg" style=${{display:"flex",gap:6}}>
                   ${[["flux","⚡ FLUX.1 Schnell"],["comfy","🎬 ComfyUI still"]].map(([v,lbl]) => html`
                     <button key=${v} type="button" onClick=${() => setScImageEngine(v)}
-                      class="ghost small" disabled=${scCasting || running}
+                      class="ghost small"
                       style=${scImageEngine===v ? {background:"var(--accent)",color:"#fff",borderColor:"var(--accent)"} : {}}>
                       ${lbl}
                     </button>
@@ -1585,17 +1761,8 @@ function App() {
               ${scStory && scCast.length > 0 && html`
                 <div class="stack" style=${{gap:8,margin:"8px 0 4px"}}>
                   <div class="muted small">
-                    <strong>Cast (${scCast.length})</strong> — edit a look, drop in a template, or pick a voice. Changing a description re-renders that character's reference.
+                    <strong>Cast (${scCast.length})</strong> — edit a look, drop in a template, or add/remove characters. Changing a description re-renders that character's reference. Voices are set in step 4.
                   </div>
-                  ${scNarrationMode !== "off" && html`
-                    <div style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",padding:"6px 8px",border:"1px dashed var(--border)",borderRadius:"var(--radius-sm)",background:"var(--surface-2)"}}>
-                      <span class="muted small" style=${{flex:"1 1 200px"}}>
-                        🔊 <strong>Suggested voices</strong> in <strong>${voiceLanguage(voice)}</strong> — one per character, picked from each role. Tweak any below.
-                      </span>
-                      <button class="ghost small" onClick=${resuggestVoices} disabled=${!voices.length}
-                        title="Re-roll the suggested character voices">↻ Re-suggest voices</button>
-                    </div>
-                  `}
                   ${scCast.map((c, i) => html`
                     <div key=${c.id} style=${{border:"1px solid var(--border)",borderRadius:"var(--radius-sm)",padding:8,display:"flex",flexDirection:"column",gap:6,background:"var(--surface-2)"}}>
                       <div style=${{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
@@ -1614,19 +1781,6 @@ function App() {
                       <textarea rows="2" style=${{fontSize:12}} value=${c.description||""}
                         placeholder="Locked look: age, build, skin tone, hair, wardrobe, distinguishing features"
                         onInput=${e => updateCastMember(c.id, { description: e.target.value })}></textarea>
-                      ${scNarrationMode !== "off" && html`
-                        <div style=${{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
-                          <span class="muted small" style=${{flex:"0 0 auto"}}>🔊 Voice</span>
-                          <select value=${c.voice||""} onChange=${e => updateCastMember(c.id, { voice: e.target.value })} style=${{flex:"1 1 160px",fontSize:12}}>
-                            <option value="">Default character voice</option>
-                            ${Object.entries(voiceGroups).map(([g, list]) => list.length > 0 && html`
-                              <optgroup label=${g} key=${c.id+"g"+g}>
-                                ${list.map(v => html`<option value=${v.shortName} key=${c.id+v.shortName}>${v.localName || v.shortName} (${v.gender||"?"})</option>`)}
-                              </optgroup>
-                            `)}
-                          </select>
-                        </div>
-                      `}
                     </div>
                   `)}
                   <div style=${{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
@@ -1639,61 +1793,75 @@ function App() {
                 </div>
               `}
               <div class="btn-row" style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",marginTop:8}}>
-                <button class="primary" onClick=${generateCast} disabled=${!scStory || scCasting || running}>
-                  ${scCasting ? "Casting…" : (scCast.length ? "↻ Regenerate cast" : "③ Generate cast")}
-                </button>
-                <span class="muted small">${!scStory ? "build a storyboard first" : scCastReady ? "cast ready — render below" : "renders one reference per character"}</span>
+                <span class="muted small">${(scCast || []).length ? (scCast.length + " character(s) — portraits & continuity render automatically in the background.") : "No characters yet — AI will generate them for you."}</span>
               </div>
-              ${scCast.length > 0 && html`
-                <div style=${{display:"flex",gap:8,overflowX:"auto",padding:"10px 2px 2px"}}>
-                  ${scCast.map((c, i) => html`
-                    <div key=${i} style=${{flex:"0 0 auto",width:104,textAlign:"center"}}>
-                      <div style=${{position:"relative",width:104,height:104,borderRadius:8,overflow:"hidden",border:"1px solid var(--border)",background:"var(--surface-2)",display:"flex",alignItems:"center",justifyContent:"center"}}>
-                        ${c.previewUrl
-                          ? html`<img src=${c.previewUrl} alt=${c.name||c.id} style=${{width:"100%",height:"100%",objectFit:"cover"}} />`
-                          : html`<span style=${{fontSize:22}}>${c.status === "rendering" ? "⏳" : c.status === "failed" ? "⚠️" : "🎭"}</span>`}
-                      </div>
-                      <div class="small" style=${{marginTop:4,fontWeight:600,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}} title=${c.description||""}>${c.name || c.id}</div>
-                      <button class="ghost small" style=${{marginTop:2,fontSize:10}} onClick=${() => regenCast(c.id)} disabled=${scCasting || running}>↻ recast</button>
-                    </div>
-                  `)}
-                </div>
-              `}
             </div>
-
-            <!-- ④ render the chain -->
-            <div class="btn-row" style=${{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
-              <button class="primary" onClick=${runStoryChain}
-                disabled=${running || scCasting || !scStory || !scCastReady}>
-                ${running ? "Rendering chain…" : `▶ Render ${scClipCount}-clip story`}
-              </button>
-              ${running && html`<button onClick=${cancelRun} title="Stop and cancel the active GPU job">✕ Cancel</button>`}
-              <span class="pill ${status.phase === "failed" ? "err" : status.phase === "done" ? "ok" : ""}">${status.label}</span>
-            </div>
-            ${(running || status.pct > 0) && html`<div class="progress"><div style=${{width: status.pct + "%"}}></div></div>`}
-
-            <!-- Per-clip chain visualization -->
-            ${scProgress.length > 0 && html`
-              <div style=${{display:"flex",gap:8,overflowX:"auto",padding:"8px 2px"}}>
-                ${scProgress.map((c, i) => html`
-                  <div key=${i} style=${{flex:"0 0 auto",width:120,textAlign:"center"}}>
-                    <div style=${{position:"relative",width:120,height:68,borderRadius:8,overflow:"hidden",border:"1px solid var(--border)",background:"var(--surface-2)",display:"flex",alignItems:"center",justifyContent:"center"}}>
-                      ${c.clipUrl
-                        ? html`<video src=${c.clipUrl} muted loop playsinline onMouseOver=${e=>e.target.play()} onMouseOut=${e=>e.target.pause()} style=${{width:"100%",height:"100%",objectFit:"cover"}}></video>`
-                        : html`<span style=${{fontSize:22}}>${c.status === "rendering" ? "⏳" : c.status === "failed" ? "⚠️" : "🎞️"}</span>`}
-                      <span style=${{position:"absolute",top:3,left:3,fontSize:10,padding:"1px 5px",borderRadius:6,background:"rgba(0,0,0,.6)",color:"#fff"}}>${i+1}</span>
-                    </div>
-                    <div class=${"pill small " + (c.status==="done"?"ok":c.status==="failed"?"err":"")} style=${{marginTop:4,fontSize:10}}>${c.status}</div>
-                    <div class="muted small" style=${{fontSize:10,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}} title=${c.title}>${c.title}</div>
-                    ${c.startUrl && html`
-                      <div class="muted small" style=${{fontSize:10,marginTop:2}}>↧ scene seed</div>
-                      <img src=${c.startUrl} alt="scene seed" style=${{width:120,height:34,objectFit:"cover",borderRadius:6,border:"1px dashed var(--accent)"}} />
-                    `}
-                  </div>
-                `)}
-              </div>
             `}
+
+            <!-- STEP 6: render -->
+            ${wizStep === 6 && html`
+            <div>
+              <label>⑥ Render</label>
+              <div class="plan" style=${{marginTop:6}}>
+                <div class="plan-head"><strong>${(scStory && scStory.title) || "Your film"}</strong><span class="pill">${scClipCount} clips · ${scClipSec}s</span></div>
+                <div class="muted small" style=${{padding:"0 12px 10px",display:"flex",flexDirection:"column",gap:4}}>
+                  <span>🎬 ${scClipCount} clips · ${scSize} · ${scAspect}</span>
+                  <span>🗣️ ${scNarrationMode === "off" ? "Silent" : ("Voiceover in " + voiceLanguage(voice))}</span>
+                  <span>🎭 ${(scCast || []).length} character(s)${scCharFile ? " · lead photo provided" : ""}</span>
+                  <span>🖼️ Portraits via ${scImageEngine === "flux" ? "FLUX.1 Schnell" : "ComfyUI still"}</span>
+                </div>
+              </div>
+              <p class="muted small" style=${{marginTop:6}}>
+                Submitting sends this film to the background render queue. The wizard resets so you can start another — track progress and cancel any job in the queue below. Finished films are saved and appear automatically.
+              </p>
+            </div>
+            <div class="btn-row" style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+              <button class="primary" onClick=${submitStoryJob} disabled=${scCasting || !scStory}>
+                ${scCasting ? "Submitting…" : "🚀 Submit to render queue"}
+              </button>
+            </div>
+            `}
+
+            <!-- wizard navigation -->
+            <div style=${{display:"flex",gap:8,alignItems:"center",justifyContent:"space-between",marginTop:8,borderTop:"1px solid var(--border)",paddingTop:10}}>
+              <button class="ghost" onClick=${wizBack} disabled=${wizStep === 1}>← Back</button>
+              <span class="muted small">Step ${wizStep} of 6</span>
+              ${wizStep < 6
+                ? html`<button class="primary" onClick=${wizNext} disabled=${wizCanNext[wizStep] && !wizCanNext[wizStep]()}>Next →</button>`
+                : html`<span style=${{width:64}}></span>`}
+            </div>
           </div>
+        </div>
+
+        <!-- RENDER QUEUE (durable background jobs) -->
+        <div class="card">
+          <h3 style=${{display:"flex",alignItems:"center",gap:8}}>🎞️ Render queue ${jobs.length > 0 && html`<span class="pill">${jobs.length}</span>`}</h3>
+          ${jobs.length === 0
+            ? html`<p class="muted small">No films yet. Build one on the left and submit — it renders here in the background while you start the next.</p>`
+            : html`<div class="stack" style=${{gap:8}}>
+                ${jobs.map(j => {
+                  const active = j.status === "queued" || j.status === "running";
+                  const pillCls = j.status === "succeeded" ? "ok" : (j.status === "failed" || j.status === "interrupted") ? "err" : "";
+                  return html`
+                    <div key=${j.id} style=${{border:"1px solid var(--border)",borderRadius:"var(--radius-sm)",padding:10,background:"var(--surface-2)"}}>
+                      <div style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                        <strong style=${{flex:"1 1 120px",fontSize:13,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}} title=${j.title}>${j.title || "Untitled"}</strong>
+                        <span class=${"pill small " + pillCls}>${j.status}</span>
+                        ${active && html`<button class="ghost small" onClick=${() => cancelJob(j.id)}>✕ Cancel</button>`}
+                      </div>
+                      ${j.label && html`<div class="muted small" style=${{margin:"4px 0"}}>${j.label}</div>`}
+                      ${active && html`<div class="progress"><div style=${{width:(j.pct || 0) + "%"}}></div></div>`}
+                      ${j.resultUrl && html`
+                        <video src=${j.resultUrl} controls loop playsinline style=${{width:"100%",borderRadius:6,marginTop:6}}></video>
+                        <div class="meta" style=${{flexWrap:"wrap"}}>
+                          <a href=${j.resultUrl} target="_blank" rel="noopener">download ↗</a>
+                          <span class="muted small">${j.narrate ? "voiced" : "silent"} · ${j.size || ""}</span>
+                        </div>
+                      `}
+                      ${j.error && !j.resultUrl && html`<div class="muted small" style=${{color:"#ef4444"}}>${j.error}</div>`}
+                    </div>`;
+                })}
+              </div>`}
         </div>
       </div>
 
