@@ -25,9 +25,14 @@ builder.Services.AddSingleton<SoraJobWatcherRegistry>();
 // Wan2.2 (ComfyUI) client. Replaces the AOAI Sora-2 video path; the rest of the
 // app (frontend, push watcher, blob upload, stitch) keeps working unchanged.
 builder.Services.AddSingleton<WanClient>();
-// Internal auth for backend services
+// Durable server-side story render pipeline: an in-process queue + a single
+// background worker that renders a whole film (cast → clip chain → narrate →
+// mux → stitch) by reusing the app's own endpoints over localhost, so the UI is
+// freed the moment a film is submitted. InternalAuth lets those self-calls past
+// the Easy Auth middleware.
 builder.Services.AddSingleton<InternalAuth>();
-// Note: StoryRenderQueue and StoryRenderWorker removed - all jobs now tracked via /api/videos (history)
+builder.Services.AddSingleton<StoryRenderQueue>();
+builder.Services.AddHostedService<StoryRenderWorker>();
 
 var app = builder.Build();
 app.UseDefaultFiles();
@@ -284,8 +289,36 @@ app.MapPost("/api/jobs/{id}/cancel", async (string id, WanClient wan, Cancellati
 // stitch) while the UI is freed to compose the next one. Jobs are persisted to
 // blob so finished films reappear after an idle recycle. Cancel is the only
 // interrupt — it stops the in-flight GPU clip and ends the job.
-// All jobs consolidated to /api/videos (history endpoint below)
-// /api/story-jobs endpoints removed in favor of unified history view
+app.MapPost("/api/story-jobs", (StorySpec spec, StoryRenderQueue queue) =>
+{
+    if (spec?.Story is null)
+        return Results.BadRequest(new { error = "story spec is required" });
+    if (spec.Story["clips"] is not System.Text.Json.Nodes.JsonArray clips || clips.Count == 0)
+        return Results.BadRequest(new { error = "storyboard has no clips" });
+    string title = "Untitled film";
+    try { var t = spec.Story["title"]?.GetValue<string>(); if (!string.IsNullOrWhiteSpace(t)) title = t!; } catch { }
+    var job = queue.Enqueue(spec, title);
+    return Results.Json(new { id = job.Id, status = job.Status });
+});
+
+app.MapGet("/api/story-jobs", async (StoryRenderQueue queue, IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
+{
+    var sas = await TryStorySasAsync(cfg, cred, ct);
+    Func<string?, string?> resign = sas is { } s ? (u => ResignBlobUrl(u, s.account, s.container, s.udk)) : (u => u);
+    return Results.Json(queue.List().Select(j => StoryJobView.Summary(j, resign)));
+});
+
+app.MapGet("/api/story-jobs/{id}", async (string id, StoryRenderQueue queue, IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
+{
+    var job = queue.Get(id);
+    if (job is null) return Results.NotFound(new { error = "no such job" });
+    var sas = await TryStorySasAsync(cfg, cred, ct);
+    Func<string?, string?> resign = sas is { } s ? (u => ResignBlobUrl(u, s.account, s.container, s.udk)) : (u => u);
+    return Results.Json(StoryJobView.Full(job, resign));
+});
+
+app.MapPost("/api/story-jobs/{id}/cancel", (string id, StoryRenderQueue queue) =>
+    queue.Cancel(id) ? Results.Json(new { ok = true }) : Results.NotFound(new { error = "no such job" }));
 
 // 3. Finalize: download MP4 from ComfyUI's /view, stream-upload to blob, return SAS URL.
 app.MapPost("/api/jobs/{id}/finalize", async (
@@ -1361,70 +1394,29 @@ Narration line to embed verbatim (already in {langName}, distribute across segme
 Plan the {segmentCount}-segment arc as JSON now.";
 
     var client = hf.CreateClient();
-    // Extended timeout for Azure OpenAI calls that may take 3-5 minutes on slow/loaded endpoints.
-    client.Timeout = TimeSpan.FromSeconds(600);
-    
-    // Retry up to 5 times with exponential backoff for transient errors
-    System.Text.Json.JsonDocument? chatDoc = null;
-    for (int attempt = 1; attempt <= 5 && chatDoc is null; attempt++)
+    client.Timeout = TimeSpan.FromSeconds(90);
+    using var chatMsg = new HttpRequestMessage(HttpMethod.Post,
+        $"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=2024-10-21");
+    chatMsg.Headers.Add("api-key", key);
+    var payload = new
     {
-        try
-        {
-            using var chatMsg = new HttpRequestMessage(HttpMethod.Post,
-                $"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=2024-10-21");
-            chatMsg.Headers.Add("api-key", key);
-            var payload = new
-            {
-                messages = new object[] {
-                    new { role = "system", content = sys },
-                    new { role = "user",   content = userMsg }
-                },
-                // gpt-4o-mini doesn't support `max_tokens` or non-default `temperature`.
-                max_completion_tokens = 2400,
-                response_format = new { type = "json_object" }
-            };
-            chatMsg.Content = new StringContent(
-                System.Text.Json.JsonSerializer.Serialize(payload),
-                Encoding.UTF8, "application/json");
-            using var chatResp = await client.SendAsync(chatMsg, ct);
-            var chatBody = await chatResp.Content.ReadAsStringAsync(ct);
-            
-            if (!chatResp.IsSuccessStatusCode)
-            {
-                var statusCode = (int)chatResp.StatusCode;
-                var isTransient = statusCode == 429 || statusCode == 408 || statusCode == 500 || statusCode == 502 || statusCode == 503 || statusCode == 504;
-                if (isTransient && attempt < 5)
-                {
-                    // Exponential backoff: 1s, 2s, 4s, 8s, 16s
-                    var delayMs = (int)Math.Pow(2, attempt - 1) * 1000;
-                    await Task.Delay(delayMs, ct);
-                    continue;
-                }
-                return Results.Problem($"Enhance failed ({statusCode}): {chatBody}");
-            }
-            
-            chatDoc = System.Text.Json.JsonDocument.Parse(chatBody);
-        }
-        catch (TaskCanceledException) when (attempt < 5)
-        {
-            // Timeout — apply exponential backoff and retry
-            var delayMs = (int)Math.Pow(2, attempt - 1) * 1000;
-            await Task.Delay(delayMs, ct);
-            continue;
-        }
-        catch (Exception ex) when (attempt < 5 && !ct.IsCancellationRequested)
-        {
-            // Other transient errors — try again with backoff
-            var delayMs = (int)Math.Pow(2, attempt - 1) * 1000;
-            await Task.Delay(delayMs, ct);
-            continue;
-        }
-    }
-    
-    if (chatDoc is null)
-        return Results.Problem("Enhance failed: Could not get response from Azure OpenAI after 5 retries");
-    
-    // Continue with parsing
+        messages = new object[] {
+            new { role = "system", content = sys },
+            new { role = "user",   content = userMsg }
+        },
+        // gpt-5-mini doesn't support `max_tokens` or non-default `temperature`.
+        max_completion_tokens = 2400,
+        response_format = new { type = "json_object" }
+    };
+    chatMsg.Content = new StringContent(
+        System.Text.Json.JsonSerializer.Serialize(payload),
+        Encoding.UTF8, "application/json");
+    using var chatResp = await client.SendAsync(chatMsg, ct);
+    var chatBody = await chatResp.Content.ReadAsStringAsync(ct);
+    if (!chatResp.IsSuccessStatusCode)
+        return Results.Problem($"Enhance failed ({(int)chatResp.StatusCode}): {chatBody}");
+
+    using var chatDoc = System.Text.Json.JsonDocument.Parse(chatBody);
     var rawContent = chatDoc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString()?.Trim() ?? "{}";
 
     // Parse the structured plan. If parsing fails, fall back to returning rawContent as the flat prompt.
@@ -1601,9 +1593,7 @@ Output JSON only. Define every character in `cast` and every place in `locations
 Cast the characters and locations this idea needs (support multiple characters), then produce the {clipCount}-clip storyboard ({clipSeconds}s per clip, {clipCount * clipSeconds}s total, aspect {size}) as ONE continuous, cinematic story — a single physically-plausible action per clip performed with readable facial expression and natural acting, each clip listing which cast members and location appear{(narrate ? $", plus per-clip audio chosen by the film's mode — for a STORY a {language} NARRATOR voiceover (with sparse {language} dialogue at key beats), for a CONVERSATION alternating {language} DIALOG and no narration — in {language}'s native script, in sync with each clip's action" : ", with narration and dialog left empty")}. Output JSON only.";
 
     var client = hf.CreateClient();
-    // Extended timeout for Azure OpenAI calls that may take 3-5 minutes on slow/loaded endpoints.
-    // Retry logic below handles transient 504s with exponential backoff.
-    client.Timeout = TimeSpan.FromSeconds(600);
+    client.Timeout = TimeSpan.FromSeconds(90);
 
     object BuildFallbackStoryboard()
     {
@@ -1681,13 +1671,12 @@ Cast the characters and locations this idea needs (support multiple characters),
     }
 
     // The storyboard JSON is large (full cast + per-clip motionPrompt + native-script
-    // narration/dialog) and gpt-4o-mini is a reasoning model, so a single call can
-    // occasionally come back empty/truncated/unparseable on a transient hiccup.
-    // Retry up to 5 times with exponential backoff (1s, 2s, 4s, 8s, 16s) to handle
-    // 504 Gateway Timeouts, 429 Too Many Requests, and other transient AOAI errors.
+    // narration/dialog) and gpt-5-mini is a reasoning model, so a single call can
+    // occasionally come back empty/truncated/unparseable on a transient hiccup. Try
+    // twice before dropping to the bland fallback (which carries no dialogue).
     //
     // Benign ideas (e.g. an adult and a child in an innocent scene) sometimes trip the
-    // Azure content filter. On a filter block we retry with `softUser` — an explicitly
+    // Azure content filter. On a filter block we retry ONCE with `softUser` — an explicitly
     // WHOLESOME reframing of the same idea. This only ever makes the request tamer (it can
     // never push genuinely unsafe content through), so it rescues false positives without
     // bypassing moderation.
@@ -1697,9 +1686,7 @@ Produce the {clipCount}-clip storyboard ({clipSeconds}s per clip, {clipCount * c
 
     System.Text.Json.Nodes.JsonNode? story = null;
     bool soften = false;
-    int maxAttempts = 5;
-    int maxFilterAttempts = 2;
-    for (int attempt = 1; attempt <= maxAttempts && story is null; attempt++)
+    for (int attempt = 1; attempt <= 3 && story is null; attempt++)
     {
         string body;
         try
@@ -1721,44 +1708,21 @@ Produce the {clipCount}-clip storyboard ({clipSeconds}s per clip, {clipCount * c
             body = await resp.Content.ReadAsStringAsync(ct);
             if (!resp.IsSuccessStatusCode)
             {
-                var statusCode = (int)resp.StatusCode;
-                var isTransient = statusCode == 429 || statusCode == 408 || statusCode == 500 || statusCode == 502 || statusCode == 503 || statusCode == 504;
-                if (isTransient && attempt < maxAttempts)
-                {
-                    // Exponential backoff: 1s, 2s, 4s, 8s, 16s
-                    var delayMs = (int)Math.Pow(2, attempt - 1) * 1000;
-                    await Task.Delay(delayMs, ct);
-                    continue;
-                }
-                if (statusCode == 400 &&
+                if (((int)resp.StatusCode == 429 || (int)resp.StatusCode >= 500) && attempt < 3) continue;
+                if ((int)resp.StatusCode == 400 &&
                     (body.Contains("content_filter") || body.Contains("ResponsibleAIPolicy")))
                 {
-                    // Content filter block → retry with the wholesome reframing (once).
-                    if (!soften && maxFilterAttempts > 1)
-                    {
-                        soften = true;
-                        maxFilterAttempts--;
-                        continue;
-                    }
+                    // First filter block → retry once with the wholesome reframing.
+                    if (!soften && attempt < 3) { soften = true; continue; }
                     return Results.Problem(statusCode: 422,
                         title: "Story blocked by content policy",
                         detail: "This idea was blocked by the content safety policy even after an automatic wholesome reframing. Try rephrasing the sensitive part — for example, state ages explicitly and make every interaction clearly innocent.");
                 }
-                return Results.Problem($"Storyboard failed ({statusCode}): {body}");
+                return Results.Problem($"Storyboard failed ({(int)resp.StatusCode}): {body}");
             }
         }
-        catch (TaskCanceledException) when (attempt < maxAttempts)
+        catch (Exception) when (attempt < 3 && !ct.IsCancellationRequested)
         {
-            // Timeout or cancellation — apply exponential backoff and retry
-            var delayMs = (int)Math.Pow(2, attempt - 1) * 1000;
-            await Task.Delay(delayMs, ct);
-            continue;
-        }
-        catch (Exception ex) when (attempt < maxAttempts && !ct.IsCancellationRequested)
-        {
-            // Other transient errors — try again with backoff
-            var delayMs = (int)Math.Pow(2, attempt - 1) * 1000;
-            await Task.Delay(delayMs, ct);
             continue;
         }
 

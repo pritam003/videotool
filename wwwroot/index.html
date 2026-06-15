@@ -2,294 +2,1991 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
+<title>avideo</title>
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>VideoTool · AI Studio</title>
+<link rel="preconnect" href="https://esm.sh" />
 <style>
   :root {
-    --bg-0: #0a0b14;
-    --bg-1: #111327;
-    --bg-2: #181b35;
-    --line: #262a4a;
-    --text: #e7e9ff;
-    --muted: #8a90b8;
-    --accent: #7c5cff;
-    --accent-2: #22d3ee;
-    --ok: #22c55e;
-    --err: #ef4444;
-    --warn: #f59e0b;
+    --bg: #f7f7f5;
+    --surface: #ffffff;
+    --surface-2: #f1f1ee;
+    --border: #e3e3df;
+    --text: #1c1d22;
+    --muted: #6b6f76;
+    --accent: #2f6df4;
+    --accent-soft: #e6efff;
+    --danger: #c5301f;
+    --warn: #b8770b;
+    --ok: #1a8451;
+    --shadow: 0 1px 2px rgba(20,20,25,.04), 0 8px 24px rgba(20,20,25,.06);
+    --radius: 14px;
+    --radius-sm: 10px;
+    --mono: ui-monospace, SF Mono, Menlo, Consolas, monospace;
   }
-  * { box-sizing: border-box }
-  html, body { margin: 0; padding: 0; height: 100%; }
-  body {
-    background:
-      radial-gradient(1200px 600px at 10% -10%, rgba(124,92,255,.25), transparent 60%),
-      radial-gradient(900px 500px at 100% 0%, rgba(34,211,238,.18), transparent 60%),
-      var(--bg-0);
-    color: var(--text);
-    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
-    min-height: 100vh;
+  html[data-theme="dark"] {
+    --bg: #0f1115;
+    --surface: #16181d;
+    --surface-2: #1d2026;
+    --border: #2a2d35;
+    --text: #e8eaf0;
+    --muted: #9aa0ac;
+    --accent: #6ea0ff;
+    --accent-soft: #1d2a44;
+    --danger: #ff7466;
+    --warn: #f0b454;
+    --ok: #58c79b;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.4);
   }
-  header {
-    padding: 22px 28px;
-    display: flex; align-items: center; justify-content: space-between;
-    border-bottom: 1px solid var(--line);
-    backdrop-filter: blur(8px);
-    position: sticky; top: 0; z-index: 10;
-    background: rgba(10,11,20,.7);
+  * { box-sizing: border-box; }
+  html, body { margin:0; padding:0; background:var(--bg); color:var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
   }
-  .brand { display: flex; align-items: center; gap: 12px; font-weight: 700; letter-spacing: .2px; }
-  .logo {
-    width: 32px; height: 32px; border-radius: 8px;
-    background: conic-gradient(from 200deg, var(--accent), var(--accent-2), var(--accent));
-    box-shadow: 0 0 24px rgba(124,92,255,.45);
+  a { color: var(--accent); }
+  button, input, select, textarea {
+    font: inherit; color: inherit;
   }
-  .pill { font-size: 12px; color: var(--muted); padding: 4px 10px; border: 1px solid var(--line); border-radius: 999px; }
-  main {
-    max-width: 1200px; margin: 28px auto; padding: 0 24px;
-    display: grid; grid-template-columns: 1.1fr 1fr; gap: 24px;
+  button {
+    background: var(--surface); border: 1px solid var(--border); color: var(--text);
+    padding: 8px 14px; border-radius: var(--radius-sm); cursor: pointer;
+    transition: background .12s, border-color .12s;
   }
-  @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
-  .card {
-    background: linear-gradient(180deg, var(--bg-1), var(--bg-2));
-    border: 1px solid var(--line);
-    border-radius: 16px;
-    padding: 22px;
-    box-shadow: 0 20px 60px rgba(0,0,0,.35);
-  }
-  h2 { margin: 0 0 14px; font-size: 16px; letter-spacing: .3px; }
-  label { display: block; font-size: 12px; color: var(--muted); margin: 14px 0 6px; text-transform: uppercase; letter-spacing: .8px; }
-  textarea, input, select {
+  button:hover:not(:disabled) { background: var(--surface-2); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.primary { background: var(--accent); color: white; border-color: var(--accent); }
+  button.primary:hover:not(:disabled) { filter: brightness(1.05); }
+  button.ghost { background: transparent; border-color: transparent; }
+  button.ghost:hover:not(:disabled) { background: var(--surface-2); }
+  input[type="text"], input[type="number"], select, textarea {
     width: 100%;
-    background: #0d1024; color: var(--text);
-    border: 1px solid var(--line); border-radius: 10px;
-    padding: 12px 14px; font: inherit;
-    transition: border .15s, box-shadow .15s;
+    background: var(--surface); border: 1px solid var(--border); color: var(--text);
+    padding: 9px 11px; border-radius: var(--radius-sm); outline: none;
+    transition: border-color .12s, box-shadow .12s;
   }
-  textarea { resize: vertical; min-height: 110px; }
-  textarea:focus, input:focus, select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(124,92,255,.25); }
-  button.primary {
-    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
-    width: 100%; margin-top: 16px;
-    padding: 14px 16px; font: 600 15px/1 inherit; color: #0b0c1a;
-    background: linear-gradient(135deg, var(--accent-2), var(--accent));
-    border: 0; border-radius: 12px; cursor: pointer;
-    transition: transform .1s, filter .15s, opacity .15s;
-    box-shadow: 0 10px 30px rgba(124,92,255,.35);
+  input:focus, select:focus, textarea:focus {
+    border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft);
   }
-  button.primary:hover { filter: brightness(1.06); }
-  button.primary:active { transform: translateY(1px); }
-  button.primary[disabled] { opacity: .55; cursor: not-allowed; box-shadow: none; }
-  button.ghost {
-    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
-    padding: 10px 14px; font: 600 13px/1 inherit; color: var(--text);
-    background: transparent; border: 1px solid var(--line); border-radius: 10px; cursor: pointer;
+  textarea { resize: vertical; min-height: 64px; font-family: inherit; }
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; font-weight: 500; }
+
+  header.app {
+    position: sticky; top: 0; z-index: 50;
+    backdrop-filter: saturate(140%) blur(10px);
+    background: color-mix(in srgb, var(--bg) 80%, transparent);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 24px; display: flex; align-items: center; gap: 12px;
   }
-  button.ghost:hover { border-color: var(--accent); }
-  .progress { margin-top: 18px; }
-  .bar { height: 8px; background: #0d1024; border-radius: 999px; border: 1px solid var(--line); overflow: hidden; }
-  .bar > i {
-    display: block; height: 100%; width: 0;
-    background: linear-gradient(90deg, var(--accent-2), var(--accent));
-    transition: width .4s ease;
+  header.app .title { font-weight: 600; font-size: 15px; letter-spacing: -.01em; }
+  header.app .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
+  header.app .spacer { flex: 1; }
+  header.app .badge { font-size: 11px; color: var(--muted); padding: 3px 8px;
+    background: var(--surface-2); border-radius: 999px; }
+
+  main { max-width: 1280px; margin: 0 auto; padding: 24px;
+    display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); gap: 24px;
+    align-items: start; }
+  @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); box-shadow: var(--shadow);
+    padding: 18px;
   }
-  .status {
-    display: flex; align-items: center; justify-content: space-between;
-    margin-top: 8px; font-size: 12px; color: var(--muted);
+  .card + .card { margin-top: 16px; }
+  .card h3 { margin: 0 0 12px; font-size: 13px; font-weight: 600; letter-spacing: .02em;
+    text-transform: uppercase; color: var(--muted); }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .row.three { grid-template-columns: 1fr 1fr 1fr; }
+  @media (max-width: 600px) { .row, .row.three { grid-template-columns: 1fr; } }
+
+  .accordion-item { border-top: 1px solid var(--border); }
+  .accordion-item:first-child { border-top: 0; }
+  .accordion-head { display: flex; align-items: center; gap: 8px; padding: 12px 0; cursor: pointer;
+    user-select: none; font-weight: 500; }
+  .accordion-head .chev { color: var(--muted); transition: transform .15s; }
+  .accordion-item.open .chev { transform: rotate(90deg); }
+  .accordion-body { padding: 4px 0 16px; }
+
+  .stack { display: flex; flex-direction: column; gap: 12px; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px;
+    background: var(--surface-2); border-radius: 999px; font-size: 11px; color: var(--muted); }
+  .pill.ok { color: var(--ok); }
+  .pill.err { color: var(--danger); }
+  .pill.warn { color: var(--warn); }
+
+  .preview { aspect-ratio: 16/9; background: #0a0a0c; border-radius: var(--radius-sm);
+    display: flex; align-items: center; justify-content: center; overflow: hidden;
+    border: 1px solid var(--border); }
+  .preview .empty { color: #777; font-size: 13px; }
+  .preview video { width: 100%; height: 100%; object-fit: contain; }
+
+  .progress { height: 6px; background: var(--surface-2); border-radius: 999px; overflow: hidden;
+    margin-top: 10px; }
+  .progress > div { height: 100%; background: var(--accent); width: 0; transition: width .3s; }
+
+  .meta { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; font-size: 12px; color: var(--muted); }
+  .meta a, .meta span { background: var(--surface-2); padding: 4px 9px; border-radius: 8px;
+    text-decoration: none; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px; }
+  .clip { background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+    overflow: hidden; cursor: pointer; transition: transform .12s, border-color .12s;
+    padding: 0; text-align: left; font: inherit; color: inherit; }
+  .clip:hover { border-color: var(--accent); transform: translateY(-1px); }
+  .clip video { width: 100%; aspect-ratio: 16/9; object-fit: cover; display: block; background: #000; }
+  .clip .name { font-size: 11px; padding: 6px 8px; color: var(--muted);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-family: var(--mono); }
+
+  /* Final prompt big editable */
+  textarea.final { font-family: var(--mono); font-size: 12.5px; min-height: 240px; }
+
+  /* Story plan */
+  .plan { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px; background: var(--surface-2); }
+  .plan-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+  .plan-seg { border-top: 1px dashed var(--border); padding: 8px 4px; }
+  .plan-seg:first-of-type { border-top: 0; }
+  .plan-seg.done { opacity: 0.65; }
+  .plan-seg-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .plan-seg-summary { font-weight: 500; }
+  .plan-beats { margin: 6px 0 0 24px; padding: 0; font-size: 12.5px; color: var(--muted); }
+  .plan-beats li { margin: 2px 0; }
+  .plan-dialogue { font-size: 12.5px; margin: 4px 0 0 24px; color: var(--text); }
+
+  /* Toast */
+  .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    background: var(--text); color: var(--bg); padding: 10px 16px; border-radius: 999px;
+    font-size: 13px; box-shadow: var(--shadow); z-index: 100; opacity: 0; transition: opacity .2s;
+    pointer-events: none; max-width: 90vw; }
+  .toast.show { opacity: 1; }
+  .toast.err { background: var(--danger); color: white; }
+
+  /* Debug drawer */
+  .drawer { position: fixed; bottom: 0; right: 0; width: min(560px, 100vw);
+    max-height: 50vh; background: var(--surface); border-top-left-radius: var(--radius);
+    border: 1px solid var(--border); border-right: 0; border-bottom: 0;
+    box-shadow: var(--shadow); display: flex; flex-direction: column; z-index: 60;
+    transform: translateY(calc(100% - 36px)); transition: transform .2s;
   }
-  .status .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; }
-  .status.queued .dot { background: var(--warn); }
-  .status.in_progress .dot { background: var(--accent-2); animation: pulse 1.2s infinite; }
-  .status.completed .dot { background: var(--ok); }
-  .status.failed .dot, .status.cancelled .dot { background: var(--err); }
-  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .35 } }
-  .toast {
-    position: fixed; right: 20px; bottom: 20px; max-width: 360px;
-    background: var(--bg-2); border: 1px solid var(--line); border-radius: 10px;
-    padding: 12px 14px; font-size: 13px; color: var(--text);
-    box-shadow: 0 16px 50px rgba(0,0,0,.5);
-    transform: translateY(20px); opacity: 0; pointer-events: none;
-    transition: opacity .2s, transform .2s;
+  .drawer.open { transform: translateY(0); }
+  .drawer .head { display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+    border-bottom: 1px solid var(--border); cursor: pointer; user-select: none; }
+  .drawer .body { flex: 1; overflow: auto; padding: 8px 12px; font: 11px/1.45 var(--mono); }
+  .drawer .body .line { padding: 3px 0; border-bottom: 1px dashed var(--border); white-space: pre-wrap; word-break: break-word; }
+  .drawer .body .line .lvl { display: inline-block; width: 44px; font-weight: 600; }
+  .drawer .body .line.error .lvl { color: var(--danger); }
+  .drawer .body .line.warn .lvl  { color: var(--warn); }
+  .drawer .body .line.net .lvl   { color: var(--accent); }
+  .drawer .body .line.ok .lvl    { color: var(--ok); }
+  .drawer .body .line.info .lvl  { color: var(--muted); }
+
+  details summary { cursor: pointer; }
+  hr.sep { border: 0; border-top: 1px solid var(--border); margin: 14px 0; }
+  .muted { color: var(--muted); }
+  .small { font-size: 12px; }
+
+  /* ---------- Mobile-friendly tweaks ----------
+     Goals: prevent iOS zoom-on-focus (16px inputs), enlarge touch targets to
+     ≥44px, tighten paddings, let buttons & rows wrap, make the debug drawer
+     full-width, and keep the preview comfortably sized on phones. */
+  @media (max-width: 720px) {
+    main { padding: 12px; gap: 14px; }
+    header.app { padding: 10px 12px; gap: 8px; }
+    header.app .badge { display: none; }
+    .card { padding: 14px; border-radius: 12px; }
+    .card + .card { margin-top: 12px; }
+    .card h3 { font-size: 12px; margin-bottom: 10px; }
+
+    /* iOS zooms any input < 16px on focus — bump to 16px and keep mono fields readable. */
+    input[type="text"], input[type="number"], select, textarea { font-size: 16px; padding: 11px 12px; }
+    textarea.final { font-size: 13px; min-height: 180px; }
+    textarea { min-height: 80px; }
+
+    /* Bigger tap targets, allow wrapping, equal-width by default. */
+    button { padding: 11px 14px; min-height: 44px; }
+    .btn-row, .row-buttons, .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    .btn-row > button, .row-buttons > button, .actions > button { flex: 1 1 calc(50% - 4px); min-width: 0; }
+
+    .grid { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; }
+    .clip video { aspect-ratio: 16/9; }
+
+    /* Debug drawer: full-width sheet that slides up; collapse handle visible. */
+    .drawer { width: 100vw; max-height: 60vh; border-radius: 12px 12px 0 0;
+      border-left: 0; border-right: 0; }
+    .drawer .body { font-size: 12px; }
+
+    /* Toast clears the drawer collapsed handle. */
+    .toast { bottom: 56px; font-size: 13px; padding: 10px 14px; }
+
+    /* Plan + meta wrap nicely. */
+    .plan { padding: 8px; }
+    .plan-beats { margin-left: 16px; }
+    .plan-dialogue { margin-left: 16px; }
+    .meta { gap: 6px; font-size: 11px; }
+
+    /* Accordion heads tappable. */
+    .accordion-head { padding: 14px 0; min-height: 44px; }
   }
-  .toast.show { transform: translateY(0); opacity: 1; }
-  .toast.err { border-color: rgba(239,68,68,.6); }
-  .lib-item {
-    aspect-ratio: 16/9; background: #0d1024; border: 1px solid var(--line);
-    border-radius: 10px; overflow: hidden; cursor: pointer; position: relative;
-    transition: border-color .15s, transform .15s;
+
+  @media (max-width: 420px) {
+    main { padding: 10px; }
+    .card { padding: 12px; }
+    .grid { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); }
+    /* On the smallest phones, give each action button its own row for clarity. */
+    .btn-row > button, .row-buttons > button, .actions > button { flex-basis: 100%; }
+    header.app .title { font-size: 14px; }
   }
-  .lib-item:hover { border-color: var(--accent); transform: translateY(-2px); }
-  .lib-item video, .lib-item .thumb { width: 100%; height: 100%; object-fit: cover; }
-  .lib-item .thumb { display: flex; align-items: center; justify-content: center; background: #0a0b14; font-size: 24px; }
-  .lib-item-del {
-    position: absolute; top: 4px; right: 4px; background: rgba(0,0,0,.7);
-    color: var(--err); border: none; border-radius: 6px; padding: 4px 8px;
-    cursor: pointer; font-size: 11px; opacity: 0; transition: opacity .15s;
-  }
-  .lib-item:hover .lib-item-del { opacity: 1; }
 </style>
 </head>
 <body>
-<header>
-  <div class="brand">
-    <div class="logo"></div>
-    <div>VideoTool <span class="pill">AI Studio</span></div>
-  </div>
-  <div class="pill" id="health">checking…</div>
-</header>
-
-<main>
-  <!-- LEFT: composer -->
-  <section class="card">
-    <h2>Create Video</h2>
-
-    <label for="prompt">Story Prompt</label>
-    <textarea id="prompt" placeholder="Describe your story idea. E.g.: A serene timelapse of clouds drifting over snow-capped mountains at golden hour, cinematic, 8K quality"></textarea>
-
-    <button id="go" class="primary">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-      Generate Video
-    </button>
-
-    <div class="progress" id="progress" hidden>
-      <div class="bar"><i id="barFill"></i></div>
-      <div class="status" id="statusLine"><span><span class="dot"></span><span id="statusText">generating…</span></span><span id="elapsed">0s</span></div>
-    </div>
-  </section>
-
-  <!-- RIGHT: library -->
-  <section class="card">
-    <h2>Video Gallery</h2>
-    <div style="display:flex;gap:6px;margin:8px 0">
-      <button type="button" id="libRefresh" class="ghost">🔄 Refresh</button>
-      <span id="libStatus" style="font-size:12px;opacity:.7;align-self:center"></span>
-    </div>
-    <div id="libGrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px;min-height:200px"></div>
-  </section>
-</main>
-
+<div id="root"></div>
 <div class="toast" id="toast"></div>
 
-<script>
-const $ = s => document.querySelector(s);
-const $$ = s => document.querySelectorAll(s);
+<script type="importmap">
+{ "imports": {
+  "react": "https://esm.sh/react@18.3.1",
+  "react-dom/client": "https://esm.sh/react-dom@18.3.1/client?external=react",
+  "htm": "https://esm.sh/htm@3.1.1/react?external=react"
+}}
+</script>
 
-// UI helpers
-const show = el => el && (el.hidden = false);
-const hide = el => el && (el.hidden = true);
-const toast = (msg, isErr) => {
-  const el = $('#toast');
-  el.textContent = msg;
-  el.classList.toggle('err', isErr);
-  el.classList.add('show');
-  setTimeout(() => el.classList.remove('show'), 3000);
-};
+<script type="module">
+import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { createRoot } from "react-dom/client";
+import { html } from "htm";
 
-// Health check
-fetch('/health').then(r => r.json()).then(d => {
-  $('#health').textContent = d.status === 'ok' ? '✅ Ready' : '⚠️ ' + d.status;
-  $('#health').style.borderColor = d.status === 'ok' ? '#22c55e' : '#f59e0b';
-}).catch(e => {
-  $('#health').textContent = '❌ Error';
-  $('#health').style.borderColor = '#ef4444';
-});
-
-// Generate video
-let isGenerating = false;
-$('#go').addEventListener('click', async () => {
-  const prompt = $('#prompt').value.trim();
-  if (!prompt) {
-    toast('Please enter a story prompt', true);
-    return;
-  }
-  
-  isGenerating = true;
-  $('#go').disabled = true;
-  show($('#progress'));
-  $('#statusText').textContent = 'generating…';
-  $('#barFill').style.width = '30%';
-  
+// ---------- debug log ----------
+const dbgListeners = new Set();
+const dbgLines = [];
+function dbg(level, label, detail) {
+  const t = new Date().toLocaleTimeString();
+  const line = { t, level, label, detail };
+  dbgLines.push(line);
+  if (dbgLines.length > 500) dbgLines.shift();
+  dbgListeners.forEach(fn => fn());
+}
+const _fetch = window.fetch.bind(window);
+window.fetch = async (input, init) => {
+  const url = typeof input === "string" ? input : input.url;
+  const method = (init?.method || (typeof input === "object" && input.method) || "GET").toUpperCase();
+  const t0 = performance.now();
   try {
-    const res = await fetch('/api/videos', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt })
-    });
-    
-    if (!res.ok) throw new Error(`Server error: ${res.status}`);
-    
-    $('#prompt').value = '';
-    toast('✅ Video generation started!');
-    
-    setTimeout(() => {
-      hide($('#progress'));
-      isGenerating = false;
-      $('#go').disabled = false;
-      loadVideos();
-    }, 2000);
-  } catch (e) {
-    toast('❌ ' + (e.message || 'Failed to create video'), true);
-    isGenerating = false;
-    $('#go').disabled = false;
-    hide($('#progress'));
-  }
-});
-
-// Load videos
-async function loadVideos() {
-  const grid = $('#libGrid');
-  const status = $('#libStatus');
-  
-  try {
-    const res = await fetch('/api/videos');
-    if (!res.ok) throw new Error(`Server error: ${res.status}`);
-    
-    const data = await res.json();
-    const videos = data.videos || [];
-    
-    if (videos.length === 0) {
-      grid.innerHTML = '<div style="color:var(--muted);font-size:13px;grid-column:1/-1;text-align:center;padding:40px 20px">No videos yet. Create one above!</div>';
-      status.textContent = '';
-      return;
+    const r = await _fetch(input, init);
+    const ms = (performance.now() - t0).toFixed(0);
+    if (!r.ok) {
+      let body = ""; try { body = (await r.clone().text()).slice(0, 1500); } catch {}
+      dbg("error", `${method} ${url} → ${r.status} (${ms}ms)`, body);
+    } else {
+      dbg("net", `${method} ${url} → ${r.status} (${ms}ms)`);
     }
-    
-    grid.innerHTML = videos.map((v, i) => `
-      <div class="lib-item" onclick="selectVideo(this, '${v.name}')">
-        <div class="thumb">🎬</div>
-        <button class="lib-item-del" onclick="deleteVideo(event, '${v.name}')">Delete</button>
+    return r;
+  } catch (e) {
+    const ms = (performance.now() - t0).toFixed(0);
+    dbg("error", `${method} ${url} → network failure (${ms}ms)`, String(e));
+    throw e;
+  }
+};
+window.addEventListener("error", e => dbg("error", e.message,
+  `${e.filename}:${e.lineno}:${e.colno}\n${e.error?.stack || ""}`));
+window.addEventListener("unhandledrejection", e => {
+  const msg = String(e.reason?.message || e.reason || "");
+  // Benign: HTMLMediaElement aborts a pending play() when we pause/seek to grab last frame.
+  if (/play\(\) request was interrupted/i.test(msg)) { e.preventDefault(); return; }
+  dbg("error", "unhandledrejection", String(e.reason?.stack || msg));
+});
+
+// ---------- toast ----------
+function toast(msg, isErr) {
+  const el = document.getElementById("toast");
+  el.textContent = msg; el.className = "toast show" + (isErr ? " err" : "");
+  setTimeout(() => el.classList.remove("show"), 2600);
+  dbg(isErr ? "error" : "info", msg);
+}
+
+// ---------- helpers ----------
+const SIZES = ["1280x720", "720x1280"];
+const DURATIONS = [
+  { v: 4, label: "4s" }, { v: 8, label: "8s" }, { v: 12, label: "12s" },
+  { v: 24, label: "24s (×2)" }, { v: 36, label: "36s (×3)" }, { v: 48, label: "48s (×4)" },
+];
+
+// Interruptible sleep: when the tab is backgrounded on mobile, browsers throttle
+// setTimeout (often to 1×/min) which makes long render polls appear "dead".
+// We track every pending sleep so wakeAllSleeps() — fired on visibilitychange to
+// `visible` — resolves them all immediately, snapping the poll loop back to life
+// the instant the user returns to the tab.
+const _pendingSleeps = new Set();
+function sleep(ms) {
+  return new Promise(resolve => {
+    let done = false;
+    const fire = () => { if (done) return; done = true; clearTimeout(t); _pendingSleeps.delete(fire); resolve(); };
+    const t = setTimeout(fire, ms);
+    _pendingSleeps.add(fire);
+  });
+}
+function wakeAllSleeps() {
+  for (const fn of Array.from(_pendingSleeps)) { try { fn(); } catch {} }
+}
+if (typeof document !== "undefined") {
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") wakeAllSleeps();
+  });
+  // Also wake on focus (covers some mobile browsers that don't fire visibilitychange reliably).
+  window.addEventListener("focus", wakeAllSleeps);
+  window.addEventListener("pageshow", wakeAllSleeps);
+}
+
+// Module-level latch so we only redirect to login once even if many fetches
+// race a 401 simultaneously (every API call funnels through jsonOrThrow).
+let _loginRedirecting = false;
+function redirectToLogin() {
+  if (_loginRedirecting) return;
+  _loginRedirecting = true;
+  const back = encodeURIComponent(location.pathname + location.search + location.hash);
+  location.href = "/.auth/login/aad?post_login_redirect_url=" + back;
+}
+async function jsonOrThrow(r) {
+  if (r.status === 401) {
+    // Easy Auth says the session is missing/expired. Hand off to the IdP;
+    // throw so the caller's error path doesn't run anything destructive
+    // before navigation (caller will be unmounted within ms anyway).
+    redirectToLogin();
+    throw new Error("redirecting to login");
+  }
+  const txt = await r.text();
+  if (!r.ok) throw new Error(txt.slice(0, 400) || `HTTP ${r.status}`);
+  try { return JSON.parse(txt); } catch { return txt; }
+}
+
+// Decode the URL-safe base64 VAPID public key the server returns into the
+// Uint8Array form pushManager.subscribe() expects.
+function urlBase64ToUint8Array(b64) {
+  const padding = "=".repeat((4 - b64.length % 4) % 4);
+  const std = (b64 + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const raw = atob(std);
+  const out = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+  return out;
+}
+
+// ---------- App ----------
+function useTheme() {
+  const [theme, setTheme] = useState(() => localStorage.getItem("theme") || "light");
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", theme);
+    localStorage.setItem("theme", theme);
+  }, [theme]);
+  return [theme, setTheme];
+}
+
+function Accordion({ title, children, defaultOpen }) {
+  const [open, setOpen] = useState(!!defaultOpen);
+  return html`
+    <div class=${"accordion-item" + (open ? " open" : "")}>
+      <div class="accordion-head" onClick=${() => setOpen(o => !o)}>
+        <span class="chev">▸</span>
+        <span>${title}</span>
       </div>
-    `).join('');
-    
-    status.textContent = `${videos.length} video${videos.length !== 1 ? 's' : ''}`;
-  } catch (e) {
-    grid.innerHTML = `<div style="color:var(--err);font-size:13px;grid-column:1/-1">${e.message}</div>`;
+      ${open && html`<div class="accordion-body">${children}</div>`}
+    </div>
+  `;
+}
+
+function Library({ refreshKey, onSelect }) {
+  const [videos, setVideos] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState("");
+  const [deleting, setDeleting] = useState("");
+  const load = useCallback(async () => {
+    setLoading(true); setErr("");
+    try {
+      const r = await fetch("/api/videos?limit=10");
+      const j = await jsonOrThrow(r);
+      setVideos(j.videos || []);
+    } catch (e) { setErr(e.message); }
+    finally { setLoading(false); }
+  }, []);
+  const del = useCallback(async (v) => {
+    if (!window.confirm("Delete this video permanently?")) return;
+    setDeleting(v.name);
+    try {
+      const path = v.name.split("/").map(encodeURIComponent).join("/");
+      const r = await fetch("/api/videos/" + path, { method: "DELETE" });
+      await jsonOrThrow(r);
+      setVideos(prev => prev.filter(x => x.name !== v.name));
+      toast("Video deleted");
+    } catch (e) { toast("Delete failed: " + (e.message || "").slice(0, 140), true); }
+    finally { setDeleting(""); }
+  }, []);
+  useEffect(() => { load(); }, [load, refreshKey]);
+  return html`
+    <div class="card">
+      <h3 style=${{display:"flex",alignItems:"center",gap:8}}>
+        Earlier videos
+        <span class="pill">${videos.length}</span>
+        <span style=${{flex:1}}></span>
+        <button class="ghost small" onClick=${load} disabled=${loading}>${loading ? "…" : "↻ Refresh"}</button>
+      </h3>
+      ${err && html`<div class="pill err small">${err}</div>`}
+      ${!loading && videos.length === 0 && html`<div class="muted small">No videos yet. Generate one above.</div>`}
+      <div class="grid">
+        ${videos.map(v => html`
+          <div
+            class="clip"
+            key=${v.name}
+            role="button"
+            tabindex="0"
+            style=${{position:"relative",cursor:"pointer"}}
+            title=${v.name + " — click to load in preview"}
+            onClick=${() => onSelect && onSelect(v)}
+            onKeyDown=${e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onSelect && onSelect(v); } }}>
+            <video src=${v.url} muted preload="metadata"
+              onMouseEnter=${e => { try { e.currentTarget.currentTime = 0.1; e.currentTarget.play(); } catch{} }}
+              onMouseLeave=${e => { e.currentTarget.pause(); }}></video>
+            <div class="name">${new Date(v.createdOn || v.lastModified).toLocaleString()}</div>
+            ${(v.title || v.prompt) ? html`
+              <div style=${{padding:"6px 8px",borderTop:"1px solid var(--border)"}}>
+                ${v.title && html`<div style=${{fontSize:12,fontWeight:600,lineHeight:1.3,whiteSpace:"normal"}}>${v.title}</div>`}
+                ${v.prompt && html`<div class="muted" style=${{fontSize:11,lineHeight:1.35,marginTop:2,whiteSpace:"normal"}} title=${v.prompt}>${v.prompt.length > 160 ? v.prompt.slice(0,160) + "…" : v.prompt}</div>`}
+              </div>
+            ` : ""}
+            <button type="button" title="Delete this video" aria-label="Delete video"
+              disabled=${deleting === v.name}
+              onClick=${e => { e.stopPropagation(); del(v); }}
+              style=${{position:"absolute",top:6,right:6,border:"none",borderRadius:6,cursor:"pointer",background:"rgba(0,0,0,.6)",color:"#fff",fontSize:13,lineHeight:1,padding:"4px 6px"}}>
+              ${deleting === v.name ? "…" : "🗑"}
+            </button>
+          </div>
+        `)}
+      </div>
+    </div>
+  `;
+}
+
+function App() {
+  const [theme, setTheme] = useTheme();
+  const [voices, setVoices] = useState([]);
+  const [voice, setVoice] = useState("en-US-AvaMultilingualNeural");
+
+  // ── Story Chain (I2V continuation) ────────────────────────────────────────
+  // The headline continuation feature: one user idea + one character image →
+  // a story spread across N=ceil(total/5) clips, each rendered image-to-video
+  // from the PREVIOUS clip's last frame, so the character + scene carry forward.
+  const [scPrompt, setScPrompt] = useState("");
+  const [scTotalSec, setScTotalSec] = useState(30);     // total film length
+  const [scAspect, setScAspect] = useState("landscape"); // landscape→832x480, vertical→480x832 (480p = fast chaining)
+  const [scCharFile, setScCharFile] = useState(null);    // character image File
+  const [scCharPreview, setScCharPreview] = useState(null); // object URL for preview
+  const [scStory, setScStory] = useState(null);          // { title, logline, subject, style, setting, clips:[...] }
+  const [scBuilding, setScBuilding] = useState(false);   // storyboard generation in flight
+  const [scProgress, setScProgress] = useState([]);      // per-clip [{index,title,status,clipUrl,startUrl}]
+  const [scCast, setScCast] = useState([]);              // casting sheet [{id,name,description,refName,previewUrl,status}]
+  const [scCasting, setScCasting] = useState(false);     // generating canonical reference snapshots
+  const scSize = scAspect === "vertical" ? "480x832" : "832x480";
+  const scClipSec = Math.min(5, Math.max(3, Number(scStory?.clipSeconds) || 5));
+  const scClipCount = scStory?.clips?.length || Math.ceil(scTotalSec / 5);
+  const scCastReady = Array.isArray(scCast) && scCast.length > 0 && scCast.every(c => c.refName);
+
+  // Narration (audio) laid over the finished film.
+  // mode: 'off' = silent · 'auto' = AI writes it · 'prompt' = AI writes it from your direction.
+  const [scNarrationMode, setScNarrationMode] = useState("auto");
+  const [scDialogVoice, setScDialogVoice] = useState("");      // character voice for spoken dialogue ("" = same as narrator)
+  const [scDialogPrompt, setScDialogPrompt] = useState("");    // optional user direction for the dialogue (empty = AI writes its own)
+  const [scDialoging, setScDialoging] = useState(false);       // dialogue generation in flight
+  const [scNarrationPrompt, setScNarrationPrompt] = useState("");
+  const [scNarrationText, setScNarrationText] = useState(""); // editable script — the user's words win
+  const [scNarrating, setScNarrating] = useState(false);      // script generation in flight
+  const [scNarrAudio, setScNarrAudio] = useState(null);       // last voice preview { url }
+  // Portrait/cast image engine: "flux" = FLUX.1 Schnell (fast, sharp) · "comfy" = the
+  // original Wan 1s-T2V still. Both run on the same A100; the toggle picks which renders
+  // the cast references, and the two paths work independently.
+  const [scImageEngine, setScImageEngine] = useState("flux");
+
+  // One-step-at-a-time wizard: 1 idea · 2 language+voiceover · 3 story · 4 voices · 5 cast · 6 render.
+  const [wizStep, setWizStep] = useState(1);
+  // Background render queue (server-side jobs): each submitted film renders on the
+  // server and reports back here, so the wizard is freed the moment you submit.
+  const [jobs, setJobs] = useState([]);
+
+  const [running, setRunning] = useState(false);
+
+  // Identity: who is signed in (when AUTH_REQUIRED=1 on the server).
+  // me === null         -> not yet probed
+  // me.authenticated    -> signed in; show email + sign-out
+  // me.devMode          -> AUTH_REQUIRED off; hide auth chrome entirely
+  const [me, setMe] = useState(null);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await fetch("/api/me");
+        if (r.status === 401) { redirectToLogin(); return; }
+        if (!r.ok) return;
+        const j = await r.json();
+        if (!cancelled) setMe(j);
+      } catch { /* offline; the next real API call will retrigger */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // Wake Lock: keep the screen on during generation so mobile browsers don't
+  // suspend the tab when the user puts the phone down. The lock auto-releases
+  // when the tab goes to background; we re-acquire it on visibilitychange.
+  // Falls back gracefully on browsers without the API (older Safari, etc.).
+  const wakeLockRef = useRef(null);
+  useEffect(() => {
+    let cancelled = false;
+    async function acquire() {
+      if (!running) return;
+      if (!("wakeLock" in navigator)) { dbg("warn", "wakeLock API not available — screen may sleep during render"); return; }
+      try {
+        const lock = await navigator.wakeLock.request("screen");
+        if (cancelled) { try { await lock.release(); } catch {} return; }
+        wakeLockRef.current = lock;
+        lock.addEventListener("release", () => { dbg("info", "wakeLock released by browser"); });
+        dbg("ok", "wakeLock acquired — screen will stay on while rendering");
+      } catch (e) { dbg("warn", `wakeLock request failed: ${e.message}`); }
+    }
+    async function release() {
+      const lock = wakeLockRef.current; wakeLockRef.current = null;
+      if (lock) { try { await lock.release(); } catch {} }
+    }
+    if (running) {
+      acquire();
+      // Re-acquire when the user returns to the tab (Wake Lock is auto-released on hide).
+      const onVis = () => { if (document.visibilityState === "visible" && running && !wakeLockRef.current) acquire(); };
+      document.addEventListener("visibilitychange", onVis);
+      return () => { cancelled = true; document.removeEventListener("visibilitychange", onVis); release(); };
+    } else {
+      release();
+    }
+  }, [running]);
+
+  // Web Push: register the service worker once on mount. The SW receives push
+  // events from our backend and shows a lock-screen / status-bar notification
+  // when each render chunk completes (so the user knows to come back to the tab,
+  // where Wake Lock + interruptible-sleep resume the next chunk). Notification
+  // permission is asked lazily — only the first time `run()` is started, so we
+  // never prompt unsolicited.
+  const swRegRef = useRef(null);
+  const pushSubRef = useRef(null);
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) { dbg("warn", "Service Worker API unavailable — no lock-screen notifications"); return; }
+    navigator.serviceWorker.register("/sw.js").then(reg => {
+      swRegRef.current = reg;
+      dbg("ok", "service worker registered");
+    }).catch(e => dbg("warn", `service worker register failed: ${e.message}`));
+    // Listen for taps on the OS notification — the SW posts a message to us so
+    // we can immediately wake any pending poll sleep and re-poll the job.
+    const onMsg = (e) => {
+      if (e.data?.type === "avideo:notification-click" || e.data?.type === "videotool:notification-click") {
+        dbg("info", `notification tapped (jobId=${e.data.jobId || "?"}) — kicking poll`);
+        wakeAllSleeps();
+      }
+    };
+    navigator.serviceWorker.addEventListener("message", onMsg);
+    return () => navigator.serviceWorker.removeEventListener("message", onMsg);
+  }, []);
+
+  // Helper: ensure notification permission, ensure a PushSubscription exists,
+  // and bind it to a specific render job ID server-side so the server pushes a
+  // notification when that job completes. Best-effort — silent on failure so a
+  // missing-API browser (iOS Safari without PWA install, Firefox private mode)
+  // never blocks the render.
+  async function pushSubscribeForJob(jobId, label) {
+    try {
+      if (!("Notification" in window)) return;
+      if (!swRegRef.current) return;
+      if (Notification.permission === "default") {
+        try { await Notification.requestPermission(); } catch {}
+      }
+      if (Notification.permission !== "granted") return;
+      let sub = pushSubRef.current || await swRegRef.current.pushManager.getSubscription();
+      if (!sub) {
+        const r = await fetch("/api/push/vapid-public-key");
+        const { publicKey } = await jsonOrThrow(r);
+        sub = await swRegRef.current.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(publicKey),
+        });
+        dbg("ok", `push subscription created (${sub.endpoint.slice(0, 60)}…)`);
+      }
+      pushSubRef.current = sub;
+      const json = sub.toJSON();
+      await fetch("/api/push/subscribe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jobId, label,
+          endpoint: json.endpoint,
+          keys: { p256dh: json.keys.p256dh, auth: json.keys.auth },
+        }),
+      });
+      dbg("ok", `push notifier armed for ${label} (jobId ${jobId.slice(0, 8)}…)`);
+    } catch (e) { dbg("warn", `push subscribe failed (${e.message}) — render will still work, just no lock-screen notification`); }
   }
-}
+  const [status, setStatus] = useState({ phase: "idle", pct: 0, label: "ready" });
+  const [outs, setOuts] = useState([]);
+  const [stitched, setStitched] = useState(null); // { url, clips, crossfade } or null
+  const [stitching, setStitching] = useState(false);
+  const [crossfade, setCrossfade] = useState(0); // seconds; 0 = lossless hard cut
+  const [refreshLib, setRefreshLib] = useState(0);
+  const [page, setPage] = useState("studio"); // "studio" = compose + current film · "history" = every saved film
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  // Cancellation: cancelRef.current=true asks the run() loop to stop after the
+  // current step. currentJobIdRef holds the in-flight job id so we can
+  // POST /api/jobs/{id}/cancel to stop server-side billing immediately.
+  const cancelRef = useRef(false);
+  const currentJobIdRef = useRef(null);
+  const voiceSuggestStoryRef = useRef(null); // story we've already auto-suggested voices for
+  const [, force] = useState(0);
 
-function selectVideo(el, name) {
-  $$('.lib-item').forEach(v => v.style.borderColor = 'var(--line)');
-  el.style.borderColor = 'var(--accent)';
-}
+  useEffect(() => {
+    const fn = () => force(x => x + 1);
+    dbgListeners.add(fn);
+    return () => dbgListeners.delete(fn);
+  }, []);
 
-async function deleteVideo(e, name) {
-  e.stopPropagation();
-  if (!confirm('Delete this video?')) return;
-  
-  try {
-    const path = name.split('/').map(encodeURIComponent).join('/');
-    const res = await fetch(`/api/videos/${path}`, { method: 'DELETE' });
-    if (!res.ok) throw new Error(`Server error: ${res.status}`);
-    toast('✅ Video deleted');
-    loadVideos();
-  } catch (e) {
-    toast('❌ ' + e.message, true);
+  // load voices
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await fetch("/api/voices");
+        const raw = await jsonOrThrow(r);
+        // /api/voices returns a flat array with PascalCase keys from the Speech REST API.
+        const arr = Array.isArray(raw) ? raw : (raw.voices || []);
+        const mapped = arr.map(v => ({
+          shortName: v.shortName || v.ShortName,
+          localName: v.localName || v.LocalName || v.DisplayName,
+          gender: (v.gender || v.Gender || "").toLowerCase(),
+          locale: v.locale || v.Locale || "",
+          localeName: v.localeName || v.LocaleName || "",
+        })).filter(v => v.shortName);
+        setVoices(mapped);
+        dbg("info", `voices loaded: ${mapped.length}`);
+      } catch (e) { dbg("warn", "voices load failed", e.message); }
+    })();
+  }, []);
+
+  // After a storyboard is built (and once the voice list has loaded), auto-suggest a
+  // distinct voice per character — matched to each character's role and the narrator's
+  // language — so the cast comes up pre-suggested with multiple voices the user can tweak.
+  useEffect(() => {
+    if (!scStory || !Array.isArray(scCast) || scCast.length === 0 || voices.length === 0) return;
+    if (voiceSuggestStoryRef.current === scStory) return;          // suggest once per storyboard
+    if (scCast.some(c => c.voice)) { voiceSuggestStoryRef.current = scStory; return; }
+    voiceSuggestStoryRef.current = scStory;
+    setScCast(prev => suggestCastVoices(prev));
+  }, [scStory, scCast, voices]);
+
+  const voiceGroups = useMemo(() => {
+    const groups = { "English (US)": [], "English (India)": [], "Hindi (India)": [], "Bengali (India)": [], "Other": [] };
+    voices.forEach(v => {
+      const loc = v.locale || "";
+      if (loc === "en-US") groups["English (US)"].push(v);
+      else if (loc === "en-IN") groups["English (India)"].push(v);
+      else if (loc === "hi-IN") groups["Hindi (India)"].push(v);
+      else if (loc === "bn-IN") groups["Bengali (India)"].push(v);
+      else groups["Other"].push(v);
+    });
+    return groups;
+  }, [voices]);
+
+  // ── Language is a first-class choice ──────────────────────────────────────
+  // The user picks ONE language for the whole film. That single choice drives the
+  // narrator voice, every character voice and the storyboard language, so the
+  // voiceover is always spoken in the chosen language (never silently English).
+  function localeOf(v) { const p = String(v || "en-US").split("-"); return p.length >= 2 ? `${p[0]}-${p[1]}` : "en-US"; }
+  function langLabel(loc) {
+    try {
+      const [l, r] = String(loc).split("-");
+      const ln = new Intl.DisplayNames(["en"], { type: "language" }).of(l) || l;
+      const rn = r ? (new Intl.DisplayNames(["en"], { type: "region" }).of(r) || r) : "";
+      return rn ? `${ln} (${rn})` : ln;
+    } catch { return loc; }
   }
+  // Locale of the currently selected narrator voice = the film's language.
+  const curLoc = localeOf(voice);
+  // Every language present in the loaded voice catalogue (common ones first).
+  const LANGUAGES = useMemo(() => {
+    const seen = new Map();
+    voices.forEach(v => { const loc = v.locale; if (loc && !seen.has(loc)) seen.set(loc, langLabel(loc)); });
+    if (!seen.size) seen.set("en-US", "English (United States)");
+    const order = ["en-US", "en-IN", "hi-IN", "bn-IN"];
+    return [...seen.entries()].sort((a, b) => {
+      const ia = order.indexOf(a[0]), ib = order.indexOf(b[0]);
+      if (ia >= 0 || ib >= 0) return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+      return a[1].localeCompare(b[1]);
+    }).map(([code, label]) => ({ code, label }));
+  }, [voices]);
+  // The voices that speak the selected language — narration AND dialogue come from here,
+  // so nothing is ever voiced in the wrong language.
+  const langVoices = useMemo(() => {
+    const inLoc = voices.filter(v => v.locale === curLoc);
+    return inLoc.length ? inLoc : voices;
+  }, [voices, curLoc]);
+  // Switch the whole film to a language: default the narrator to a natural voice in that
+  // locale and clear per-character voices so they get re-picked in the new language.
+  function pickLanguage(loc) {
+    const inLoc = voices.filter(v => v.locale === loc);
+    const pref = inLoc.find(v => /Multilingual/i.test(v.shortName) && v.gender === "Female")
+      || inLoc.find(v => v.gender === "Female") || inLoc[0];
+    if (pref) setVoice(pref.shortName);
+    setScDialogVoice("");
+    voiceSuggestStoryRef.current = null;
+    setScCast(prev => (prev || []).map(c => ({ ...c, voice: "" })));
+  }
+
+  // Wan2.2 can take a while per clip. Start with longer poll intervals
+  // to avoid wasting round trips, then tighten as render approaches completion.
+  // Bails out promptly if cancelRef is set (and tells backend to cancel server-side).
+  async function poll(id, onProgress) {
+    currentJobIdRef.current = id;
+    let elapsed = 0;
+    try {
+      let transientFails = 0;
+      while (true) {
+        if (cancelRef.current) throw new Error("Cancelled by user");
+        const wait = elapsed < 60_000 ? 6000 : elapsed < 120_000 ? 4000 : 3000;
+        await sleep(wait);
+        elapsed += wait;
+        if (cancelRef.current) throw new Error("Cancelled by user");
+        const r = await fetch(`/api/jobs/${id}`);
+        // Tolerate transient upstream 5xx / 429 — the underlying
+        // render job is still alive, just the status endpoint hiccuped.
+        // Bail only after several consecutive failures.
+        if (r.status === 429 || (r.status >= 500 && r.status <= 599)) {
+          transientFails++;
+          dbg("warn", `transient ${r.status} on /api/jobs/${id} (fail ${transientFails}/6) — keep polling`);
+          if (transientFails >= 6) {
+            const tx = await r.text().catch(() => "");
+            throw new Error(`Status endpoint returned ${r.status} 6× in a row: ${tx.slice(0, 240)}`);
+          }
+          continue;
+        }
+        transientFails = 0;
+        const j = await jsonOrThrow(r);
+        const st = j.status;
+        if (onProgress) onProgress(st, elapsed);
+        else setStatus(s => ({ ...s, label: st }));
+        if (st === "succeeded" || st === "completed") return j;
+        if (st === "failed" || st === "cancelled") throw new Error("Job " + st);
+      }
+    } finally {
+      currentJobIdRef.current = null;
+    }
+  }
+
+  // User-initiated cancellation. Sets the cancel flag, tells backend to stop the
+  // active job (saves billing), then lets run()'s loop exit on its next check.
+  async function cancelRun() {
+    if (!running) return;
+    cancelRef.current = true;
+    setStatus(s => ({ ...s, label: "cancelling…" }));
+    const id = currentJobIdRef.current;
+    if (id) {
+      try {
+        await fetch(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" });
+        dbg("info", `cancel signal sent for ${id}`);
+      } catch (e) {
+        dbg("warn", `failed to signal cancel: ${e.message}`);
+      }
+    }
+    toast("Cancelling generation…");
+  }
+
+  // Manual re-stitch with a chosen crossfade. Used by the "Re-stitch with crossfade" button.
+  async function restitch(cfSec) {
+    if (outs.length < 2) { toast("Need at least 2 clips to stitch.", true); return; }
+    setStitching(true);
+    try {
+      const r = await fetch("/api/stitch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ urls: outs.map(o => o.url), crossfade: cfSec })
+      });
+      const j = await jsonOrThrow(r);
+      setStitched({ url: j.url, clips: j.clips, crossfade: j.crossfade, bytes: j.bytes });
+      setCrossfade(cfSec);
+      toast(cfSec > 0 ? `Re-stitched with ${cfSec}s crossfade` : "Re-stitched (hard cuts)");
+      setRefreshLib(x => x + 1);
+    } catch (e) { toast("Stitch failed: " + e.message, true); }
+    finally { setStitching(false); }
+  }
+
+  // ── Story Chain (I2V continuation) orchestrator ───────────────────────────
+
+  // Pick the character image + build a preview thumbnail.
+  function pickCharImage(file) {
+    if (scCharPreview) { try { URL.revokeObjectURL(scCharPreview); } catch {} }
+    setScCharFile(file || null);
+    setScCharPreview(file ? URL.createObjectURL(file) : null);
+  }
+
+  // Human-readable language of the selected narrator voice (e.g. "hi-IN-..." → "Hindi").
+  // The storyboard writes the whole script + narration in THIS language so the spoken
+  // audio and the on-screen story share one language and stay in sync.
+  function voiceLanguage(v) {
+    try {
+      const sub = String(v || "en-US").split("-")[0];
+      const name = new Intl.DisplayNames(["en"], { type: "language" }).of(sub);
+      return name || "English";
+    } catch { return "English"; }
+  }
+
+  // Step 1: turn the idea into a story spread over N=ceil(total/5) clips.
+  async function buildStoryboard() {
+    if (!scPrompt.trim()) { toast("Enter a story idea first.", true); return; }
+    const narrating = scNarrationMode !== "off";
+    setScBuilding(true); setScStory(null); setScProgress([]); setScCast([]);
+    try {
+      const r = await fetch("/api/storyboard", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: scPrompt, totalSeconds: scTotalSec, clipSeconds: 5, size: scSize, narrate: narrating, language: narrating ? voiceLanguage(voice) : "English", dialogDirection: narrating ? scDialogPrompt : "" })
+      });
+      const j = await jsonOrThrow(r);
+      const story = j.story || {};
+      if (!Array.isArray(story.clips) || story.clips.length === 0) throw new Error("storyboard had no clips");
+      setScStory(story);
+      // Seed the editable cast from the story so the user can review it, swap in
+      // templates, edit descriptions and assign a per-character voice BEFORE casting.
+      const seedCast = (Array.isArray(story.cast) && story.cast.length
+        ? story.cast
+        : [{ id: "hero", name: "Lead", description: story.subject || scPrompt || "the main subject" }]
+      ).map(c => ({ id: c.id, name: c.name || c.id, description: c.description || "", voice: "", refName: null, previewUrl: null, status: "idle" }));
+      setScCast(seedCast);
+      dbg("ok", `storyboard: "${story.title || "untitled"}" — ${story.clips.length} clips`);
+      toast(`Storyboard ready — ${story.clips.length} clips telling one story`);
+    } catch (e) {
+      dbg("warn", "storyboard failed", e.message);
+      toast("Storyboard failed: " + e.message.slice(0, 200), true);
+    } finally { setScBuilding(false); }
+  }
+
+  // Edit a single clip's motion prompt inline (lets the user tweak the story).
+  function editClipPrompt(idx, value) {
+    setScStory(s => {
+      if (!s) return s;
+      const clips = s.clips.map(c => c.index === idx ? { ...c, motionPrompt: value } : c);
+      return { ...s, clips };
+    });
+  }
+
+  // Edit a single clip's narration line inline (per-clip, synced voiceover).
+  function editClipNarration(idx, value) {
+    setScStory(s => {
+      if (!s) return s;
+      const clips = s.clips.map(c => c.index === idx ? { ...c, narration: value } : c);
+      return { ...s, clips };
+    });
+  }
+
+  // Edit a single clip's on-screen dialogue line inline (the character's spoken words).
+  function editClipDialog(idx, value) {
+    setScStory(s => {
+      if (!s) return s;
+      const clips = s.clips.map(c => c.index === idx ? { ...c, dialog: value } : c);
+      return { ...s, clips };
+    });
+  }
+
+  // Generate (or rewrite) the spoken dialogue for every clip from the current story +
+  // narration, in the chosen voice language. scDialogPrompt steers what's said; if it's
+  // empty the model writes natural in-character dialogue on its own. Kept in sync because
+  // it's fed each clip's action + narration.
+  async function genDialogue() {
+    if (!scStory || !Array.isArray(scStory.clips) || !scStory.clips.length) { toast("Generate a storyboard first.", true); return; }
+    setScDialoging(true);
+    try {
+      const r = await fetch("/api/dialogue", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          direction: scDialogPrompt,
+          language: scNarrationMode !== "off" ? voiceLanguage(voice) : "English",
+          clips: scStory.clips.map(c => ({ index: c.index, title: c.title || "", action: c.action || "", narration: c.narration || "" }))
+        })
+      });
+      const j = await jsonOrThrow(r);
+      const map = {}; (j.dialogs || []).forEach(d => { map[d.index] = d.dialog || ""; });
+      setScStory(s => s ? { ...s, clips: s.clips.map(c => (c.index in map ? { ...c, dialog: map[c.index] } : c)) } : s);
+      dbg("ok", `dialogue written for ${Object.keys(map).length} clips`);
+      toast("Dialogue written — edit any line, or tweak the direction and regenerate.");
+    } catch (e) {
+      toast("Dialogue failed: " + e.message.slice(0, 160), true);
+    } finally { setScDialoging(false); }
+  }
+
+  // Submit an I2V job, tolerating GPU cold-start (503 warming) and rate limits.
+  async function submitI2V(startImage, thePrompt, clipSec, label) {
+    for (let attempt = 0; attempt < 40; attempt++) {
+      if (cancelRef.current) throw new Error("Cancelled by user");
+      const fd = new FormData();
+      fd.append("prompt", thePrompt);
+      fd.append("seconds", String(clipSec));
+      fd.append("size", scSize);
+      fd.append("startImage", startImage);
+      const r = await fetch("/api/jobs", { method: "POST", body: fd });
+      const txt = await r.text();
+      if (r.ok) return JSON.parse(txt);
+      let warming = false;
+      try { warming = !!JSON.parse(txt).warming; } catch {}
+      if (r.status === 503 && (warming || /warming|starting up|cold start/i.test(txt))) {
+        setStatus(s => ({ ...s, label: `${label}: GPU warming up… (try ${attempt + 1})` }));
+        dbg("warn", `${label}: GPU cold-starting (503 warming), retrying in 15s`);
+        await sleep(15000); continue;
+      }
+      if (r.status === 429 || /Too many running tasks/i.test(txt)) { await sleep(5000 + attempt * 2000); continue; }
+      throw new Error(txt.slice(0, 400));
+    }
+    throw new Error("GPU did not become ready after several minutes — try again.");
+  }
+
+  // Audio prompter: ask the LLM to write a voiceover script from the storyboard
+  // (+ optional user direction in 'prompt' mode). Returns plain narration text.
+  async function fetchNarrationScript() {
+    const r = await fetch("/api/narration-script", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        idea: scPrompt,
+        title: scStory?.title || "",
+        logline: scStory?.logline || "",
+        actions: (scStory?.clips || []).map(c => c.action || c.title || ""),
+        totalSeconds: scTotalSec,
+        prompt: scNarrationMode === "prompt" ? scNarrationPrompt : "",
+        voice
+      })
+    });
+    const j = await jsonOrThrow(r);
+    return (j.script || "").trim();
+  }
+
+  // "Generate narration" button: write the script into the editable box.
+  async function genNarration() {
+    if (!scStory) { toast("Build a storyboard first.", true); return; }
+    setScNarrating(true);
+    try {
+      const script = await fetchNarrationScript();
+      setScNarrationText(script);
+      setScNarrAudio(null);
+      dbg("ok", `narration script ready (${script.split(/\s+/).filter(Boolean).length} words)`);
+      toast("Narration written — edit it freely, then render.");
+    } catch (e) {
+      toast("Narration failed: " + e.message.slice(0, 160), true);
+    } finally { setScNarrating(false); }
+  }
+
+  // "Preview voice": synthesize the first clip's narration line and play it (no video).
+  async function previewNarration() {
+    const line = ((scStory?.clips || []).map(c => (c.narration || "").trim()).find(Boolean)) || "";
+    if (!line) { toast("Build a storyboard first — narration comes from each clip.", true); return; }
+    try {
+      const r = await fetch("/api/narrate", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: line, voice })
+      });
+      const j = await jsonOrThrow(r);
+      setScNarrAudio({ url: j.url });
+      try { new Audio(j.url).play(); } catch {}
+    } catch (e) { toast("Voice preview failed: " + e.message.slice(0, 160), true); }
+  }
+
+  // Submit a TEXT-TO-VIDEO job (no start image) — used to render canonical
+  // reference snapshots for casting and multi-character establishing stills.
+  async function submitT2V(thePrompt, clipSec, label) {
+    for (let attempt = 0; attempt < 40; attempt++) {
+      if (cancelRef.current) throw new Error("Cancelled by user");
+      const fd = new FormData();
+      fd.append("prompt", thePrompt);
+      fd.append("seconds", String(clipSec));
+      fd.append("size", scSize);
+      const r = await fetch("/api/jobs", { method: "POST", body: fd });
+      const txt = await r.text();
+      if (r.ok) return JSON.parse(txt);
+      let warming = false; try { warming = !!JSON.parse(txt).warming; } catch {}
+      if (r.status === 503 && (warming || /warming|starting up|cold start/i.test(txt))) {
+        setStatus(s => ({ ...s, label: `${label}: GPU warming up… (try ${attempt + 1})` }));
+        await sleep(15000); continue;
+      }
+      if (r.status === 429 || /Too many running tasks/i.test(txt)) { await sleep(5000 + attempt * 2000); continue; }
+      throw new Error(txt.slice(0, 400));
+    }
+    throw new Error("GPU did not become ready after several minutes — try again.");
+  }
+
+  // Render a still image from text: a 1s T2V clip whose last frame we extract +
+  // normalise + push into ComfyUI as a reusable start image. Returns {name, previewUrl}.
+  async function renderStillFromText(thePrompt, label) {
+    const job = await submitT2V(thePrompt, 1, label);
+    pushSubscribeForJob(job.id, label);
+    await poll(job.id, (st, elapsed) => {
+      setStatus(s => ({ ...s, label: `${label}: ${st} (${Math.round(elapsed / 1000)}s)` }));
+    });
+    const fr = await fetch(`/api/jobs/${job.id}/finalize`, { method: "POST" });
+    const fj = await jsonOrThrow(fr);
+    const ef = await fetch("/api/extract-last-frame", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ videoUrl: fj.url, size: scSize })
+    });
+    const ej = await jsonOrThrow(ef);
+    return { name: ej.name, previewUrl: ej.previewUrl };
+  }
+
+  // Render a clean portrait with FLUX.1 Schnell on the A100 (fast, sharp, a few seconds).
+  // Same {name, previewUrl} shape as the Wan still, so it drops straight into casting.
+  // Tolerates GPU cold start; throws a fluxUnavailable error for any other failure
+  // (e.g. the FLUX checkpoint isn't staged on the share yet) so callers can fall back.
+  async function fluxPortrait(thePrompt, label) {
+    for (let attempt = 0; attempt < 40; attempt++) {
+      if (cancelRef.current) throw new Error("Cancelled by user");
+      const r = await fetch("/api/flux-image", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: thePrompt, size: scSize })
+      });
+      if (r.ok) { const j = await r.json(); return { name: j.name, previewUrl: j.previewUrl }; }
+      const txt = await r.text();
+      let warming = false; try { warming = !!JSON.parse(txt).warming; } catch {}
+      if (r.status === 503 && (warming || /warming|cold start|50[234]|ActivationFailed|no capacity/i.test(txt))) {
+        setStatus(s => ({ ...s, label: `${label}: GPU warming up… (try ${attempt + 1})` }));
+        await sleep(15000); continue;
+      }
+      const e = new Error("flux: " + txt.slice(0, 200)); e.fluxUnavailable = true; throw e;
+    }
+    const e = new Error("GPU did not become ready for FLUX"); e.fluxUnavailable = true; throw e;
+  }
+
+  // Portrait with graceful degradation: FLUX.1 Schnell first; if it isn't available
+  // (weights not staged, node error, …) fall back to the slower 1s Wan T2V still so
+  // casting never hard-fails just because FLUX isn't ready.
+  async function renderPortrait(thePrompt, label) {
+    // ComfyUI still engine: the original Wan 1s-T2V → last-frame path (always available).
+    if (scImageEngine === "comfy") return await renderStillFromText(thePrompt, label);
+    // FLUX engine: FLUX.1 Schnell first, with a graceful fallback to the Wan still so
+    // casting never hard-fails just because FLUX hit an error.
+    try { return await fluxPortrait(thePrompt, label); }
+    catch (e) {
+      if (cancelRef.current || /Cancelled by user/i.test(e.message || "")) throw e;
+      dbg("warn", `${label}: FLUX unavailable (${(e.message || "").slice(0, 80)}) — falling back to ComfyUI still`);
+      return await renderStillFromText(thePrompt, label);
+    }
+  }
+
+  // Upload a user-provided image as a canonical character reference (tolerates GPU cold start).
+  async function uploadCharImage(file, label) {
+    for (let attempt = 0; attempt < 40; attempt++) {
+      if (cancelRef.current) throw new Error("Cancelled by user");
+      const cfd = new FormData(); cfd.append("image", file); cfd.append("size", scSize);
+      const cr = await fetch("/api/comfy-image", { method: "POST", body: cfd });
+      if (cr.ok) { const j = await cr.json(); return { name: j.name, previewUrl: j.previewUrl }; }
+      const txt = await cr.text();
+      let warming = false; try { warming = !!JSON.parse(txt).warming; } catch {}
+      if (cr.status === 503 || warming || /warming|50[234]|timeout|ActivationFailed|no capacity/i.test(txt)) {
+        setStatus(s => ({ ...s, label: `${label}: GPU warming up… (try ${attempt + 1})` }));
+        await sleep(15000); continue;
+      }
+      throw new Error("character image upload failed: " + txt.slice(0, 300));
+    }
+    throw new Error("GPU did not become ready to accept the image — try again.");
+  }
+
+  // Predefined, production-safe cast archetypes. The user can drop one in as a new
+  // character, use one to overwrite an existing character, or just type their own
+  // description manually — all three flows feed the same editable scCast list.
+  const CAST_TEMPLATES = [
+    { label: "Young man", name: "Young man", description: "a man in his mid-20s, athletic build, warm brown skin, short black hair, expressive dark eyes, light stubble, wearing a casual jacket and jeans" },
+    { label: "Young woman", name: "Young woman", description: "a woman in her mid-20s, slim build, light brown skin, long dark wavy hair, bright eyes, wearing a simple blouse and jeans" },
+    { label: "Middle-aged man", name: "Man", description: "a man in his 40s, sturdy build, medium skin tone, neat salt-and-pepper hair, calm steady eyes, wearing a plain collared shirt" },
+    { label: "Middle-aged woman", name: "Woman", description: "a woman in her 40s, average build, medium skin tone, dark hair tied back, kind eyes, wearing a simple kurta" },
+    { label: "Elderly man", name: "Old man", description: "a man in his 70s, lean and slightly stooped, weathered tan skin, thin grey hair and a short white beard, gentle tired eyes, wearing a worn shawl" },
+    { label: "Elderly woman", name: "Old woman", description: "a woman in her 70s, small frame, soft wrinkled skin, silver hair in a neat bun, warm eyes, wearing a draped sari" },
+    { label: "Little girl", name: "Girl", description: "a girl about 7 years old, small, round cheeks, dark hair in two braids, curious bright eyes, wearing a bright cotton dress" },
+    { label: "Little boy", name: "Boy", description: "a boy about 8 years old, skinny, tousled dark hair, a gap-toothed grin, wearing a striped t-shirt and shorts" },
+    { label: "Businesswoman", name: "Executive", description: "a woman in her late 30s, poised, medium skin tone, sleek dark hair in a low bun, sharp confident eyes, wearing a tailored charcoal suit" },
+    { label: "Businessman", name: "Executive", description: "a man in his 40s, solid build, olive skin, neatly combed hair, serious expression, wearing a navy suit and tie" },
+  ];
+
+  // Append a new character to the editable cast (optionally pre-filled from a template).
+  function addCastMember(partial) {
+    setScCast(p => {
+      const base = Array.isArray(p) ? p : [];
+      let id = (partial && partial.id) || `char${base.length + 1}`;
+      while (base.some(c => c.id === id)) id += "x";
+      return [...base, {
+        id,
+        name: (partial && partial.name) || "New character",
+        description: (partial && partial.description) || "",
+        voice: "", refName: null, previewUrl: null, status: "idle"
+      }];
+    });
+  }
+  // Patch one cast member (name / description / voice). Editing the look clears its
+  // rendered reference so the user re-casts that character with the new description.
+  function updateCastMember(id, patch) {
+    const invalidates = ("name" in patch) || ("description" in patch);
+    setScCast(p => (p || []).map(c => c.id === id
+      ? { ...c, ...patch, ...(invalidates && (c.refName) ? { refName: null, previewUrl: null, status: "idle" } : {}) }
+      : c));
+  }
+  function removeCastMember(id) {
+    setScCast(p => (p || []).filter(c => c.id !== id));
+  }
+
+  // Build the text prompt that renders a clean canonical portrait for one character.
+  function castSnapshotPrompt(c, story) {
+    const look = (c.description || "").trim();
+    return `Cinematic full-body character portrait of ${c.name || "the character"}: ${look}. Single subject, standing, facing camera, neutral seamless studio backdrop, soft even key light, sharp focus, photorealistic, accurate human anatomy and proportions. ${(story && story.style) || ""}. No on-screen text, captions, or watermarks.`;
+  }
+
+  // Infer a character's likely gender from its name + description so we can suggest a
+  // fitting voice. Returns "female" | "male" | "" (unknown/neutral).
+  function inferGender(c) {
+    const t = `${c.name || ""} ${c.description || ""}`.toLowerCase();
+    const f = /\b(woman|women|girl|girls|lady|ladies|she|her|hers|mother|mom|mum|mommy|wife|daughter|sister|aunt|auntie|grandmother|grandma|granny|actress|queen|princess|businesswoman|madam|miss|mrs|ms|female|feminine|heroine|widow|bride|niece)\b/.test(t);
+    const m = /\b(man|men|boy|boys|guy|gentleman|he|his|him|father|dad|daddy|husband|son|brother|uncle|grandfather|grandpa|king|prince|businessman|sir|mr|male|masculine|hero|widower|groom|nephew)\b/.test(t);
+    return f && !m ? "female" : m && !f ? "male" : "";
+  }
+
+  // Pick a distinct voice for one character from a candidate pool, matching gender when
+  // known and avoiding voices already taken by other characters / the narrator.
+  function suggestVoiceForCharacter(c, pool, used) {
+    if (!pool.length) return "";
+    const want = inferGender(c);
+    let cands = pool.filter(v => !used.has(v.shortName));
+    if (want) { const g = cands.filter(v => v.gender === want); if (g.length) cands = g; }
+    if (!cands.length) cands = pool.filter(v => !used.has(v.shortName));
+    if (!cands.length) cands = pool;
+    const pick = cands[0];
+    used.add(pick.shortName);
+    return pick.shortName;
+  }
+
+  // Auto-suggest a distinct per-character voice for the whole cast, in the narrator's
+  // language. Respects any voice the user already chose; only fills the blanks.
+  function suggestCastVoices(list) {
+    if (!Array.isArray(list) || !list.length || !voices.length) return list;
+    const loc = String(voice || "en-US").split("-").slice(0, 2).join("-"); // e.g. "hi-IN"
+    const lang2 = String(voice || "en").split("-")[0];                     // e.g. "hi"
+    let pool = voices.filter(v => v.locale === loc);
+    if (pool.length < 2) pool = voices.filter(v => (v.locale || "").startsWith(lang2 + "-"));
+    if (pool.length < 2) pool = voices.slice();
+    const used = new Set();
+    if (voice) used.add(voice); // keep character voices distinct from the narrator's
+    return list.map(c => {
+      if (c.voice) { used.add(c.voice); return c; }
+      return { ...c, voice: suggestVoiceForCharacter(c, pool, used) };
+    });
+  }
+
+  // Clear and re-roll all character-voice suggestions (the "↻ Re-suggest" button).
+  function resuggestVoices() {
+    if (scStory) voiceSuggestStoryRef.current = scStory;
+    setScCast(prev => suggestCastVoices((prev || []).map(c => ({ ...c, voice: "" }))));
+  }
+
+  // Predefined voice "bundles" per language — a one-click cast of distinct voices.
+  // Applying one sets the narrator to the first voice and gives every character a
+  // distinct voice from the bundle (cycled). Only voices that actually exist in the
+  // loaded catalogue are used.
+  const VOICE_BUNDLES = {
+    "en-US": [
+      { label: "Warm storyteller", voices: ["en-US-AvaMultilingualNeural", "en-US-AndrewMultilingualNeural", "en-US-EmmaMultilingualNeural", "en-US-BrianMultilingualNeural"] },
+      { label: "Classic studio", voices: ["en-US-JennyNeural", "en-US-GuyNeural", "en-US-AriaNeural", "en-US-DavisNeural"] },
+    ],
+    "en-IN": [
+      { label: "Indian English", voices: ["en-IN-NeerjaNeural", "en-IN-PrabhatNeural", "en-IN-AnanyaNeural", "en-IN-AaravNeural"] },
+    ],
+    "hi-IN": [
+      { label: "Hindi ensemble", voices: ["hi-IN-SwaraNeural", "hi-IN-MadhurNeural", "hi-IN-AnanyaNeural", "hi-IN-AaravNeural"] },
+    ],
+    "bn-IN": [
+      { label: "Bengali pair", voices: ["bn-IN-TanishaaNeural", "bn-IN-BashkarNeural"] },
+    ],
+  };
+  function bundlesForCurrentLanguage() {
+    const loc = String(voice || "en-US").split("-").slice(0, 2).join("-");
+    return VOICE_BUNDLES[loc] || [];
+  }
+  function applyVoiceBundle(bundle) {
+    const avail = new Set(voices.map(v => v.shortName));
+    const pool = (bundle.voices || []).filter(s => avail.has(s));
+    if (!pool.length) { toast("That bundle isn't available for the loaded voices.", true); return; }
+    setVoice(pool[0]);
+    voiceSuggestStoryRef.current = scStory; // we've set voices explicitly; don't auto-overwrite
+    setScCast(prev => (prev || []).map((c, i) => ({ ...c, voice: pool[i % pool.length] })));
+    dbg("ok", `applied voice bundle "${bundle.label}" (${pool.length} voices)`);
+    toast(`Voice bundle “${bundle.label}” applied`);
+  }
+
+  // ── Background render queue ────────────────────────────────────────────
+  async function refreshJobs() {
+    try {
+      const r = await fetch("/api/story-jobs");
+      if (r.ok) setJobs(await r.json());
+    } catch { /* transient — keep last list */ }
+  }
+  async function cancelJob(id) {
+    try { await fetch(`/api/story-jobs/${id}/cancel`, { method: "POST" }); dbg("info", `cancel requested for ${id}`); }
+    catch (e) { dbg("warn", `cancel failed: ${e.message}`); }
+    refreshJobs();
+  }
+
+  function resetWizard() {
+    setWizStep(1);
+    setScStory(null); setScCast([]); setScProgress([]);
+    setScCharFile(null); setScCharPreview(null); setScNarrAudio(null);
+    setScPrompt(""); setScDialogPrompt("");
+    voiceSuggestStoryRef.current = null;
+  }
+
+  // Submit the finalized film to the SERVER-SIDE pipeline. Returns immediately so the
+  // UI is freed to compose another; the render runs in the background and shows up in
+  // the queue below. This is the only place a film is dispatched.
+  async function submitStoryJob() {
+    if (!scStory || !Array.isArray(scStory.clips) || !scStory.clips.length) {
+      toast("Generate the story first.", true); return;
+    }
+    const narrating = scNarrationMode !== "off";
+    let cast = (scCast || []).map(c => ({
+      id: c.id, name: c.name || c.id, description: c.description || "",
+      voice: narrating ? (c.voice || "") : "", refName: c.refName || null
+    }));
+    if (!cast.length) { toast("Add at least one character first.", true); return; }
+
+    setScCasting(true);
+    try {
+      // If a lead photo was uploaded, normalize it now so the worker uses that exact face.
+      if (scCharFile && cast[0] && !cast[0].refName) {
+        try {
+          toast("Preparing your lead reference…");
+          const ref = await uploadCharImage(scCharFile, "Lead");
+          cast[0] = { ...cast[0], refName: ref.name };
+        } catch (e) {
+          dbg("warn", `lead upload failed (${e.message}); the lead will be generated instead`);
+        }
+      }
+      const spec = {
+        language: narrating ? voiceLanguage(voice) : "English",
+        size: scSize,
+        clipSeconds: Math.min(5, Math.max(3, Number(scStory.clipSeconds) || 5)),
+        narrate: narrating,
+        narratorVoice: voice,
+        dialogVoice: scDialogVoice || "",
+        imageEngine: scImageEngine,
+        crossfade: crossfade,
+        idea: scPrompt,
+        story: scStory,
+        cast
+      };
+      const r = await fetch("/api/story-jobs", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(spec)
+      });
+      const j = await jsonOrThrow(r);
+      dbg("ok", `film queued: ${j.id} — "${scStory.title || "film"}"`);
+      toast(`Queued “${scStory.title || "film"}” 🎬 — rendering in the background`);
+      await refreshJobs();
+      resetWizard();
+    } catch (e) {
+      toast("Submit failed: " + e.message.slice(0, 160), true);
+    } finally { setScCasting(false); }
+  }
+
+  // Wizard step gating: which steps are reachable right now.
+  const wizCanNext = {
+    1: () => !!scPrompt.trim(),
+    2: () => true,
+    3: () => !!(scStory && Array.isArray(scStory.clips) && scStory.clips.length),
+    4: () => true,
+  };
+  function wizNext() { if (wizStep < 5 && (wizCanNext[wizStep] ? wizCanNext[wizStep]() : true)) setWizStep(wizStep + 1); }
+  function wizBack() { if (wizStep > 1) setWizStep(wizStep - 1); }
+
+  // ── Casting phase: generate ONE canonical reference image per character BEFORE
+  //    any clip is rendered, so every clip can be seeded from a stable identity
+  //    (instead of the previous clip's degrading last frame). Supports multiple
+  //    characters. The lead may use your uploaded image; others render from text.
+  async function generateCast() {
+    if (!scStory) { toast("Build a storyboard first.", true); return; }
+    // Prefer the user's edited cast (names, descriptions, templates, voices); fall back
+    // to the story's cast, then to a single lead.
+    let cast = (Array.isArray(scCast) && scCast.length) ? scCast
+      : (Array.isArray(scStory.cast) && scStory.cast.length) ? scStory.cast
+      : [{ id: "hero", name: "Lead", description: scStory.subject || scPrompt || "the main subject" }];
+    cancelRef.current = false; currentJobIdRef.current = null;
+    setScCasting(true);
+    setScCast(cast.map(c => ({ ...c, voice: c.voice || "", status: "rendering", refName: null, previewUrl: null })));
+    setStatus({ phase: "running", pct: 1, label: `casting ${cast.length} character${cast.length > 1 ? "s" : ""} in parallel…` });
+    try {
+      // Cast every character at once (parallel) — the user's "casting happens parallely".
+      // The GPU serialises actual rendering, but all snapshots are submitted together.
+      await Promise.all(cast.map(async (c, i) => {
+        if (cancelRef.current) throw new Error("Cancelled by user");
+        let ref;
+        if (i === 0 && scCharFile) ref = await uploadCharImage(scCharFile, `cast ${c.name || c.id}`);
+        else ref = await renderPortrait(castSnapshotPrompt(c, scStory), `cast ${c.name || c.id}`);
+        setScCast(p => p.map(x => x.id === c.id ? { ...x, status: "done", refName: ref.name, previewUrl: ref.previewUrl } : x));
+        dbg("ok", `cast ready: ${c.name || c.id}`);
+      }));
+      setStatus({ phase: "idle", pct: 0, label: "cast ready" });
+      toast(`Cast ready — ${cast.length} character${cast.length > 1 ? "s" : ""}. Review, then render the film.`);
+    } catch (e) {
+      const cancelled = cancelRef.current || /Cancelled by user/i.test(e.message || "");
+      setStatus({ phase: cancelled ? "idle" : "failed", pct: 0, label: cancelled ? "cancelled" : "casting error" });
+      toast(cancelled ? "Casting cancelled" : "Casting failed: " + e.message.slice(0, 160), !cancelled);
+    } finally { setScCasting(false); }
+  }
+
+  // Regenerate one character's canonical snapshot from its locked text description.
+  async function regenCast(id) {
+    const c = (scCast || []).find(x => x.id === id);
+    if (!scStory || !c) return;
+    cancelRef.current = false; setScCasting(true);
+    setScCast(p => p.map(x => x.id === id ? { ...x, status: "rendering" } : x));
+    setStatus({ phase: "running", pct: 1, label: `re-casting ${c.name || c.id}…` });
+    try {
+      const ref = await renderPortrait(castSnapshotPrompt(c, scStory), `recast ${c.name || c.id}`);
+      setScCast(p => p.map(x => x.id === id ? { ...x, status: "done", refName: ref.name, previewUrl: ref.previewUrl } : x));
+      setStatus({ phase: "idle", pct: 0, label: "cast ready" });
+      toast(`Re-cast ${c.name || c.id}`);
+    } catch (e) {
+      setScCast(p => p.map(x => x.id === id ? { ...x, status: "failed" } : x));
+      toast("Re-cast failed: " + e.message.slice(0, 140), true);
+    } finally { setScCasting(false); }
+  }
+
+  // Compose a clip's text prompt: prepend the LOCKED descriptions of the
+  // characters present + the location, so identity is anchored in text as well
+  // as in the seed image. This reinforces consistency across the whole film.
+  function buildClipPrompt(clip, story, prevClip, narrating, castMap) {
+    const castById = {}; (story.cast || []).forEach(c => castById[c.id] = c);
+    // The user-edited cast (descriptions / templates) wins over the original story cast.
+    if (castMap) Object.keys(castMap).forEach(id => { castById[id] = { ...castById[id], ...castMap[id] }; });
+    const locById = {}; (story.locations || []).forEach(l => locById[l.id] = l);
+    const present = (clip.characters || []).map(id => castById[id]).filter(Boolean);
+    const loc = locById[clip.location];
+    const who = present.map(c => `${c.name || c.id} — ${c.description || ""}`).join("; ");
+    const where = loc ? `Location: ${loc.name || loc.id}, ${loc.description || ""}. ` : "";
+    const idn = who ? `Featuring ${who}. ` : "";
+    // Strict 5s→5s continuity: feed the PREVIOUS clip's action + spoken line so this
+    // clip (whose first frame IS the previous clip's last frame) continues seamlessly.
+    let cont = "";
+    if (prevClip) {
+      const pa = (prevClip.action || "").trim();
+      cont = `This clip continues STRICTLY from the previous shot — its first frame IS the previous shot's final frame, so keep the exact same character identities, faces, wardrobe, location, lighting and camera continuity. Previously: ${pa}. Now the story moves forward: `;
+    }
+    const base = clip.motionPrompt || clip.action || scPrompt;
+    const nLine = narrating ? (clip.narration || "").trim() : "";
+    const dLine = narrating ? (clip.dialog || "").trim() : "";
+    // Drive ACTING (visible speech + expression), NOT the foreign-language words themselves —
+    // the exact spoken words ride the TTS audio track, so we never risk on-screen text.
+    const acting = !narrating ? ""
+      : dLine
+        ? ` In this moment the character is speaking their line aloud — show natural, well-timed lip movement and a facial expression that matches the emotion. Never render captions, subtitles or any on-screen text.`
+        : nLine
+          ? ` Show the character's facial expression and emotion clearly. Never render captions, subtitles or any on-screen text.`
+          : "";
+    return `${idn}${where}${cont}${base}${acting}`.trim();
+  }
+
+  // Pick (single character) or compose (multiple characters) the canonical start
+  // image for a clip. Single: reuse that character's reference. Multiple: render a
+  // fresh establishing still from all present characters' locked descriptions so
+  // they appear together in one frame for Wan I2V (which takes one start image).
+  async function clipStartImage(clip, story, castMap, label) {
+    const present = (clip.characters || []).filter(id => castMap[id] && castMap[id].refName);
+    if (present.length === 0) {
+      const any = Object.values(castMap).find(c => c.refName);
+      return any ? any.refName : null;
+    }
+    if (present.length === 1) return castMap[present[0]].refName;
+    const castById = {}; (story.cast || []).forEach(c => castById[c.id] = c);
+    if (castMap) Object.keys(castMap).forEach(id => { castById[id] = { ...castById[id], ...castMap[id] }; });
+    const locById = {}; (story.locations || []).forEach(l => locById[l.id] = l);
+    const who = present.map(id => { const c = castById[id]; return c ? `${c.name || c.id}: ${c.description || ""}` : id; }).join(". ");
+    const loc = locById[clip.location];
+    const where = loc ? `${loc.name || loc.id} — ${loc.description || ""}` : (story.setting || "");
+    const prompt = `Cinematic establishing wide shot showing multiple characters together in the same frame. ${who}. Setting: ${where}. ${clip.action || ""}. All characters fully visible and in-frame, photorealistic, consistent lighting, physically plausible composition. ${story.style || ""}. No on-screen text, captions, or watermarks.`;
+    setStatus(s => ({ ...s, label: `${label}: composing multi-character scene…` }));
+    const still = await renderPortrait(prompt, `${label} scene`);
+    setScProgress(p => p.map(x => x.index === clip.index ? { ...x, startUrl: still.previewUrl } : x));
+    return still.name;
+  }
+
+  // Render the film ASSET-FIRST: every clip is seeded from a CANONICAL character
+  // reference (or a freshly composed multi-character still) — never the previous
+  // clip's degrading last frame — and each clip's own narration line is muxed onto
+  // that clip so the voiceover stays in sync. Then the narrated clips are stitched.
+  async function runStoryChain() {
+    if (!scStory || !Array.isArray(scStory.clips) || scStory.clips.length === 0) {
+      toast("Generate a storyboard first.", true); return;
+    }
+    if (!scCastReady) { toast("Generate the cast first (③ Generate cast).", true); return; }
+    cancelRef.current = false; currentJobIdRef.current = null;
+    setRunning(true); setOuts([]); setStitched(null);
+    const clips = scStory.clips;
+    const N = clips.length;
+    const clipSec = Math.min(5, Math.max(3, Number(scStory.clipSeconds) || 5));
+    const castMap = {}; (scCast || []).forEach(c => castMap[c.id] = c);
+    const narrating = scNarrationMode !== "off";
+    setScProgress(clips.map(c => ({ index: c.index, title: c.title || `clip ${c.index}`, status: "pending", clipUrl: null, startUrl: null })));
+    setStatus({ phase: "running", pct: 1, label: "preparing scenes" });
+    const etaMin = Math.ceil((N * 70) / 60);
+    toast(`Rendering ${N}-clip film · est. ~${etaMin} min on Wan2.2 I2V`);
+    try {
+      const finals = [];
+      let prevFrameName = null, prevFramePreview = null, prevClip = null;
+      for (let i = 0; i < N; i++) {
+        if (cancelRef.current) throw new Error("Cancelled by user");
+        const clip = clips[i];
+        const label = `clip ${i + 1}/${N}`;
+        const basePct = 2 + (i / N) * 92;
+        const spanPct = (1 / N) * 88;
+        setScProgress(p => p.map(x => x.index === clip.index ? { ...x, status: "rendering" } : x));
+        setStatus({ phase: "running", pct: basePct, label: `${label}: ${clip.title || "rendering"}` });
+
+        // Seed selection. The casting image only LOCKS THE FACE — it is NOT the start of
+        // every clip. ONLY the first clip starts from the casting reference (to inject the
+        // cast's generated/uploaded face). EVERY later clip starts from the PREVIOUS clip's
+        // last scene/frame, so the video continues from where it left off (never restarts as
+        // the portrait) while the cast keeps that same face — reinforced by the locked face
+        // descriptions restated in every prompt. We only fall back to the casting reference
+        // if last-frame extraction failed for the previous clip.
+        let startImage, seedKind;
+        if (i === 0 || !prevFrameName) {
+          startImage = await clipStartImage(clip, scStory, castMap, label);
+          seedKind = "casting";
+          if (!startImage) throw new Error(`${label}: no character reference available — generate the cast first`);
+        } else {
+          startImage = prevFrameName;
+          seedKind = "last-frame";
+          setScProgress(p => p.map(x => x.index === clip.index ? { ...x, startUrl: prevFramePreview } : x));
+        }
+
+        const thePrompt = buildClipPrompt(clip, scStory, prevClip, narrating, castMap);
+        dbg("info", `${label} seed=${seedKind}`);
+        const job = await submitI2V(startImage, thePrompt, clipSec, label);
+        pushSubscribeForJob(job.id, label);
+        const etaMs = clipSec * 16000;
+        await poll(job.id, (st, elapsed) => {
+          const frac = Math.min(0.98, elapsed / etaMs);
+          setStatus(s => ({ ...s, label: `${label}: ${st} (${Math.round(elapsed / 1000)}s)`, pct: basePct + spanPct * frac }));
+        });
+        setStatus(s => ({ ...s, label: `${label}: finalizing` }));
+        const fr = await fetch(`/api/jobs/${job.id}/finalize`, { method: "POST" });
+        const fj = await jsonOrThrow(fr);
+        let clipUrl = fj.url;
+
+        // Extract THIS clip's last frame (from the silent render) to seed the NEXT clip
+        // — the core of the strict 5s→5s continuation chain the user asked for.
+        if (i < N - 1 && !cancelRef.current) {
+          try {
+            const ef = await fetch("/api/extract-last-frame", {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ videoUrl: clipUrl, size: scSize })
+            });
+            const ej = await jsonOrThrow(ef);
+            prevFrameName = ej.name; prevFramePreview = ej.previewUrl;
+          } catch (e) {
+            dbg("warn", `${label}: last-frame extract failed (${e.message}); next clip re-seeds from casting`);
+            prevFrameName = null; prevFramePreview = null;
+          }
+        }
+
+        // Per-clip audio: speak the DIALOGUE (character voice) and the NARRATION (narrator
+        // voice), concatenate dialogue→narration into one track, and mux it onto THIS clip so
+        // the audio lands in sync with its action. Either line may be empty.
+        if (narrating && !cancelRef.current) {
+          const nLine = (clip.narration || "").trim();
+          const dLine = (clip.dialog || "").trim();
+          // Voice the dialogue in the SPEAKING character's own voice when we know who it is
+          // (clip.speaker, or the sole present character), else the default character voice.
+          const speakerId = clip.speaker || ((clip.characters || []).length === 1 ? clip.characters[0] : "");
+          const dVoice = (speakerId && castMap[speakerId] && castMap[speakerId].voice) || scDialogVoice || voice;
+          try {
+            const tracks = [];
+            if (dLine) {
+              setStatus(s => ({ ...s, label: `${label}: dialogue` }));
+              const dr = await fetch("/api/narrate", {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ text: dLine, voice: dVoice })
+              });
+              tracks.push((await jsonOrThrow(dr)).url);
+            }
+            if (nLine) {
+              setStatus(s => ({ ...s, label: `${label}: narrating` }));
+              const nr = await fetch("/api/narrate", {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ text: nLine, voice })
+              });
+              tracks.push((await jsonOrThrow(nr)).url);
+            }
+            if (tracks.length) {
+              let audioUrl = tracks[0];
+              if (tracks.length > 1) {
+                const cr = await fetch("/api/concat-audio", {
+                  method: "POST", headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ audioUrls: tracks, gapMs: 350 })
+                });
+                audioUrl = (await jsonOrThrow(cr)).url;
+              }
+              const mr = await fetch("/api/mux-audio", {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ videoUrl: clipUrl, audioUrl, mode: "replace" })
+              });
+              clipUrl = (await jsonOrThrow(mr)).url;
+              dbg("ok", `${label} voiced (${[dLine && "dialogue", nLine && "narration"].filter(Boolean).join(" + ")})`);
+            }
+          } catch (e) {
+            dbg("warn", `${label} audio failed (${e.message}); clip kept silent`);
+          }
+        }
+
+        finals.push({ url: clipUrl, seconds: clipSec, size: scSize });
+        setOuts([...finals]);
+        setScProgress(p => p.map(x => x.index === clip.index ? { ...x, status: "done", clipUrl } : x));
+        dbg("ok", `${label} rendered (seed=${seedKind})`);
+        prevClip = clip;
+      }
+
+      // Stitch the clips into the final film. Narrated chains use hard cuts so the
+      // per-clip audio doesn't overlap across a crossfade.
+      setRefreshLib(x => x + 1);
+      if (finals.length >= 2) {
+        setStitching(true);
+        const cf = narrating ? 0 : crossfade;
+        setStatus({ phase: "running", pct: 95, label: `stitching ${finals.length} clips into the film…` });
+        try {
+          const r = await fetch("/api/stitch", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ urls: finals.map(f => f.url), crossfade: cf })
+          });
+          const j = await jsonOrThrow(r);
+          setStitched({ url: j.url, clips: j.clips, crossfade: j.crossfade, bytes: j.bytes, narrated: narrating });
+          dbg("ok", `stitched ${j.clips} clips → ${(j.bytes / 1024 / 1024).toFixed(1)}MB film`);
+        } catch (e) {
+          dbg("warn", "stitch failed; clips still available individually", e.message);
+          toast("Stitch failed — clips are available individually", true);
+        } finally { setStitching(false); }
+      }
+
+      setStatus({ phase: "done", pct: 100, label: "film ready" });
+      toast("Story chain complete 🎬");
+    } catch (e) {
+      const cancelled = cancelRef.current || /Cancelled by user/i.test(e.message || "");
+      setStatus({ phase: cancelled ? "idle" : "failed", pct: 0, label: cancelled ? "cancelled" : "error" });
+      toast(cancelled ? "Story chain cancelled" : e.message.slice(0, 200), !cancelled);
+    } finally {
+      cancelRef.current = false; currentJobIdRef.current = null; setRunning(false);
+    }
+  }
+
+  const recentLines = dbgLines.slice(-200);
+
+  // Poll the server-side render queue so finished films appear automatically; the
+  // steady 3s poll also keeps the F1 app warm so background renders don't get
+  // recycled mid-flight while a tab is open.
+  useEffect(() => {
+    refreshJobs();
+    const iv = setInterval(refreshJobs, 3000);
+    return () => clearInterval(iv);
+  }, []);
+  // Advance to the story-review step automatically once a storyboard is generated.
+  useEffect(() => { if (scStory && wizStep === 2) setWizStep(3); }, [scStory]);
+
+  return html`
+    <header class="app">
+      <span class="dot"></span>
+      <span class="title">avideo</span>
+      <span class="badge">wan2.2 · ${scSize} · ${scClipCount} clips</span>
+      <div style=${{display:"flex",gap:4,marginLeft:12}}>
+        <button class="ghost small" onClick=${() => setPage("studio")}
+          style=${page==="studio" ? {background:"var(--accent)",color:"#fff",borderColor:"var(--accent)"} : {}}>Studio</button>
+        <button class="ghost small" onClick=${() => { setPage("history"); setRefreshLib(x => x + 1); }}
+          style=${page==="history" ? {background:"var(--accent)",color:"#fff",borderColor:"var(--accent)"} : {}}>History</button>
+      </div>
+      <div class="spacer"></div>
+      <button class="ghost" onClick=${() => setTheme(theme === "light" ? "dark" : "light")} title="Toggle theme">
+        ${theme === "light" ? "☾" : "☀"}
+      </button>
+      <button class="ghost" onClick=${() => setDrawerOpen(o => !o)} title="Debug log">
+        debug${dbgLines.length > 0 ? html` <span class="pill">${dbgLines.length}</span>` : ""}
+      </button>
+      ${me && me.authenticated ? html`
+        <span class="badge" title=${"object id: " + (me.objectId || "")}>${me.email || "signed in"}</span>
+        <a class="ghost" href="/.auth/logout?post_logout_redirect_url=/" title="Sign out" style=${{textDecoration:"none",padding:"6px 10px"}}>sign out</a>
+      ` : ""}
+    </header>
+
+    <main>
+      ${page === "history" ? html`
+      <!-- HISTORY: every saved film, with the prompt it was made from -->
+      <div style=${{gridColumn:"1 / -1"}}>
+        <${Library} refreshKey=${refreshLib} onSelect=${v => { setOuts([{ url: v.url, name: v.name, seconds: scClipSec, size: scSize }]); setStitched(null); setPage("studio"); toast("Loaded " + v.name); }} />
+      </div>
+      ` : html`
+      <!-- LEFT: Compose -->
+      <div key="studio-left">
+        <div class="card" style=${{borderColor:"var(--accent)",borderWidth:1,borderStyle:"solid"}}>
+          <h3 style=${{display:"flex",alignItems:"center",gap:8}}>🎬 Make a film <span class="pill ok small">step ${wizStep}/5</span></h3>
+          <div style=${{display:"flex",gap:4,flexWrap:"wrap",margin:"6px 0 12px"}}>
+            ${[[1,"Idea"],[2,"Language"],[3,"Story"],[4,"Cast"],[5,"Render"]].map(([n,lbl]) => html`
+              <button key=${n} type="button" class="ghost small" title=${lbl}
+                onClick=${() => { if (n <= wizStep) setWizStep(n); }}
+                style=${{flex:"1 1 0",minWidth:48,fontSize:11,padding:"4px 2px",cursor:n<=wizStep?"pointer":"default",...(wizStep===n ? {background:"var(--accent)",color:"#fff",borderColor:"var(--accent)"} : {}),...(n<wizStep ? {opacity:.85} : n>wizStep ? {opacity:.45} : {})}}>
+                ${n}. ${lbl}
+              </button>
+            `)}
+          </div>
+          <div class="stack">
+            <!-- STEP 1: story idea + dialogue idea + length/aspect -->
+            ${wizStep === 1 && html`
+            <div>
+              <label>① Story idea</label>
+              <textarea rows="3" placeholder="A lone astronaut explores an abandoned Martian station, discovers a flickering signal, and follows it to a hidden greenhouse still alive."
+                value=${scPrompt} onInput=${e => setScPrompt(e.target.value)}></textarea>
+            </div>
+            <div>
+              <label>Dialogue idea <span class="muted small">· optional — what they talk about / the tone. Leave empty to auto-write in sync with the story.</span></label>
+              <textarea rows="2" style=${{fontSize:13}} value=${scDialogPrompt}
+                onInput=${e => setScDialogPrompt(e.target.value)}
+                placeholder="e.g. Two friends bicker playfully about who saw the signal first."></textarea>
+            </div>
+            <div class="row">
+              <div>
+                <label>Film length</label>
+                <select value=${scTotalSec} onChange=${e => setScTotalSec(Number(e.target.value))}>
+                  <option value=${15}>15s · 3 clips</option>
+                  <option value=${30}>30s · 6 clips</option>
+                  <option value=${45}>45s · 9 clips</option>
+                  <option value=${60}>1 min · 12 clips</option>
+                </select>
+              </div>
+              <div>
+                <label>Aspect <span class="muted small">(480p, fast)</span></label>
+                <select value=${scAspect} onChange=${e => setScAspect(e.target.value)}>
+                  <option value="landscape">Landscape 16:9</option>
+                  <option value="vertical">Vertical 9:16</option>
+                </select>
+              </div>
+            </div>
+            `}
+            <!-- STEP 2: language / voiceover — chosen BEFORE writing so the script and
+                 narration are generated together, in one language, in sync. -->
+            ${wizStep === 2 && html`
+            <div>
+              <label>② Language &amp; voiceover <span class="muted small">(the whole script is written in the chosen language)</span></label>
+              <div class="seg" style=${{display:"flex",gap:6,flexWrap:"wrap",margin:"4px 0 8px"}}>
+                ${[["off","🔇 No voiceover"],["auto","🎙️ AI voiceover"]].map(([v,lbl]) => html`
+                  <button key=${v} type="button" onClick=${() => setScNarrationMode(v)}
+                    class="ghost small"
+                    style=${scNarrationMode===v ? {background:"var(--accent)",color:"#fff",borderColor:"var(--accent)"} : {}}>
+                    ${lbl}
+                  </button>
+                `)}
+              </div>
+              ${scNarrationMode !== "off" ? html`
+                <div class="stack" style=${{gap:8}}>
+                  <div>
+                    <label>Language <span class="muted small">· the whole film — script, narration &amp; every spoken line — is written and voiced in this language</span></label>
+                    <select value=${curLoc} onChange=${e => pickLanguage(e.target.value)}>
+                      ${LANGUAGES.map(l => html`<option value=${l.code} key=${l.code}>${l.label}</option>`)}
+                    </select>
+                  </div>
+                  <div>
+                    <label>Narrator voice <span class="muted small">· speaks the narration in <strong>${langLabel(curLoc)}</strong></span></label>
+                    <select value=${voice} onChange=${e => setVoice(e.target.value)}>
+                      ${langVoices.map(v => html`<option value=${v.shortName} key=${v.shortName}>${v.localName || v.shortName} (${v.gender || "?"})</option>`)}
+                    </select>
+                  </div>
+                  <div>
+                    <label>Default character voice <span class="muted small">· dialogue fallback when a cast member has no voice set in the cast step</span></label>
+                    <select value=${scDialogVoice} onChange=${e => setScDialogVoice(e.target.value)}>
+                      <option value="">Same as narrator</option>
+                      ${langVoices.map(v => html`<option value=${v.shortName} key=${"d" + v.shortName}>${v.localName || v.shortName} (${v.gender || "?"})</option>`)}
+                    </select>
+                  </div>
+                </div>
+              ` : html`<p class="muted small">The film will be silent. You can still type on-screen dialogue in step 3 — it just won't be spoken.</p>`}
+            </div>
+
+            <div class="btn-row" style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+              <button class="primary" onClick=${buildStoryboard} disabled=${scBuilding || !scPrompt.trim()}>
+                ${scBuilding ? "Writing story…" : (scNarrationMode !== "off" ? "Generate story + voiceover →" : "Generate storyboard →")}
+              </button>
+              <span class="muted small">${scClipCount} clips · ${scClipSec}s each · one continuous arc</span>
+            </div>
+            `}
+
+            <!-- STEP 3: story, narration & dialogue review (editable) -->
+            ${wizStep === 3 && (!scStory ? html`<p class="muted small">Generate the story in step 2 first.</p>` : html`
+              <div>
+                <label>③ Story, narration &amp; dialogue <span class="muted small">· generated — review &amp; edit anything below</span></label>
+              </div>
+              ${scNarrationMode !== "off" && html`
+                <div class="btn-row" style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                  <button class="ghost" onClick=${genDialogue} disabled=${scDialoging}>${scDialoging ? "Writing dialogue…" : "✍️ Regenerate dialogue"}</button>
+                  <button class="ghost" onClick=${previewNarration}>🔊 Preview voice</button>
+                  <button class="ghost" onClick=${buildStoryboard} disabled=${scBuilding}>${scBuilding ? "Rewriting…" : "↻ Rewrite story"}</button>
+                </div>
+                ${scNarrAudio && html`<audio src=${scNarrAudio.url} controls style=${{width:"100%"}}></audio>`}
+              `}
+              ${Array.isArray(scStory.clips) && html`
+              <div class="plan">
+                <div class="plan-head">
+                  <strong>${scStory.title || "Storyboard"}</strong>
+                  <span class="pill">${scStory.clips.length} clips</span>
+                </div>
+                ${scStory.logline && html`<div class="muted small" style=${{padding:"0 12px 8px"}}>${scStory.logline}</div>`}
+                ${(scCast.length > 0 || (Array.isArray(scStory.cast) && scStory.cast.length > 0)) && html`
+                  <div class="muted small" style=${{padding:"0 12px 8px",display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
+                    <span style=${{opacity:.7}}>Cast:</span>
+                    ${(scCast.length ? scCast : scStory.cast).map((c,ci) => html`<span class="pill small" key=${ci} title=${c.description||""}>${c.name || c.id}${c.voice ? " 🔊" : ""}</span>`)}
+                    ${Array.isArray(scStory.locations) && scStory.locations.map((l,li) => html`<span class="pill small" key=${"l"+li} title=${l.description||""} style=${{borderStyle:"dashed"}}>@ ${l.name || l.id}</span>`)}
+                  </div>
+                `}
+                ${scStory.clips.map((c, i) => html`
+                  <div class="plan-seg" key=${i}>
+                    <div class="plan-seg-head">
+                      <span class="pill">${i+1}</span>
+                      <span class="plan-seg-summary"><strong>${c.title || ""}</strong> — ${c.action || ""}</span>
+                      ${c.camera && html`<span class="pill small">${c.camera}</span>`}
+                    </div>
+                    ${((Array.isArray(c.characters) && c.characters.length > 0) || c.location) && html`
+                      <div style=${{display:"flex",gap:4,flexWrap:"wrap",padding:"0 0 6px 30px"}}>
+                        ${(c.characters||[]).map((id,ci) => { const nm = (scCast.find(x => x.id === id) || {}).name || id; return html`<span class="pill small" key=${ci} title=${c.speaker===id ? "speaks in this clip" : ""}>${nm}${c.speaker===id ? " 🔊" : ""}</span>`; })}
+                        ${c.location && html`<span class="pill small" style=${{borderStyle:"dashed"}}>@ ${c.location}</span>`}
+                      </div>
+                    `}
+                    <${Accordion} title="motion prompt">
+                      <textarea rows="3" style=${{fontSize:12,fontFamily:"var(--mono)"}} value=${c.motionPrompt || ""}
+                        onInput=${e => editClipPrompt(c.index, e.target.value)}></textarea>
+                    </${Accordion}>
+                    <${Accordion} title=${"narration · " + ((c.narration||"").trim() ? ((c.narration||"").trim().split(" ").filter(Boolean).length + " words") : "empty")}>
+                      <textarea rows="2" style=${{fontSize:12}} placeholder="Narrator voiceover for this clip (kept short so it fits)."
+                        value=${c.narration || ""} onInput=${e => editClipNarration(c.index, e.target.value)}></textarea>
+                    </${Accordion}>
+                    <${Accordion} title=${"dialogue · " + ((c.dialog||"").trim() ? ((c.dialog||"").trim().split(" ").filter(Boolean).length + " words") : "none")}>
+                      <textarea rows="2" style=${{fontSize:12}} placeholder="What a character actually says on screen in this clip (leave empty if silent)."
+                        value=${c.dialog || ""} onInput=${e => editClipDialog(c.index, e.target.value)}></textarea>
+                    </${Accordion}>
+                  </div>
+                `)}
+              </div>
+              `}
+            `)}
+
+            <!-- STEP 4: characters + image + per-character voices -->
+            ${wizStep === 4 && html`
+            <div>
+              <label>④ Characters &amp; voices <span class="muted small">(upload a face for the lead, or let AI generate everyone — carried across every clip)</span></label>
+              <p class="muted small" style=${{margin:"2px 0 8px"}}>
+                Review the cast the story proposed — edit any description, drop in a template, or add/remove characters. Optionally upload a photo for the lead. Each character is rendered once and reused in every clip so identities stay locked.
+              </p>
+              <div style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",margin:"0 0 10px"}}>
+                <span class="muted small" style=${{flex:"0 0 auto"}}>Portrait engine</span>
+                <div class="seg" style=${{display:"flex",gap:6}}>
+                  ${[["flux","⚡ FLUX.1 Schnell"],["comfy","🎬 ComfyUI still"]].map(([v,lbl]) => html`
+                    <button key=${v} type="button" onClick=${() => setScImageEngine(v)}
+                      class="ghost small"
+                      style=${scImageEngine===v ? {background:"var(--accent)",color:"#fff",borderColor:"var(--accent)"} : {}}>
+                      ${lbl}
+                    </button>
+                  `)}
+                </div>
+                <span class="muted small" style=${{flex:"1 1 100%"}}>
+                  ${scImageEngine==="flux"
+                    ? "FLUX.1 Schnell renders sharp portraits in a few seconds (auto-falls back to the ComfyUI still if FLUX is unavailable)."
+                    : "The original Wan 1-second-clip still — slower, but always available."}
+                </span>
+              </div>
+              <label class="muted small">Lead reference photo <span class="muted small">(optional)</span></label>
+              <input type="file" accept="image/*" onChange=${e => pickCharImage(e.target.files[0] || null)} />
+              ${scCharPreview && html`
+                <div style=${{marginTop:8,display:"flex",alignItems:"center",gap:10}}>
+                  <img src=${scCharPreview} alt="lead" style=${{width:72,height:72,objectFit:"cover",borderRadius:"var(--radius-sm)",border:"1px solid var(--border)"}} />
+                  <div class="muted small">${scCharFile?.name || ""}<br/>Used as the lead's reference.</div>
+                </div>
+              `}
+              ${scStory && scCast.length > 0 && html`
+                <div class="stack" style=${{gap:8,margin:"8px 0 4px"}}>
+                  <div class="muted small">
+                    <strong>Cast (${scCast.length})</strong> — edit a look, drop in a template, or add/remove characters. Changing a description re-renders that character's reference.${scNarrationMode !== "off" ? " Pick each character's voice below." : ""}
+                  </div>
+                  ${scNarrationMode !== "off" && html`
+                    <div style=${{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
+                      <span class="muted small">Voices in ${langLabel(curLoc)}:</span>
+                      ${bundlesForCurrentLanguage().map((b,bi) => html`<button key=${bi} class="ghost small" onClick=${() => applyVoiceBundle(b)} disabled=${!voices.length}>${b.label}</button>`)}
+                      <button class="ghost small" onClick=${resuggestVoices} disabled=${!voices.length}>↻ Auto-suggest voices</button>
+                    </div>
+                  `}
+                  ${scCast.map((c, i) => html`
+                    <div key=${c.id} style=${{border:"1px solid var(--border)",borderRadius:"var(--radius-sm)",padding:8,display:"flex",flexDirection:"column",gap:6,background:"var(--surface-2)"}}>
+                      <div style=${{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
+                        <span class="pill small" style=${{flex:"0 0 auto"}}>${i+1}</span>
+                        <input value=${c.name||""} placeholder="Name"
+                          onInput=${e => updateCastMember(c.id, { name: e.target.value })}
+                          style=${{flex:"1 1 110px",fontSize:13,fontWeight:600}} />
+                        <select value="" title="Replace this character with a predefined template"
+                          onChange=${e => { const t = CAST_TEMPLATES[+e.target.value]; if (t) updateCastMember(c.id, { name: t.name, description: t.description }); e.target.value=""; }}
+                          style=${{flex:"0 0 auto",fontSize:12}}>
+                          <option value="">Template…</option>
+                          ${CAST_TEMPLATES.map((t, ti) => html`<option value=${ti} key=${c.id+"t"+ti}>${t.label}</option>`)}
+                        </select>
+                        <button class="ghost small" title="Remove character" onClick=${() => removeCastMember(c.id)} style=${{flex:"0 0 auto"}}>✕</button>
+                      </div>
+                      <textarea rows="2" style=${{fontSize:12}} value=${c.description||""}
+                        placeholder="Locked look: age, build, skin tone, hair, wardrobe, distinguishing features"
+                        onInput=${e => updateCastMember(c.id, { description: e.target.value })}></textarea>
+                      ${scNarrationMode !== "off" && html`
+                        <div style=${{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
+                          <span class="muted small" style=${{flex:"0 0 auto"}}>🔊 Voice</span>
+                          <select style=${{flex:"1 1 160px",fontSize:12}} value=${c.voice || ""} onChange=${e => updateCastMember(c.id, { voice: e.target.value })}>
+                            <option value="">Default character voice</option>
+                            ${langVoices.map(v => html`<option value=${v.shortName} key=${"cv" + c.id + v.shortName}>${v.localName || v.shortName} (${v.gender || "?"})</option>`)}
+                          </select>
+                        </div>
+                      `}
+                    </div>
+                  `)}
+                  <div style=${{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
+                    <button class="ghost small" onClick=${() => addCastMember()}>+ Add character</button>
+                    <select value="" onChange=${e => { const t = CAST_TEMPLATES[+e.target.value]; if (t) addCastMember({ name: t.name, description: t.description }); e.target.value=""; }} style=${{fontSize:12}}>
+                      <option value="">+ Add from template…</option>
+                      ${CAST_TEMPLATES.map((t, ti) => html`<option value=${ti} key=${"add"+ti}>${t.label}</option>`)}
+                    </select>
+                  </div>
+                </div>
+              `}
+              <div class="btn-row" style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",marginTop:8}}>
+                <span class="muted small">${(scCast || []).length ? (scCast.length + " character(s) — portraits & continuity render automatically in the background.") : "No characters yet — AI will generate them for you."}</span>
+              </div>
+            </div>
+            `}
+
+            <!-- STEP 5: render -->
+            ${wizStep === 5 && html`
+            <div>
+              <label>⑤ Render</label>
+              <div class="plan" style=${{marginTop:6}}>
+                <div class="plan-head"><strong>${(scStory && scStory.title) || "Your film"}</strong><span class="pill">${scClipCount} clips · ${scClipSec}s</span></div>
+                <div class="muted small" style=${{padding:"0 12px 10px",display:"flex",flexDirection:"column",gap:4}}>
+                  <span>🎬 ${scClipCount} clips · ${scSize} · ${scAspect}</span>
+                  <span>🗣️ ${scNarrationMode === "off" ? "Silent" : ("Voiceover in " + voiceLanguage(voice))}</span>
+                  <span>🎭 ${(scCast || []).length} character(s)${scCharFile ? " · lead photo provided" : ""}</span>
+                  <span>🖼️ Portraits via ${scImageEngine === "flux" ? "FLUX.1 Schnell" : "ComfyUI still"}</span>
+                </div>
+              </div>
+              <p class="muted small" style=${{marginTop:6}}>
+                Submitting sends this film to the background render queue. The wizard resets so you can start another — track progress and cancel any job in the queue below. Finished films are saved and appear automatically.
+              </p>
+            </div>
+            <div class="btn-row" style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+              <button class="primary" onClick=${submitStoryJob} disabled=${scCasting || !scStory}>
+                ${scCasting ? "Submitting…" : "🚀 Submit to render queue"}
+              </button>
+            </div>
+            `}
+
+            <!-- wizard navigation -->
+            <div style=${{display:"flex",gap:8,alignItems:"center",justifyContent:"space-between",marginTop:8,borderTop:"1px solid var(--border)",paddingTop:10}}>
+              <button class="ghost" onClick=${wizBack} disabled=${wizStep === 1}>← Back</button>
+              <span class="muted small">Step ${wizStep} of 5</span>
+              ${wizStep < 5
+                ? html`<button class="primary" onClick=${wizNext} disabled=${wizCanNext[wizStep] && !wizCanNext[wizStep]()}>Next →</button>`
+                : html`<span style=${{width:64}}></span>`}
+            </div>
+          </div>
+        </div>
+
+        <!-- RENDER QUEUE (durable background jobs) -->
+        <div class="card">
+          <h3 style=${{display:"flex",alignItems:"center",gap:8}}>🎞️ Render queue ${jobs.length > 0 && html`<span class="pill">${jobs.length}</span>`}</h3>
+          ${jobs.length === 0
+            ? html`<p class="muted small">No films yet. Build one on the left and submit — it renders here in the background while you start the next.</p>`
+            : html`<div class="stack" style=${{gap:8}}>
+                ${jobs.map(j => {
+                  const active = j.status === "queued" || j.status === "running";
+                  const pillCls = j.status === "succeeded" ? "ok" : (j.status === "failed" || j.status === "interrupted") ? "err" : "";
+                  return html`
+                    <div key=${j.id} style=${{border:"1px solid var(--border)",borderRadius:"var(--radius-sm)",padding:10,background:"var(--surface-2)"}}>
+                      <div style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                        <strong style=${{flex:"1 1 120px",fontSize:13,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}} title=${j.title}>${j.title || "Untitled"}</strong>
+                        <span class=${"pill small " + pillCls}>${j.status}</span>
+                        ${active && html`<button class="ghost small" onClick=${() => cancelJob(j.id)}>✕ Cancel</button>`}
+                      </div>
+                      ${j.label && html`<div class="muted small" style=${{margin:"4px 0"}}>${j.label}</div>`}
+                      ${active && html`<div class="progress"><div style=${{width:(j.pct || 0) + "%"}}></div></div>`}
+                      ${j.resultUrl && html`
+                        <video src=${j.resultUrl} controls loop playsinline style=${{width:"100%",borderRadius:6,marginTop:6}}></video>
+                        <div class="meta" style=${{flexWrap:"wrap"}}>
+                          <a href=${j.resultUrl} target="_blank" rel="noopener">download ↗</a>
+                          <span class="muted small">${j.narrate ? "voiced" : "silent"} · ${j.size || ""}</span>
+                        </div>
+                      `}
+                      ${j.error && !j.resultUrl && html`<div class="muted small" style=${{color:"#ef4444"}}>${j.error}</div>`}
+                    </div>`;
+                })}
+              </div>`}
+        </div>
+      </div>
+
+      <!-- RIGHT: Preview (the current film) -->
+      <div key="studio-right">
+        <div class="card">
+          <h3>Preview</h3>
+          <div class="preview">
+            ${(() => {
+              const headline = stitched?.url || (outs.length > 0 ? outs[outs.length-1].url : null);
+              if (!headline) return html`<div class="empty">Your video will appear here.</div>`;
+              return html`<video src=${headline} controls autoplay loop></video>`;
+            })()}
+          </div>
+          ${stitched && html`
+            <div class="meta" style=${{flexWrap:"wrap"}}>
+              <span class="pill ok">combined · ${stitched.clips} clips · ${stitched.crossfade > 0 ? stitched.crossfade + "s crossfade" : "hard cuts"} · ${(stitched.bytes/1024/1024).toFixed(1)}MB</span>
+              <a href=${stitched.url} target="_blank" rel="noopener">download ↗</a>
+            </div>
+          `}
+          ${outs.length >= 2 && html`
+            <div class="meta" style=${{flexWrap:"wrap",gap:6}}>
+              <span style=${{opacity:.7,marginRight:6}}>Transition:</span>
+              <button class="ghost" disabled=${stitching} onClick=${() => restitch(0)} title="Lossless concat, ~1s. Best when last-frame anchor worked.">hard cut</button>
+              <button class="ghost" disabled=${stitching} onClick=${() => restitch(0.3)} title="Re-encodes the whole video. ~30s on F1.">0.3s xfade</button>
+              <button class="ghost" disabled=${stitching} onClick=${() => restitch(0.5)} title="Re-encodes the whole video. ~30s on F1.">0.5s xfade</button>
+              ${stitching && html`<span class="pill">stitching…</span>`}
+            </div>
+          `}
+          ${outs.length > 0 && html`
+            <div class="meta">
+              ${outs.map((o, i) => html`<a href=${o.url} target="_blank" rel="noopener" key=${i}>clip ${i+1}/${outs.length} ↗</a>`)}
+              <span>${scClipSec}s × ${outs.length} · ${scSize}</span>
+            </div>
+          `}
+        </div>
+      </div>
+      `}
+    </main>
+
+    <div class=${"drawer" + (drawerOpen ? " open" : "")}>
+      <div class="head" onClick=${() => setDrawerOpen(o => !o)}>
+        <strong style=${{fontSize:12,letterSpacing:".04em",textTransform:"uppercase"}}>Debug log</strong>
+        <span class="pill">${dbgLines.length}</span>
+        <span style=${{flex:1}}></span>
+        <button class="ghost small" onClick=${e => { e.stopPropagation(); navigator.clipboard.writeText(recentLines.map(l => `[${l.t}] ${l.level} ${l.label}${l.detail ? "\n  " + l.detail : ""}`).join("\n")); toast("Copied"); }}>copy</button>
+        <button class="ghost small" onClick=${e => { e.stopPropagation(); dbgLines.length = 0; force(x => x+1); }}>clear</button>
+        <span style=${{fontSize:11,color:"var(--muted)"}}>${drawerOpen ? "▼" : "▲"}</span>
+      </div>
+      <div class="body">
+        ${recentLines.length === 0
+          ? html`<div class="muted">No events yet.</div>`
+          : recentLines.slice().reverse().map((l, i) => html`
+              <div class=${"line " + l.level} key=${i}>
+                <span class="lvl">${l.level}</span> [${l.t}] ${l.label}${l.detail ? "\n  " + l.detail : ""}
+              </div>
+            `)}
+      </div>
+    </div>
+  `;
 }
 
-// Refresh button
-$('#libRefresh').addEventListener('click', loadVideos);
-
-// Load on page load
-window.addEventListener('load', loadVideos);
+createRoot(document.getElementById("root")).render(React.createElement(App));
 </script>
 </body>
 </html>
