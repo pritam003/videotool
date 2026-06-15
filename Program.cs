@@ -1530,28 +1530,11 @@ app.MapPost("/api/generate-story-idea", async (
     var key = Cfg(cfg, "AOAI_KEY");
     var deployment = cfg["CHAT_DEPLOYMENT"] ?? "gpt-4o-mini";
 
-    var systemPrompt = @"You are a creative film director, screenwriter, and storyteller. Generate both a compelling story premise and sample dialogue for a short film concept.
+    var systemPrompt = @"You are a creative screenwriter. Generate story and dialogue for a film concept.
 
-When given a story idea, provide:
-
-1. STORY: A vivid single paragraph (3-4 sentences) film treatment that:
-   - Expands the user's idea with cinematic details
-   - Establishes characters, setting, and central conflict/emotion
-   - Hints at the story arc (beginning, tension, resolution)
-
-2. DIALOGUE: 2-3 sample dialogue exchanges (4-6 lines total) that:
-   - Feel natural and authentic to the characters/setting
-   - Hint at the story's central conflict or emotion
-   - Show character personality and relationships
-   - Are suitable for a 30-60 second short film
-
-Format your response EXACTLY as:
-[STORY]
-{story content here}
-[/STORY]
-[DIALOGUE]
-{dialogue content here}
-[/DIALOGUE]";
+Return EXACTLY this format:
+[STORY]3-4 sentence vivid story treatment with character, setting, and emotion[/STORY]
+[DIALOGUE]2-3 dialogue exchanges showing character and conflict[/DIALOGUE]";
 
     var userPrompt = $@"Create a story and dialogue for this film concept:
 
@@ -1570,7 +1553,7 @@ Remember to use the [STORY] [/STORY] and [DIALOGUE] [/DIALOGUE] delimiters.";
                 new { role = "system", content = systemPrompt },
                 new { role = "user", content = userPrompt }
             },
-            max_completion_tokens = 400
+            max_completion_tokens = 8000  // gpt-5-mini needs high budget for reasoning + story+dialogue output
         };
 
         using var msg = new HttpRequestMessage(HttpMethod.Post,
