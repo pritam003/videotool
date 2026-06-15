@@ -64,7 +64,7 @@
     "class_type": "CLIPTextEncode",
     "_meta": { "title": "Negative prompt" },
     "inputs": {
-      "text": "blurry, distorted, low quality, low resolution, oversaturated, color bleed, posterized, banding, jpeg artifacts, bad anatomy, malformed, deformed face, extra limbs, watermark, on-screen text, captions, logo, ugly, morphing, flickering, identity change, face swap, different person",
+      "text": "blurry, distorted, low quality, low resolution, oversaturated, color bleed, posterized, banding, jpeg artifacts, bad anatomy, malformed, deformed face, extra limbs, watermark, on-screen text, captions, logo, ugly, morphing, flickering, identity change, face swap, different person, floating, levitating, sliding feet, foot skating, rubber limbs, elastic body, jitter, stutter, warping geometry, melting, teleporting objects, impossible motion, broken joints, dislocated limbs, unnatural movement, physics defying, speed ramping",
       "clip": ["5", 0]
     }
   },

@@ -1195,46 +1195,60 @@ app.MapPost("/api/storyboard", async (StoryboardRequest req, IHttpClientFactory 
     var clipCount = Math.Clamp((int)Math.Ceiling(totalSeconds / (double)clipSeconds), 1, 24);
     var size = req.Size ?? "832x480";
 
-    var sys = $@"You are a film director and storyboard artist planning a SINGLE continuous short film that will be produced as a CHAIN of {clipCount} image-to-video clips, each {clipSeconds} seconds long, played back-to-back to form one ~{clipCount * clipSeconds}-second film.
+    var sys = $@"You are a film director and casting director planning a SINGLE continuous short film produced as a CHAIN of {clipCount} image-to-video clips, each {clipSeconds} seconds long, played back-to-back into one ~{clipCount * clipSeconds}-second film.
 
-HOW THE PRODUCTION WORKS (critical — shapes how you must write prompts):
-- Clip 1 is generated from the user's CHARACTER IMAGE as its first frame.
-- Every later clip is generated image-to-video from the PREVIOUS clip's LAST FRAME as its first frame.
-- So the character's appearance, wardrobe, and setting are carried VISUALLY from frame to frame — you do NOT need to re-describe the character's face or clothes in detail. Instead, each clip's prompt must describe MOTION: what the character/camera DOES during these {clipSeconds} seconds, and how the shot ENDS so it flows into the next clip.
+HOW THE PRODUCTION WORKS (critical — shapes how you must write this):
+- BEFORE any clip is rendered, we generate ONE canonical reference image for EACH character and EACH location (a casting / location sheet).
+- Each clip is then rendered image-to-video by seeding its first frame from the canonical reference(s) of the characters present in THAT clip — NOT from the previous clip. This locks every character's identity, face and wardrobe for the whole film and prevents drift.
+- Therefore you MUST: (a) define a CAST and LOCATIONS up front with fixed, detailed visual descriptions, and (b) in every clip list which characters and which location appear, and briefly restate their key locked traits in the motion prompt.
+
+CASTING RULES:
+- Give every character a stable short id (e.g. 'hero', 'rival', 'mother'), a name, and a LOCKED description: age, build, skin tone, face, hair, wardrobe, and 1-2 distinguishing features. These never change across clips.
+- Give every location a stable id, a name, and a LOCKED description: place, time of day, color palette, key set pieces, lighting. These never change.
+- Support MULTIPLE characters; a clip may contain one or several of them.
 
 STORY RULES:
-- Spread the user's idea across all {clipCount} clips as ONE evolving story: clip 1 establishes; the middle clips develop/rise; the final clip resolves. NEVER repeat the same action — each clip must MOVE THE STORY FORWARD with new action.
-- Maintain continuity: each clip begins exactly where the previous clip's endState left off (same pose, location, framing) and then progresses.
-- Photorealistic and physically plausible by default. No on-screen text, captions, logos, or watermarks.
-- Keep one consistent visual style, lens and lighting across all clips (state it once in `style`).
+- Spread the idea across all {clipCount} clips as ONE evolving story: clip 1 establishes; middle clips develop/rise; the final clip resolves. NEVER repeat an action — each clip MOVES THE STORY FORWARD.
+- Exactly ONE clear, physically plausible action per clip (real gravity, weight, momentum, balance, natural human motion and timing). Do not cram multiple simultaneous actions into {clipSeconds} seconds.
+- Photorealistic. No on-screen text, captions, logos, or watermarks. One consistent visual style/lens/lighting (state once in `style`).
+
+NARRATION:
+- Write a SHORT spoken voiceover line for EACH clip that matches THAT clip's action, present tense, at most {Math.Max(6, clipSeconds * 2)} words so it fits within {clipSeconds} seconds when spoken. Plain language, no stage directions.
 
 Return ONE JSON object, no markdown, exactly this shape:
 {{
   ""title"": ""<short film title>"",
-  ""logline"": ""<one sentence describing the whole story arc>"",
-  ""subject"": ""<one short sentence naming the main character generically, e.g. 'the young woman in the ochre blazer' — the image defines exact identity, keep this light>"",
-  ""style"": ""<one line: film stock + grade + lens + lighting, identical across all clips>"",
-  ""setting"": ""<one line: where the story takes place and how/if it travels>"",
+  ""logline"": ""<one sentence describing the whole arc>"",
+  ""style"": ""<film stock + grade + lens + lighting, identical across all clips>"",
+  ""setting"": ""<where the story takes place and how/if it travels>"",
   ""clipSeconds"": {clipSeconds},
   ""clipCount"": {clipCount},
+  ""cast"": [
+    {{ ""id"": ""hero"", ""name"": ""<name>"", ""description"": ""<LOCKED full visual: age, build, skin, face, hair, wardrobe, distinguishing features>"" }}
+  ],
+  ""locations"": [
+    {{ ""id"": ""place1"", ""name"": ""<name>"", ""description"": ""<LOCKED: place, time of day, palette, set pieces, lighting>"" }}
+  ],
   ""clips"": [
     {{
       ""index"": 1,
       ""title"": ""<3-5 word beat title>"",
-      ""action"": ""<one sentence: the distinct physical action that happens in THIS clip, advancing the story>"",
-      ""camera"": ""<one short phrase: camera movement for this clip, e.g. 'slow push-in', 'handheld follow', 'static wide'>"",
-      ""motionPrompt"": ""<40-90 words. The image-to-video prompt to render this clip. Open by stating the first frame continues seamlessly, then describe the MOTION (subject action + camera move) over {clipSeconds} seconds, then the lighting/style in a few words. Describe what CHANGES, not a static description. Do not describe the character's face/clothes in detail — the frame already shows them. End with the negative cue 'No on-screen text, captions, or watermarks.'>"",
-      ""endState"": ""<one sentence: what the LAST frame of this clip shows — the pose/position/framing that the next clip will continue from>""
+      ""characters"": [""hero""],
+      ""location"": ""place1"",
+      ""action"": ""<one sentence: the single physical action in THIS clip>"",
+      ""camera"": ""<one short phrase: camera move, e.g. 'slow push-in'>"",
+      ""motionPrompt"": ""<40-90 words. Name the present character(s) and briefly restate their locked look, place them in the named location, then describe the SINGLE physical action + camera move over {clipSeconds} seconds with realistic physics and timing. End with 'No on-screen text, captions, or watermarks.'>"",
+      ""narration"": ""<short spoken line for this clip, present tense, at most {Math.Max(6, clipSeconds * 2)} words>"",
+      ""endState"": ""<one sentence: what the last frame shows>""
     }}
-    // ... exactly {clipCount} clips, each DISTINCT and in story order.
   ]
 }}
 
-Output JSON only. Exactly {clipCount} clips.";
+Output JSON only. Define every character in `cast` and every place in `locations`. Exactly {clipCount} clips, each listing its characters + location.";
 
     var user = $@"User film idea: {req.Prompt}
 
-Produce the {clipCount}-clip storyboard ({clipSeconds}s per clip, {clipCount * clipSeconds}s total, aspect {size}). Spread the idea into ONE continuous story — distinct action in every clip, each continuing from the previous clip's last frame. Output JSON only.";
+Cast the characters and locations this idea needs (support multiple characters), then produce the {clipCount}-clip storyboard ({clipSeconds}s per clip, {clipCount * clipSeconds}s total, aspect {size}) as ONE continuous story — a single physically-plausible action per clip, each clip listing which cast members and location appear, plus a short narration line per clip. Output JSON only.";
 
     var client = hf.CreateClient();
     client.Timeout = TimeSpan.FromSeconds(90);
@@ -1247,7 +1261,7 @@ Produce the {clipCount}-clip storyboard ({clipSeconds}s per clip, {clipCount * c
             new { role = "system", content = sys },
             new { role = "user",   content = user }
         },
-        max_completion_tokens = 4000,
+        max_completion_tokens = 8000,
         response_format = new { type = "json_object" }
     };
     msg.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
@@ -1270,16 +1284,21 @@ Produce the {clipCount}-clip storyboard ({clipSeconds}s per clip, {clipCount * c
             {
                 index = i,
                 title = $"Beat {i}",
+                characters = new[] { "hero" },
+                location = "place1",
                 action = i == 1
-                    ? "The story begins with a clear establishing action that introduces the scene and intention."
+                    ? "The main character is introduced with a clear establishing action."
                     : i == clipCount
-                        ? "The action resolves naturally into a clear ending moment that concludes the story."
-                        : "The action advances the situation with a visible change that raises stakes and momentum.",
+                        ? "The action resolves into a clear, composed ending moment."
+                        : "The action advances with a visible change that raises the stakes.",
                 camera,
-                motionPrompt = $"First frame continues seamlessly from the previous clip. Over {clipSeconds} seconds, show a {phase} beat for this story idea: {clean}. Keep movement clear and progressive, with realistic timing and physical continuity. Maintain the same cinematic style and lighting throughout. No on-screen text, captions, or watermarks.",
+                motionPrompt = $"The main character is centered in the scene. Over {clipSeconds} seconds, perform a single {phase} action for this story idea: {clean}. Keep motion clear, progressive and physically plausible — real weight, gravity and natural human timing. Maintain the same cinematic style and lighting. No on-screen text, captions, or watermarks.",
+                narration = i == 1
+                    ? "Our story begins."
+                    : i == clipCount ? "And so it ends." : "The moment builds.",
                 endState = i == clipCount
-                    ? "Final frame settles into a composed ending shot that feels complete."
-                    : "Final frame lands in a stable pose and framing that can continue seamlessly into the next clip."
+                    ? "Final frame settles into a composed ending shot."
+                    : "Final frame lands in a stable pose that can continue."
             };
         }).ToArray();
 
@@ -1287,11 +1306,12 @@ Produce the {clipCount}-clip storyboard ({clipSeconds}s per clip, {clipCount * c
         {
             title,
             logline = clean,
-            subject = "the main subject from the character image",
             style = "photoreal cinematic look, natural color grade, consistent lensing and lighting",
             setting = "one continuous environment with smooth spatial continuity",
             clipSeconds,
             clipCount,
+            cast = new[] { new { id = "hero", name = "Lead", description = "the main subject defined by the reference image; consistent face, hair and wardrobe throughout" } },
+            locations = new[] { new { id = "place1", name = "Main Setting", description = "one continuous environment with consistent palette and lighting" } },
             clips
         };
     }

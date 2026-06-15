@@ -47,7 +47,7 @@ public sealed class WanClient
     {
         var (frames, w, h, seed) = NormalizeDims(seconds, width, height);
         var workflow = _workflowJson.Value
-            .Replace("__PROMPT__", JsonSerializer.Serialize(prompt))
+            .Replace("__PROMPT__", JsonSerializer.Serialize(WithRealismDirectives(prompt)))
             .Replace("__WIDTH__", w.ToString(System.Globalization.CultureInfo.InvariantCulture))
             .Replace("__HEIGHT__", h.ToString(System.Globalization.CultureInfo.InvariantCulture))
             .Replace("__FRAMES__", frames.ToString(System.Globalization.CultureInfo.InvariantCulture))
@@ -69,7 +69,7 @@ public sealed class WanClient
             throw new ArgumentException("imageName is required for I2V", nameof(imageName));
         var (frames, w, h, seed) = NormalizeDims(seconds, width, height);
         var workflow = _i2vWorkflowJson.Value
-            .Replace("__PROMPT__", JsonSerializer.Serialize(prompt))
+            .Replace("__PROMPT__", JsonSerializer.Serialize(WithRealismDirectives(prompt)))
             .Replace("__IMAGE__", JsonSerializer.Serialize(imageName))
             .Replace("__WIDTH__", w.ToString(System.Globalization.CultureInfo.InvariantCulture))
             .Replace("__HEIGHT__", h.ToString(System.Globalization.CultureInfo.InvariantCulture))
@@ -111,6 +111,19 @@ public sealed class WanClient
         if (doc.RootElement.TryGetProperty("subfolder", out var sf) && !string.IsNullOrEmpty(sf.GetString()))
             name = $"{sf.GetString()}/{name}";
         return name;
+    }
+
+    // Physics / realism directives appended to every positive prompt so the
+    // Lightning 4-step Wan2.2 renders obey gravity, weight and anatomy instead of
+    // producing floaty, rubber-limbed, foot-sliding motion. Kept terse so it
+    // reinforces — not drowns — the caller's motion description.
+    private const string RealismSuffix =
+        " Physically accurate motion: natural gravity, real weight and momentum, balanced posture, feet firmly planted on the ground, stable horizon. Anatomically correct human movement with natural joint articulation and realistic timing. Consistent lighting, shadows and reflections; solid object permanence; smooth coherent motion with no warping.";
+
+    private static string WithRealismDirectives(string prompt)
+    {
+        prompt = (prompt ?? string.Empty).Trim();
+        return prompt.Length == 0 ? RealismSuffix.Trim() : prompt + RealismSuffix;
     }
 
     // Frame count must be 4n+1 (temporal compression factor 4); spatial dims multiples
