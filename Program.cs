@@ -25,14 +25,9 @@ builder.Services.AddSingleton<SoraJobWatcherRegistry>();
 // Wan2.2 (ComfyUI) client. Replaces the AOAI Sora-2 video path; the rest of the
 // app (frontend, push watcher, blob upload, stitch) keeps working unchanged.
 builder.Services.AddSingleton<WanClient>();
-// Durable server-side story render pipeline: an in-process queue + a single
-// background worker that renders a whole film (cast → clip chain → narrate →
-// mux → stitch) by reusing the app's own endpoints over localhost, so the UI is
-// freed the moment a film is submitted. InternalAuth lets those self-calls past
-// the Easy Auth middleware.
+// Internal auth for backend services
 builder.Services.AddSingleton<InternalAuth>();
-builder.Services.AddSingleton<StoryRenderQueue>();
-builder.Services.AddHostedService<StoryRenderWorker>();
+// Note: StoryRenderQueue and StoryRenderWorker removed - all jobs now tracked via /api/videos (history)
 
 var app = builder.Build();
 app.UseDefaultFiles();
@@ -289,36 +284,8 @@ app.MapPost("/api/jobs/{id}/cancel", async (string id, WanClient wan, Cancellati
 // stitch) while the UI is freed to compose the next one. Jobs are persisted to
 // blob so finished films reappear after an idle recycle. Cancel is the only
 // interrupt — it stops the in-flight GPU clip and ends the job.
-app.MapPost("/api/story-jobs", (StorySpec spec, StoryRenderQueue queue) =>
-{
-    if (spec?.Story is null)
-        return Results.BadRequest(new { error = "story spec is required" });
-    if (spec.Story["clips"] is not System.Text.Json.Nodes.JsonArray clips || clips.Count == 0)
-        return Results.BadRequest(new { error = "storyboard has no clips" });
-    string title = "Untitled film";
-    try { var t = spec.Story["title"]?.GetValue<string>(); if (!string.IsNullOrWhiteSpace(t)) title = t!; } catch { }
-    var job = queue.Enqueue(spec, title);
-    return Results.Json(new { id = job.Id, status = job.Status });
-});
-
-app.MapGet("/api/story-jobs", async (StoryRenderQueue queue, IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
-{
-    var sas = await TryStorySasAsync(cfg, cred, ct);
-    Func<string?, string?> resign = sas is { } s ? (u => ResignBlobUrl(u, s.account, s.container, s.udk)) : (u => u);
-    return Results.Json(queue.List().Select(j => StoryJobView.Summary(j, resign)));
-});
-
-app.MapGet("/api/story-jobs/{id}", async (string id, StoryRenderQueue queue, IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
-{
-    var job = queue.Get(id);
-    if (job is null) return Results.NotFound(new { error = "no such job" });
-    var sas = await TryStorySasAsync(cfg, cred, ct);
-    Func<string?, string?> resign = sas is { } s ? (u => ResignBlobUrl(u, s.account, s.container, s.udk)) : (u => u);
-    return Results.Json(StoryJobView.Full(job, resign));
-});
-
-app.MapPost("/api/story-jobs/{id}/cancel", (string id, StoryRenderQueue queue) =>
-    queue.Cancel(id) ? Results.Json(new { ok = true }) : Results.NotFound(new { error = "no such job" }));
+// All jobs consolidated to /api/videos (history endpoint below)
+// /api/story-jobs endpoints removed in favor of unified history view
 
 // 3. Finalize: download MP4 from ComfyUI's /view, stream-upload to blob, return SAS URL.
 app.MapPost("/api/jobs/{id}/finalize", async (
