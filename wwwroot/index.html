@@ -462,6 +462,8 @@ function App() {
   // mode: 'off' = silent · 'auto' = AI writes it · 'prompt' = AI writes it from your direction.
   const [scNarrationMode, setScNarrationMode] = useState("auto");
   const [scDialogVoice, setScDialogVoice] = useState("");      // character voice for spoken dialogue ("" = same as narrator)
+  const [scDialogPrompt, setScDialogPrompt] = useState("");    // optional user direction for the dialogue (empty = AI writes its own)
+  const [scDialoging, setScDialoging] = useState(false);       // dialogue generation in flight
   const [scNarrationPrompt, setScNarrationPrompt] = useState("");
   const [scNarrationText, setScNarrationText] = useState(""); // editable script — the user's words win
   const [scNarrating, setScNarrating] = useState(false);      // script generation in flight
@@ -743,7 +745,7 @@ function App() {
     try {
       const r = await fetch("/api/storyboard", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: scPrompt, totalSeconds: scTotalSec, clipSeconds: 5, size: scSize, narrate: narrating, language: narrating ? voiceLanguage(voice) : "English" })
+        body: JSON.stringify({ prompt: scPrompt, totalSeconds: scTotalSec, clipSeconds: 5, size: scSize, narrate: narrating, language: narrating ? voiceLanguage(voice) : "English", dialogDirection: narrating ? scDialogPrompt : "" })
       });
       const j = await jsonOrThrow(r);
       const story = j.story || {};
@@ -782,6 +784,32 @@ function App() {
       const clips = s.clips.map(c => c.index === idx ? { ...c, dialog: value } : c);
       return { ...s, clips };
     });
+  }
+
+  // Generate (or rewrite) the spoken dialogue for every clip from the current story +
+  // narration, in the chosen voice language. scDialogPrompt steers what's said; if it's
+  // empty the model writes natural in-character dialogue on its own. Kept in sync because
+  // it's fed each clip's action + narration.
+  async function genDialogue() {
+    if (!scStory || !Array.isArray(scStory.clips) || !scStory.clips.length) { toast("Generate a storyboard first.", true); return; }
+    setScDialoging(true);
+    try {
+      const r = await fetch("/api/dialogue", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          direction: scDialogPrompt,
+          language: scNarrationMode !== "off" ? voiceLanguage(voice) : "English",
+          clips: scStory.clips.map(c => ({ index: c.index, title: c.title || "", action: c.action || "", narration: c.narration || "" }))
+        })
+      });
+      const j = await jsonOrThrow(r);
+      const map = {}; (j.dialogs || []).forEach(d => { map[d.index] = d.dialog || ""; });
+      setScStory(s => s ? { ...s, clips: s.clips.map(c => (c.index in map ? { ...c, dialog: map[c.index] } : c)) } : s);
+      dbg("ok", `dialogue written for ${Object.keys(map).length} clips`);
+      toast("Dialogue written — edit any line, or tweak the direction and regenerate.");
+    } catch (e) {
+      toast("Dialogue failed: " + e.message.slice(0, 160), true);
+    } finally { setScDialoging(false); }
   }
 
   // Submit an I2V job, tolerating GPU cold-start (503 warming) and rate limits.
@@ -1283,6 +1311,20 @@ function App() {
                         </optgroup>
                       `)}
                     </select>
+                  </div>
+                  <div>
+                    <label>Dialogue direction <span class="muted small">· optional — what characters talk about / tone. Leave empty to auto-write in sync with the story.</span></label>
+                    <textarea rows="2" style=${{fontSize:13}} value=${scDialogPrompt}
+                      onInput=${e => setScDialogPrompt(e.target.value)}
+                      placeholder="e.g. Lena teases her friend for being late; keep it playful. Leave empty and dialogue is written automatically, in sync with the story + narration."></textarea>
+                    ${scStory && html`
+                      <div class="btn-row" style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",marginTop:6}}>
+                        <button class="ghost" onClick=${genDialogue} disabled=${scDialoging || running}>
+                          ${scDialoging ? "Writing dialogue…" : "✍️ Generate dialogue"}
+                        </button>
+                        <span class="muted small">rewrites every clip's dialogue from the story + narration</span>
+                      </div>
+                    `}
                   </div>
                   ${scStory && html`
                     <div class="btn-row" style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>

@@ -1258,10 +1258,15 @@ app.MapPost("/api/storyboard", async (StoryboardRequest req, IHttpClientFactory 
     var size = req.Size ?? "832x480";
     var language = string.IsNullOrWhiteSpace(req.Language) ? "English" : req.Language!.Trim();
     var narrate = req.Narrate ?? true;
+    var dialogDirection = (req.DialogDirection ?? "").Trim();
+    var dialogGuidance = string.IsNullOrWhiteSpace(dialogDirection)
+        ? "When someone would naturally speak in a clip, INVENT a short, natural, in-character dialog line that fits the action and the narration; leave dialog empty only when silence clearly fits."
+        : $@"DIALOGUE DIRECTION from the user — make the characters' spoken dialog follow this, while keeping each line in {language} and in sync with that clip's action and narration: ""{dialogDirection}"".";
     var narrationRule = narrate
         ? $@"AUDIO — VOICEOVER + DIALOGUE (written TOGETHER with the visuals so the audio and the picture stay in sync; BOTH fields are in {language}):
 - narration: a SHORT narrator voiceover line for EACH clip in {language}, present tense, matched to THAT clip's on-screen action. Consecutive clips' narration MUST read as ONE continuous script (no repeats, each line follows from the last).
 - dialog: the EXACT words a character actually SPEAKS on screen in THIS clip, in {language} — spoken words only, NO name prefix, NO quotation marks. If nobody speaks in a clip, set dialog to an empty string.
+- {dialogGuidance}
 - Keep narration and dialog each very SHORT; when a clip has BOTH, together they must be speakable within {clipSeconds} seconds (about {Math.Max(6, clipSeconds * 2)} words TOTAL across the two).
 - Keep title, style, action and motionPrompt in ENGLISH (the video model needs English). ONLY the narration and dialog fields are written in {language}."
         : @"AUDIO:
@@ -1453,6 +1458,95 @@ Cast the characters and locations this idea needs (support multiple characters),
     }
 
     return Results.Ok(new { story, clipSeconds, clipCount, totalSeconds, size });
+});
+
+// (Re)generate per-clip SPOKEN DIALOGUE for an existing storyboard, in sync with each clip's
+// action and narrator narration. Optional user `direction` steers what characters say; when it
+// is empty the model invents natural in-character dialogue on its own. All lines in `language`.
+app.MapPost("/api/dialogue", async (DialogueRequest req, IHttpClientFactory hf,
+    IConfiguration cfg, CancellationToken ct) =>
+{
+    var clips = (req?.Clips ?? Array.Empty<DialogueClip>()).Where(c => c is not null).ToArray();
+    if (clips.Length == 0)
+        return Results.BadRequest(new { error = "clips are required" });
+
+    var endpoint = Cfg(cfg, "AOAI_ENDPOINT").TrimEnd('/');
+    var key = Cfg(cfg, "AOAI_KEY");
+    var deployment = cfg["CHAT_DEPLOYMENT"] ?? "gpt-4o-mini";
+
+    var language = string.IsNullOrWhiteSpace(req?.Language) ? "English" : req!.Language!.Trim();
+    var direction = (req?.Direction ?? "").Trim();
+    var directionRule = string.IsNullOrWhiteSpace(direction)
+        ? "The user gave NO direction — invent natural, in-character spoken dialogue yourself from each clip's action and narration."
+        : $@"Follow this user direction for what the characters say (still keep every line in {language}): ""{direction}"".";
+
+    var sys = $@"You are a screenwriter writing the SPOKEN DIALOGUE for a short film, in sync with an existing storyboard and its narrator voiceover.
+Rules:
+- For EACH clip, write the EXACT words a character SPEAKS aloud on screen, in {language}. Spoken words only — NO character-name prefix, NO quotation marks, NO stage directions.
+- Keep each line SHORT (at most 12 words) so it is speakable within the clip and does not collide with that clip's narration.
+- The dialogue MUST fit that clip's action and sit naturally alongside the clip's narration; across clips it should read as ONE continuous, evolving exchange.
+- If a clip is clearly a silent moment, return an empty string for that clip's dialog.
+- {directionRule}
+Return ONE JSON object exactly: {{ ""dialogs"": [ {{ ""index"": <clip index>, ""dialog"": ""<{language} spoken line or empty>"" }} ] }} — one entry for EVERY clip index given, no markdown.";
+
+    var clipLines = string.Join("\n", clips.Select(c =>
+        $"- clip {c.Index}: action = {(c.Action ?? "").Trim()}; narration = {(c.Narration ?? "").Trim()}"));
+    var user = $@"Language for all dialogue: {language}
+Write the dialog for each clip index:
+{clipLines}
+
+Return the JSON now.";
+
+    var client = hf.CreateClient();
+    client.Timeout = TimeSpan.FromSeconds(60);
+    using var msg = new HttpRequestMessage(HttpMethod.Post,
+        $"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=2024-10-21");
+    msg.Headers.Add("api-key", key);
+    var payload = new
+    {
+        messages = new object[] {
+            new { role = "system", content = sys },
+            new { role = "user",   content = user }
+        },
+        max_completion_tokens = 2000,
+        response_format = new { type = "json_object" }
+    };
+    msg.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+    using var resp = await client.SendAsync(msg, ct);
+    var body = await resp.Content.ReadAsStringAsync(ct);
+    if (!resp.IsSuccessStatusCode)
+        return Results.Problem($"Dialogue failed ({(int)resp.StatusCode}): {body}");
+
+    string raw;
+    try
+    {
+        using var doc = JsonDocument.Parse(body);
+        raw = doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString()?.Trim() ?? "";
+    }
+    catch { raw = ""; }
+
+    var js = raw.IndexOf('{'); var je = raw.LastIndexOf('}');
+    if (js >= 0 && je > js) raw = raw.Substring(js, je - js + 1);
+
+    try
+    {
+        var node = System.Text.Json.Nodes.JsonNode.Parse(raw);
+        var arr = node?["dialogs"] as System.Text.Json.Nodes.JsonArray;
+        var outList = new List<object>();
+        if (arr is not null)
+            foreach (var d in arr)
+            {
+                if (d is null) continue;
+                int.TryParse(d["index"]?.ToString(), out var idx);
+                var line = d["dialog"]?.ToString() ?? "";
+                outList.Add(new { index = idx, dialog = line });
+            }
+        return Results.Ok(new { dialogs = outList });
+    }
+    catch
+    {
+        return Results.Problem("Dialogue model returned unparseable JSON.");
+    }
 });
 
 // Audio prompter: write a spoken voiceover script for a finished Story Chain
@@ -2229,10 +2323,12 @@ public record TailRequest(string VideoUrl, double? Seconds, string? Size);
 public record SliceRequest(string VideoUrl, double? StartSec, double? DurationSec, string? Size, bool? FromEnd);
 public record RemixRequest(string VideoId, string Prompt, int? Seconds, string? Size);
 public record ExtractFrameRequest(string VideoUrl, string? Size);
-public record StoryboardRequest(string Prompt, int? TotalSeconds, int? ClipSeconds, string? Size, string? Language, bool? Narrate);
+public record StoryboardRequest(string Prompt, int? TotalSeconds, int? ClipSeconds, string? Size, string? Language, bool? Narrate, string? DialogDirection);
 public record NarrationScriptRequest(string? Idea, string? Title, string? Logline, string[]? Actions, int? TotalSeconds, string? Prompt, string? Voice);
 public record MuxAudioRequest(string VideoUrl, string AudioUrl, string? Mode);
 public record ConcatAudioRequest(string[]? AudioUrls, int? GapMs);
+public record DialogueClip(int Index, string? Title, string? Action, string? Narration);
+public record DialogueRequest(string? Direction, string? Language, DialogueClip[]? Clips);
 
 // In-memory store for PromptCraft jobs. Single-instance F1 deployment, so a
 // process-local concurrent dictionary is the simplest viable storage. Jobs
