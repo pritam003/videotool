@@ -383,17 +383,18 @@ public sealed class StoryRenderWorker : BackgroundService
                         ? sw.Voice!
                         : (!string.IsNullOrWhiteSpace(spec.DialogVoice) ? spec.DialogVoice! : spec.NarratorVoice);
 
+                    var style = MoodToStyle(S(clip["mood"], ""));
                     var tracks = new List<string>();
                     if (dLine.Length > 0)
                     {
                         job.Label = $"{label}: dialogue";
-                        var dr = await PostJsonAsync("/api/narrate", new { text = dLine, voice = dVoice }, ct);
+                        var dr = await PostJsonAsync("/api/narrate", new { text = dLine, voice = dVoice, style }, ct);
                         tracks.Add(dr.GetProperty("url").GetString()!);
                     }
                     if (nLine.Length > 0)
                     {
                         job.Label = $"{label}: narrating";
-                        var nr = await PostJsonAsync("/api/narrate", new { text = nLine, voice = spec.NarratorVoice }, ct);
+                        var nr = await PostJsonAsync("/api/narrate", new { text = nLine, voice = spec.NarratorVoice, style }, ct);
                         tracks.Add(nr.GetProperty("url").GetString()!);
                     }
                     if (tracks.Count > 0)
@@ -405,8 +406,10 @@ public sealed class StoryRenderWorker : BackgroundService
                                 new { audioUrls = tracks.ToArray(), gapMs = 350 }, ct);
                             audioUrl = cr.GetProperty("url").GetString()!;
                         }
+                        // 'fit' holds the shot to the spoken line (lead-in + tail) instead of
+                        // truncating the audio at the fixed clip length — keeps audio in sync.
                         var mr = await PostJsonAsync("/api/mux-audio",
-                            new { videoUrl = clipUrl, audioUrl, mode = "replace" }, ct);
+                            new { videoUrl = clipUrl, audioUrl, mode = "fit" }, ct);
                         clipUrl = mr.GetProperty("url").GetString()!;
                     }
                 }
@@ -428,7 +431,7 @@ public sealed class StoryRenderWorker : BackgroundService
             try
             {
                 var r = await PostJsonAsync("/api/stitch",
-                    new { urls = finals.ToArray(), crossfade = cf }, ct);
+                    new { urls = finals.ToArray(), crossfade = cf, reencode = narrating }, ct);
                 job.ResultUrl = r.GetProperty("url").GetString();
             }
             catch (OperationCanceledException) { throw; }
@@ -445,6 +448,28 @@ public sealed class StoryRenderWorker : BackgroundService
     }
 
     // ---- prompt builders (ported 1:1 from the JS) -------------------------
+
+    // Map the storyboard's one-word clip mood onto an Azure TTS express-as style so the
+    // narrator/character is performed with feeling. Empty/unknown mood -> "" (neutral, the
+    // service ignores an empty style); styles a voice doesn't support fall back to neutral.
+    private static string MoodToStyle(string mood)
+    {
+        mood = (mood ?? "").Trim().ToLowerInvariant();
+        if (mood.Length == 0) return "";
+        bool Has(params string[] keys) => keys.Any(k => mood.Contains(k));
+        if (Has("sad", "grief", "sorrow", "mourn", "melanch", "lonel", "heartbreak", "loss", "tear")) return "sad";
+        if (Has("bittersweet", "wistful", "nostalg", "longing", "yearn", "tender", "gentle", "warm", "fond", "intimate", "soft")) return "gentle";
+        if (Has("hope", "uplift", "reassur", "optimis")) return "hopeful";
+        if (Has("joy", "happy", "delight", "cheer", "playful", "fun", "merry")) return "cheerful";
+        if (Has("excite", "thrill", "eager", "energetic")) return "excited";
+        if (Has("love", "affection", "romantic", "caring")) return "affectionate";
+        if (Has("calm", "peace", "serene", "soothing", "quiet", "still")) return "calm";
+        if (Has("whisper", "secret", "hush")) return "whispering";
+        if (Has("fear", "afraid", "scared", "anxious", "nervous", "tense", "dread", "worried")) return "fearful";
+        if (Has("angry", "furious", "rage", "frustrat")) return "angry";
+        if (Has("serious", "solemn", "grave", "stern", "somber", "sombre")) return "serious";
+        return "";
+    }
 
     private static string CastSnapshotPrompt(CastWork c, JsonNode story)
     {

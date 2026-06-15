@@ -613,7 +613,22 @@ app.MapPost("/api/stitch", async (StitchRequest req, IHttpClientFactory hf,
 
         var outPath = Path.Combine(work, "out.mp4");
         string args;
-        if (crossfade <= 0.0)
+        if (req.Reencode == true && crossfade <= 0.0)
+        {
+            // Robust concat for heterogeneous clips (narrated clips are re-encoded by the
+            // 'fit' mux to varying lengths). Re-encode through the concat filter so mismatched
+            // SPS/PPS/timebase can't corrupt the stream. Requires every input to carry audio.
+            var sb = new StringBuilder("-y ");
+            for (int i = 0; i < locals.Count; i++) sb.Append($"-i \"{locals[i]}\" ");
+            var fc = new StringBuilder();
+            for (int i = 0; i < locals.Count; i++) fc.Append($"[{i}:v][{i}:a]");
+            fc.Append($"concat=n={locals.Count}:v=1:a=1[v][a]");
+            sb.Append($"-filter_complex \"{fc}\" -map \"[v]\" -map \"[a]\" ");
+            sb.Append("-c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p -c:a aac -b:a 192k -movflags +faststart ");
+            sb.Append($"\"{outPath}\"");
+            args = sb.ToString();
+        }
+        else if (crossfade <= 0.0)
         {
             // Lossless concat-demuxer. All inputs must share codec/resolution/timebase
             // (true for clips from the same Sora deployment with the same size param).
@@ -706,7 +721,26 @@ app.MapPost("/api/mux-audio", async (MuxAudioRequest req, IHttpClientFactory hf,
 
         var outPath = Path.Combine(work, "out.mp4");
         var mode = (req.Mode ?? "replace").ToLowerInvariant();
-        string args = mode == "mix"
+        string args;
+        if (mode == "fit")
+        {
+            // Cinematic fit: hold the shot to the spoken line instead of truncating it.
+            // Brief lead-in before the voice, then a tail to breathe; extend the (silent)
+            // video by freezing its last frame so the whole line is heard, never clipped.
+            var ci = System.Globalization.CultureInfo.InvariantCulture;
+            var vDur = await ProbeDurationAsync(ffmpeg, vIn, ct);
+            var aDur = await ProbeDurationAsync(ffmpeg, aIn, ct);
+            const double leadIn = 0.4, tail = 0.7;
+            var target = Math.Max(vDur, leadIn + aDur + tail);
+            var ext = Math.Max(0.0, target - vDur);
+            var leadMs = (int)Math.Round(leadIn * 1000);
+            string F(double x) => x.ToString("0.###", ci);
+            args = $"-y -i \"{vIn}\" -i \"{aIn}\" -filter_complex "
+                 + $"\"[0:v]tpad=stop_mode=clone:stop_duration={F(ext)}[v];[1:a]adelay=delays={leadMs}:all=1,apad[a]\" "
+                 + $"-map \"[v]\" -map \"[a]\" -t {F(target)} -c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p "
+                 + $"-c:a aac -b:a 192k -movflags +faststart \"{outPath}\"";
+        }
+        else args = mode == "mix"
             ? $"-y -i \"{vIn}\" -i \"{aIn}\" -filter_complex \"[0:a][1:a]amix=inputs=2:duration=longest[a]\" -map 0:v -map \"[a]\" -c:v copy -c:a aac -b:a 192k -movflags +faststart \"{outPath}\""
             : $"-y -i \"{vIn}\" -i \"{aIn}\" -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 192k -shortest -movflags +faststart \"{outPath}\"";
 
@@ -1083,8 +1117,16 @@ app.MapPost("/api/narrate", async (NarrateRequest req, IHttpClientFactory hf,
         }
     }
 
-    var ssml = $@"<speak version='1.0' xml:lang='{lang}'>
-<voice name='{voice}'>{System.Security.SecurityElement.Escape(text)}</voice>
+    // Optional emotional delivery: wrap the line in <mstts:express-as style> (+ a gentle
+    // prosody rate). Azure ignores an unsupported style/voice gracefully (neutral fallback),
+    // so this is safe for non-English voices too.
+    var inner = System.Security.SecurityElement.Escape(text);
+    if (!string.IsNullOrWhiteSpace(req.Rate))
+        inner = $"<prosody rate='{System.Security.SecurityElement.Escape(req.Rate!)}'>{inner}</prosody>";
+    if (!string.IsNullOrWhiteSpace(req.Style))
+        inner = $"<mstts:express-as style='{System.Security.SecurityElement.Escape(req.Style!)}'>{inner}</mstts:express-as>";
+    var ssml = $@"<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xmlns:mstts='https://www.w3.org/2001/mstts' xml:lang='{lang}'>
+<voice name='{voice}'>{inner}</voice>
 </speak>";
 
     var client = hf.CreateClient();
@@ -1384,7 +1426,8 @@ DIALOGUE (words spoken on screen):
 - Across the clips the spoken lines read as ONE natural, evolving exchange with real emotion and specific, human detail — never generic pleasantries.
 - For every clip that HAS a dialog line, set `speaker` to the cast id (from `cast`) of the character who says it; use an empty string when dialog is empty.
 - {dialogGuidance}
-- Keep each line very SHORT; when a clip has BOTH narration and dialog, together they must be speakable within {clipSeconds} seconds (about {Math.Max(6, clipSeconds * 2)} words TOTAL).
+- Keep each line very SHORT — natural, unhurried speech, not crammed. HARD LIMIT: narration + dialog TOGETHER at most about {Math.Max(6, clipSeconds * 2)} words, so the line is spoken calmly within roughly {clipSeconds} seconds. Count the words; if over, cut ruthlessly. Fewer, well-chosen words feel more cinematic than a packed line.
+- EMOTION: give every clip a one-word `mood` that matches the beat (sad, hopeful, tender, lonely, warm, anxious, joyful, calm, bittersweet, serious, longing…); it drives how the voice is PERFORMED so the film feels acted and felt, not read out. Let the mood evolve across the clips with the story's arc.
 - Keep title, style, action and motionPrompt in ENGLISH (the video model needs English). ONLY the narration and dialog fields are written in {language}'s native script."
         : @"AUDIO:
 - Set every clip's narration AND dialog to an empty string. The user turned voiceover off.";
@@ -1435,6 +1478,7 @@ Return ONE JSON object, no markdown, exactly this shape:
       ""narration"": ""<{language} narrator voiceover line for this clip, present tense, short>"",
       ""dialog"": ""<{language} words a character speaks on screen in this clip — spoken words only, no name prefix; empty string if no one speaks>"",
       ""speaker"": ""<the cast id of the single character who speaks `dialog` in this clip; empty string when dialog is empty>"",
+      ""mood"": ""<ONE English word for this clip's emotional tone, used to colour the voice delivery: e.g. sad, hopeful, tender, lonely, warm, anxious, joyful, calm, bittersweet, serious, longing>"",
       ""endState"": ""<one sentence: what the last frame shows>""
     }}
   ]
@@ -1480,6 +1524,7 @@ Cast the characters and locations this idea needs (support multiple characters),
                     : i == clipCount ? "And so it ends." : "The moment builds.",
                 dialog = "",
                 speaker = "",
+                mood = i == 1 ? "calm" : i == clipCount ? "bittersweet" : "hopeful",
                 endState = i == clipCount
                     ? "Final frame settles into a composed ending shot."
                     : "Final frame lands in a stable pose that can continue."
@@ -2465,11 +2510,11 @@ static async Task SendPushAsync(PushSubscriptionStore subs, VapidConfig vapid, s
 
 app.Run();
 
-public record NarrateRequest(string Text, string? Voice);
+public record NarrateRequest(string Text, string? Voice, string? Style, string? Rate);
 public record TranslateRequest(string Text, string? To);
 public record EnhanceRequest(string Prompt, string? Narration, string? Voice, int? Seconds, string? Size);
 public record PromptCraftRequest(string UserAsk, int? TotalSeconds, string? Size, string? Narration, string? Voice, int? MaxIterations);
-public record StitchRequest(string[] Urls, double? Crossfade);
+public record StitchRequest(string[] Urls, double? Crossfade, bool? Reencode);
 public record IdentityRequest(string VideoUrl, string? OriginalAnchor);
 public record TailRequest(string VideoUrl, double? Seconds, string? Size);
 public record SliceRequest(string VideoUrl, double? StartSec, double? DurationSec, string? Size, bool? FromEnd);
