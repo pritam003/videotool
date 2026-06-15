@@ -1017,17 +1017,20 @@ function App() {
     let cont = "";
     if (prevClip) {
       const pa = (prevClip.action || "").trim();
-      const pn = narrating ? (prevClip.narration || "").trim() : "";
-      cont = `This clip continues STRICTLY from the previous shot — its first frame IS the previous shot's final frame, so keep the exact same character identities, faces, wardrobe, location, lighting and camera continuity. Previously: ${pa}${pn ? ` (voiceover then, audio only — never shown on screen: “${pn}”)` : ""}. Now the story moves forward: `;
+      cont = `This clip continues STRICTLY from the previous shot — its first frame IS the previous shot's final frame, so keep the exact same character identities, faces, wardrobe, location, lighting and camera continuity. Previously: ${pa}. Now the story moves forward: `;
     }
     const base = clip.motionPrompt || clip.action || scPrompt;
     const nLine = narrating ? (clip.narration || "").trim() : "";
     const dLine = narrating ? (clip.dialog || "").trim() : "";
-    const aud = [dLine && `a character speaks: “${dLine}”`, nLine && `voiceover: “${nLine}”`].filter(Boolean).join("; ");
-    const cur = aud
-      ? ` The on-screen action is timed to the audio (audio only — never shown as on-screen text): ${aud}.`
-      : "";
-    return `${idn}${where}${cont}${base}${cur}`.trim();
+    // Drive ACTING (visible speech + expression), NOT the foreign-language words themselves —
+    // the exact spoken words ride the TTS audio track, so we never risk on-screen text.
+    const acting = !narrating ? ""
+      : dLine
+        ? ` In this moment the character is speaking their line aloud — show natural, well-timed lip movement and a facial expression that matches the emotion. Never render captions, subtitles or any on-screen text.`
+        : nLine
+          ? ` Show the character's facial expression and emotion clearly. Never render captions, subtitles or any on-screen text.`
+          : "";
+    return `${idn}${where}${cont}${base}${acting}`.trim();
   }
 
   // Pick (single character) or compose (multiple characters) the canonical start

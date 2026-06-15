@@ -1260,15 +1260,15 @@ app.MapPost("/api/storyboard", async (StoryboardRequest req, IHttpClientFactory 
     var narrate = req.Narrate ?? true;
     var dialogDirection = (req.DialogDirection ?? "").Trim();
     var dialogGuidance = string.IsNullOrWhiteSpace(dialogDirection)
-        ? "When someone would naturally speak in a clip, INVENT a short, natural, in-character dialog line that fits the action and the narration; leave dialog empty only when silence clearly fits."
-        : $@"DIALOGUE DIRECTION from the user — make the characters' spoken dialog follow this, while keeping each line in {language} and in sync with that clip's action and narration: ""{dialogDirection}"".";
+        ? "No dialogue direction was given — INVENT natural, in-character dialog yourself: every clip where someone would plausibly speak gets a short spoken line that fits the action and narration; leave dialog empty only when silence clearly fits."
+        : $@"DIALOGUE DIRECTION from the user — this is the dramatic SPINE of the film: build the action, narration AND dialog across the clips to honor and pay it off, every spoken line in {language} and in sync with that clip's action and narration: ""{dialogDirection}"".";
     var narrationRule = narrate
-        ? $@"AUDIO — VOICEOVER + DIALOGUE (written TOGETHER with the visuals so the audio and the picture stay in sync; BOTH fields are in {language}):
-- narration: a SHORT narrator voiceover line for EACH clip in {language}, present tense, matched to THAT clip's on-screen action. Consecutive clips' narration MUST read as ONE continuous script (no repeats, each line follows from the last).
-- dialog: the EXACT words a character actually SPEAKS on screen in THIS clip, in {language} — spoken words only, NO name prefix, NO quotation marks. If nobody speaks in a clip, set dialog to an empty string.
+        ? $@"AUDIO — ONE FILM SCRIPT = NARRATION (voiceover) + DIALOGUE (spoken on screen), written TOGETHER with the visuals so audio and picture stay in sync. Write BOTH in {language} USING ITS NATIVE SCRIPT (for Hindi use Devanagari, for Bengali use Bengali script, etc.) — NEVER romanized/transliterated, never English; only real proper names may stay as-is:
+- narration: a SHORT narrator voiceover line for EACH clip in {language}, present tense, matched to THAT clip's on-screen action. Read end to end, the clips' narration MUST form ONE continuous, COMPLETE voiceover script that covers the WHOLE story — no repeats, each line follows from the last.
+- dialog: the EXACT words a character SPEAKS on screen in THIS clip, in {language} — spoken words only, NO name prefix, NO quotation marks. Across the clips the dialog must read as ONE natural, evolving conversation with real emotion that, together with the narration, tells the complete film. If nobody speaks in a clip, set dialog to an empty string.
 - {dialogGuidance}
 - Keep narration and dialog each very SHORT; when a clip has BOTH, together they must be speakable within {clipSeconds} seconds (about {Math.Max(6, clipSeconds * 2)} words TOTAL across the two).
-- Keep title, style, action and motionPrompt in ENGLISH (the video model needs English). ONLY the narration and dialog fields are written in {language}."
+- Keep title, style, action and motionPrompt in ENGLISH (the video model needs English). ONLY the narration and dialog fields are written in {language}'s native script."
         : @"AUDIO:
 - Set every clip's narration AND dialog to an empty string. The user turned voiceover off.";
 
@@ -1287,6 +1287,7 @@ CASTING RULES:
 STORY RULES:
 - Spread the idea across all {clipCount} clips as ONE evolving story: clip 1 establishes; middle clips develop/rise; the final clip resolves. NEVER repeat an action — each clip MOVES THE STORY FORWARD.
 - Exactly ONE clear, physically plausible action per clip (real gravity, weight, momentum, balance, natural human motion and timing). Do not cram multiple simultaneous actions into {clipSeconds} seconds.
+- ACTING & EXPRESSION: direct it like a real film. In every clip the present character(s) show readable facial expression and emotion that fits the beat; when a character has a dialog line, they are visibly SPEAKING with natural lip movement and matching expression and gesture. Bake this acting direction (plus the physics above) INTO each clip's motionPrompt.
 - Photorealistic. No on-screen text, captions, logos, or watermarks. One consistent visual style/lens/lighting (state once in `style`).
 
 {narrationRule}
@@ -1313,7 +1314,7 @@ Return ONE JSON object, no markdown, exactly this shape:
       ""location"": ""place1"",
       ""action"": ""<one sentence: the single physical action in THIS clip>"",
       ""camera"": ""<one short phrase: camera move, e.g. 'slow push-in'>"",
-      ""motionPrompt"": ""<40-90 words. Name the present character(s) and briefly restate their locked look, place them in the named location, then describe the SINGLE physical action + camera move over {clipSeconds} seconds with realistic physics and timing. End with 'No on-screen text, captions, or watermarks.'>"",
+      ""motionPrompt"": ""<40-110 words, ENGLISH. Name the present character(s) and briefly restate their locked look, place them in the named location, then describe the SINGLE physical action + camera move over {clipSeconds} seconds with realistic physics and natural human timing. ALWAYS state the character's facial expression/emotion; if this clip has a dialog line, say the character is speaking with natural lip movement and matching expression (do NOT write the spoken words). End with 'No on-screen text, captions, or watermarks.'>"",
       ""narration"": ""<{language} narrator voiceover line for this clip, present tense, short>"",
       ""dialog"": ""<{language} words a character speaks on screen in this clip — spoken words only, no name prefix; empty string if no one speaks>"",
       ""endState"": ""<one sentence: what the last frame shows>""
@@ -1323,9 +1324,12 @@ Return ONE JSON object, no markdown, exactly this shape:
 
 Output JSON only. Define every character in `cast` and every place in `locations`. Exactly {clipCount} clips, each listing its characters + location.";
 
-    var user = $@"User film idea: {req.Prompt}
+    var creativeLine = (narrate && !string.IsNullOrWhiteSpace(dialogDirection))
+        ? $"\n\nDialogue / creative direction to build the WHOLE film around: \"{dialogDirection}\" — write every spoken dialog line and the narration in {language}'s native script."
+        : "";
+    var user = $@"User film idea: {req.Prompt}{creativeLine}
 
-Cast the characters and locations this idea needs (support multiple characters), then produce the {clipCount}-clip storyboard ({clipSeconds}s per clip, {clipCount * clipSeconds}s total, aspect {size}) as ONE continuous story — a single physically-plausible action per clip, each clip listing which cast members and location appear{(narrate ? $", plus a short {language} narrator NARRATION line and (when a character speaks) a {language} DIALOG line per clip, both written in sync with that clip's action" : ", with narration and dialog left empty")}. Output JSON only.";
+Cast the characters and locations this idea needs (support multiple characters), then produce the {clipCount}-clip storyboard ({clipSeconds}s per clip, {clipCount * clipSeconds}s total, aspect {size}) as ONE continuous, cinematic story — a single physically-plausible action per clip performed with readable facial expression and natural acting, each clip listing which cast members and location appear{(narrate ? $", plus a short {language} narrator NARRATION line and (when a character speaks) a {language} DIALOG line per clip — all in {language}'s native script, in sync with that clip's action" : ", with narration and dialog left empty")}. Output JSON only.";
 
     var client = hf.CreateClient();
     client.Timeout = TimeSpan.FromSeconds(90);
@@ -1478,13 +1482,13 @@ app.MapPost("/api/dialogue", async (DialogueRequest req, IHttpClientFactory hf,
     var direction = (req?.Direction ?? "").Trim();
     var directionRule = string.IsNullOrWhiteSpace(direction)
         ? "The user gave NO direction — invent natural, in-character spoken dialogue yourself from each clip's action and narration."
-        : $@"Follow this user direction for what the characters say (still keep every line in {language}): ""{direction}"".";
+        : $@"The user's dialogue direction is the dramatic SPINE — build the spoken lines across the clips to honor and pay it off, with real emotion (every line still in {language}): ""{direction}"".";
 
     var sys = $@"You are a screenwriter writing the SPOKEN DIALOGUE for a short film, in sync with an existing storyboard and its narrator voiceover.
 Rules:
-- For EACH clip, write the EXACT words a character SPEAKS aloud on screen, in {language}. Spoken words only — NO character-name prefix, NO quotation marks, NO stage directions.
+- For EACH clip, write the EXACT words a character SPEAKS aloud on screen, in {language} USING ITS NATIVE SCRIPT (for Hindi use Devanagari, for Bengali use Bengali script, etc.) — NEVER romanized/transliterated, never English; only real proper names may stay as-is. Spoken words only — NO character-name prefix, NO quotation marks, NO stage directions.
 - Keep each line SHORT (at most 12 words) so it is speakable within the clip and does not collide with that clip's narration.
-- The dialogue MUST fit that clip's action and sit naturally alongside the clip's narration; across clips it should read as ONE continuous, evolving exchange.
+- The dialogue MUST fit that clip's action and sit naturally alongside the clip's narration; across ALL clips it must read as ONE continuous, evolving conversation with real emotion that tells the complete film.
 - If a clip is clearly a silent moment, return an empty string for that clip's dialog.
 - {directionRule}
 Return ONE JSON object exactly: {{ ""dialogs"": [ {{ ""index"": <clip index>, ""dialog"": ""<{language} spoken line or empty>"" }} ] }} — one entry for EVERY clip index given, no markdown.";
