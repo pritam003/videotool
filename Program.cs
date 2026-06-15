@@ -1514,7 +1514,7 @@ Plan the {segmentCount}-segment arc as JSON now.";
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Generate Story Idea: AI-powered story suggestion from user input
+// Generate Story & Dialog Idea: AI-powered story and dialog suggestions
 // ─────────────────────────────────────────────────────────────────────────────
 app.MapPost("/api/generate-story-idea", async (
     [FromBody] JsonElement req,
@@ -1530,22 +1530,34 @@ app.MapPost("/api/generate-story-idea", async (
     var key = Cfg(cfg, "AOAI_KEY");
     var deployment = cfg["CHAT_DEPLOYMENT"] ?? "gpt-4o-mini";
 
-    var systemPrompt = @"You are a creative film director and storyteller. The user will give you a brief story idea or concept. 
-Your job is to expand it into a compelling, detailed story premise suitable for a short film (30-60 seconds).
+    var systemPrompt = @"You are a creative film director, screenwriter, and storyteller. Generate both a compelling story premise and sample dialogue for a short film concept.
 
-Return a SINGLE paragraph (3-4 sentences) that:
-1. Expands the user's idea with vivid, cinematic details
-2. Establishes the main characters, setting, and central conflict/emotion
-3. Hints at the story arc (beginning, tension, resolution)
-4. Is written in an inspiring, visual style that feels like a film treatment
+When given a story idea, provide:
 
-Keep it concise and filmable — suitable for a short video.";
+1. STORY: A vivid single paragraph (3-4 sentences) film treatment that:
+   - Expands the user's idea with cinematic details
+   - Establishes characters, setting, and central conflict/emotion
+   - Hints at the story arc (beginning, tension, resolution)
 
-    var userPrompt = $@"Expand this story idea into a compelling short film premise:
+2. DIALOGUE: 2-3 sample dialogue exchanges (4-6 lines total) that:
+   - Feel natural and authentic to the characters/setting
+   - Hint at the story's central conflict or emotion
+   - Show character personality and relationships
+   - Are suitable for a 30-60 second short film
+
+Format your response EXACTLY as:
+[STORY]
+{story content here}
+[/STORY]
+[DIALOGUE]
+{dialogue content here}
+[/DIALOGUE]";
+
+    var userPrompt = $@"Create a story and dialogue for this film concept:
 
 ""{userInput}""
 
-Write it as a vivid, single paragraph film treatment.";
+Remember to use the [STORY] [/STORY] and [DIALOGUE] [/DIALOGUE] delimiters.";
 
     try
     {
@@ -1558,7 +1570,7 @@ Write it as a vivid, single paragraph film treatment.";
                 new { role = "user", content = userPrompt }
             },
             temperature = 0.8m,
-            max_completion_tokens = 250,
+            max_completion_tokens = 400,
             top_p = 0.9m
         };
 
@@ -1571,20 +1583,27 @@ Write it as a vivid, single paragraph film treatment.";
         
         if (!resp.IsSuccessStatusCode)
         {
-            return Results.Ok(new { suggestion = userInput }); // graceful fallback
+            return Results.Ok(new { suggestion = userInput, story = userInput, dialogue = "" }); // graceful fallback
         }
 
         using var doc = JsonDocument.Parse(body);
-        var suggestion = (doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString() ?? "").Trim();
+        var fullResponse = (doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString() ?? "").Trim();
 
-        if (string.IsNullOrWhiteSpace(suggestion))
-            suggestion = userInput; // fallback
+        // Parse story and dialogue from delimiters
+        var storyMatch = System.Text.RegularExpressions.Regex.Match(fullResponse, @"\[STORY\](.*?)\[/STORY\]", System.Text.RegularExpressions.RegexOptions.Singleline);
+        var dialogueMatch = System.Text.RegularExpressions.Regex.Match(fullResponse, @"\[DIALOGUE\](.*?)\[/DIALOGUE\]", System.Text.RegularExpressions.RegexOptions.Singleline);
 
-        return Results.Ok(new { suggestion });
+        var story = storyMatch.Success ? storyMatch.Groups[1].Value.Trim() : userInput;
+        var dialogue = dialogueMatch.Success ? dialogueMatch.Groups[1].Value.Trim() : "";
+
+        if (string.IsNullOrWhiteSpace(story))
+            story = userInput;
+
+        return Results.Ok(new { suggestion = story, story, dialogue });
     }
     catch (Exception ex)
     {
-        return Results.Ok(new { suggestion = userInput }); // graceful fallback
+        return Results.Ok(new { suggestion = userInput, story = userInput, dialogue = "" }); // graceful fallback
     }
 });
 

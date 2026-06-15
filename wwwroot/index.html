@@ -644,6 +644,7 @@ function App() {
   const [chatMessages, setChatMessages] = useState([{ role: "assistant", text: "💬 Hi! Describe your story idea, and I'll help you write a compelling narrative and dialogues. Examples: 'A lonely robot finds friendship', 'Two rivals discover a secret', 'A chef's worst day turns magical'." }]);
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
+  const [lastStoryDialogData, setLastStoryDialogData] = useState(null); // store story + dialogue for "Apply" button
 
   async function sendChatMessage() {
     if (!chatInput.trim() || chatLoading) return;
@@ -657,19 +658,31 @@ function App() {
         body: JSON.stringify({ userInput: userMsg })
       });
       const j = await jsonOrThrow(r);
-      const suggestion = j.suggestion || "";
-      setChatMessages(prev => [...prev, { role: "assistant", text: suggestion }]);
-      dbg("ok", "story suggestion generated");
+      const story = j.story || j.suggestion || "";
+      const dialogue = j.dialogue || "";
+      
+      // Format message: show story + dialogue
+      let assistantMsg = "";
+      if (story) assistantMsg += `📖 Story:\n${story}`;
+      if (dialogue) assistantMsg += `\n\n💬 Dialogue:\n${dialogue}`;
+      if (!assistantMsg) assistantMsg = "No suggestion generated. Try a different prompt.";
+      
+      setChatMessages(prev => [...prev, { role: "assistant", text: assistantMsg }]);
+      setLastStoryDialogData({ story, dialogue });
+      dbg("ok", "story & dialogue generated");
     } catch (e) {
       setChatMessages(prev => [...prev, { role: "assistant", text: `❌ Error: ${e.message.slice(0, 100)}` }]);
     } finally { setChatLoading(false); }
   }
 
-  function applyStoryToForm(suggestion) {
-    if (suggestion.trim()) {
-      setScPrompt(suggestion);
+  function applyStoryToForm(story, dialogue) {
+    if (story && story.trim()) {
+      setScPrompt(story.trim());
+      if (dialogue && dialogue.trim()) {
+        setScDialogPrompt(dialogue.trim());
+      }
       setWizStep(1);
-      toast("Story idea applied! Review in step ① and continue.");
+      toast("Story & dialogue applied! Review in step ① and continue.");
     }
   }
 
@@ -1711,8 +1724,8 @@ function App() {
               <button class="primary small" onClick=${sendChatMessage} disabled=${!chatInput.trim()||chatLoading}>
                 ${chatLoading?"Generating...":"Get Story Idea"}
               </button>
-              ${chatMessages.length > 1 && html`
-                <button class="ghost small" onClick=${() => { const lastAssistant = [...chatMessages].reverse().find(m => m.role === "assistant"); if (lastAssistant) applyStoryToForm(lastAssistant.text.replace(/^[✨❌]/,"").trim()); }} title="Apply last suggestion">Apply Story</button>
+              ${lastStoryDialogData && html`
+                <button class="ghost small" onClick=${() => applyStoryToForm(lastStoryDialogData.story, lastStoryDialogData.dialogue)} title="Apply story & dialogue to form">Apply Story & Dialogue</button>
               `}
             </div>
           </div>
