@@ -621,6 +621,68 @@ app.MapPost("/api/mux-audio", async (MuxAudioRequest req, IHttpClientFactory hf,
     }
 });
 
+// Concatenate several narration/dialogue MP3s into ONE audio track (dialogue first, then
+// narration) with a short gap between segments, so a single clip can carry BOTH a spoken
+// dialogue line and a narrator voiceover. Returns a WAV url (pcm — always encodable by the
+// bundled static ffmpeg); /api/mux-audio re-encodes it to AAC when laying it over the video.
+app.MapPost("/api/concat-audio", async (ConcatAudioRequest req, IHttpClientFactory hf,
+    IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
+{
+    var urls = (req?.AudioUrls ?? Array.Empty<string>())
+        .Where(u => !string.IsNullOrWhiteSpace(u)).ToArray();
+    if (urls.Length == 0)
+        return Results.BadRequest(new { error = "audioUrls is required" });
+    if (urls.Length == 1)
+        return Results.Ok(new { url = urls[0], single = true });
+
+    var ffmpeg = LocateFfmpeg();
+    if (ffmpeg is null)
+        return Results.Problem("ffmpeg binary not found. Expected at ./bin/ffmpeg (bundled by CI).");
+
+    var gap = Math.Clamp(req?.GapMs ?? 300, 0, 2000) / 1000.0;
+    var gapStr = gap.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
+
+    var work = Path.Combine(Path.GetTempPath(), $"concat-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(work);
+    try
+    {
+        var http = hf.CreateClient();
+        http.Timeout = TimeSpan.FromMinutes(2);
+        var inputs = new StringBuilder();
+        var filter = new StringBuilder();
+        for (int i = 0; i < urls.Length; i++)
+        {
+            var f = Path.Combine(work, $"in{i}.mp3");
+            using (var s = await http.GetStreamAsync(urls[i], ct))
+            await using (var fs = File.Create(f)) await s.CopyToAsync(fs, ct);
+            inputs.Append($"-i \"{f}\" ");
+            var pad = i < urls.Length - 1 ? $",apad=pad_dur={gapStr}" : "";
+            filter.Append($"[{i}:a]aresample=24000,aformat=sample_fmts=s16:channel_layouts=mono{pad}[a{i}];");
+        }
+        for (int i = 0; i < urls.Length; i++) filter.Append($"[a{i}]");
+        filter.Append($"concat=n={urls.Length}:v=0:a=1[a]");
+
+        var outPath = Path.Combine(work, "out.wav");
+        var args = $"-y {inputs}-filter_complex \"{filter}\" -map \"[a]\" -c:a pcm_s16le \"{outPath}\"";
+        var (ec, stderr) = await RunProcessAsync(ffmpeg, args, ct);
+        if (ec != 0 || !File.Exists(outPath))
+            return Results.Problem($"ffmpeg concat failed (exit {ec}): {stderr.Substring(0, Math.Min(stderr.Length, 1500))}");
+
+        var wav = await File.ReadAllBytesAsync(outPath, ct);
+        var account = Cfg(cfg, "STORAGE_ACCOUNT");
+        var svc = new BlobServiceClient(new Uri($"https://{account}.blob.core.windows.net"), cred);
+        var container = svc.GetBlobContainerClient(cfg["STORAGE_CONTAINER"] ?? "videos");
+        var name = $"narration/{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}.wav";
+        using var ms = new MemoryStream(wav);
+        var url = await UploadAndSign(container, name, ms, "audio/wav", svc, account, ct);
+        return Results.Ok(new { url, blob = name, bytes = wav.Length });
+    }
+    finally
+    {
+        try { Directory.Delete(work, recursive: true); } catch { }
+    }
+});
+
 static string? LocateFfmpeg()
 {
     // 1. Bundled ./bin/ffmpeg next to the app DLL.
@@ -1197,12 +1259,13 @@ app.MapPost("/api/storyboard", async (StoryboardRequest req, IHttpClientFactory 
     var language = string.IsNullOrWhiteSpace(req.Language) ? "English" : req.Language!.Trim();
     var narrate = req.Narrate ?? true;
     var narrationRule = narrate
-        ? $@"NARRATION (voiceover — written TOGETHER with the visuals so audio and video stay in sync):
-- Write a SHORT spoken voiceover line for EACH clip in {language} — the EXACT words spoken aloud during that clip. At most {Math.Max(6, clipSeconds * 2)} words so it fits within {clipSeconds} seconds when spoken. Present tense, plain spoken language, no stage directions.
-- Each clip's narration MUST match THAT clip's on-screen action so the voiceover lands in sync with the picture, and the narration of consecutive clips MUST read as ONE continuous script (no repeats, each line follows from the last).
-- Keep title, style, action and motionPrompt in ENGLISH (the video model needs English). ONLY the narration field is written in {language}."
-        : @"NARRATION:
-- Set every clip's narration to an empty string. The user turned voiceover off.";
+        ? $@"AUDIO — VOICEOVER + DIALOGUE (written TOGETHER with the visuals so the audio and the picture stay in sync; BOTH fields are in {language}):
+- narration: a SHORT narrator voiceover line for EACH clip in {language}, present tense, matched to THAT clip's on-screen action. Consecutive clips' narration MUST read as ONE continuous script (no repeats, each line follows from the last).
+- dialog: the EXACT words a character actually SPEAKS on screen in THIS clip, in {language} — spoken words only, NO name prefix, NO quotation marks. If nobody speaks in a clip, set dialog to an empty string.
+- Keep narration and dialog each very SHORT; when a clip has BOTH, together they must be speakable within {clipSeconds} seconds (about {Math.Max(6, clipSeconds * 2)} words TOTAL across the two).
+- Keep title, style, action and motionPrompt in ENGLISH (the video model needs English). ONLY the narration and dialog fields are written in {language}."
+        : @"AUDIO:
+- Set every clip's narration AND dialog to an empty string. The user turned voiceover off.";
 
     var sys = $@"You are a film director and casting director planning a SINGLE continuous short film produced as a CHAIN of {clipCount} image-to-video clips, each {clipSeconds} seconds long, played back-to-back into one ~{clipCount * clipSeconds}-second film.
 
@@ -1246,7 +1309,8 @@ Return ONE JSON object, no markdown, exactly this shape:
       ""action"": ""<one sentence: the single physical action in THIS clip>"",
       ""camera"": ""<one short phrase: camera move, e.g. 'slow push-in'>"",
       ""motionPrompt"": ""<40-90 words. Name the present character(s) and briefly restate their locked look, place them in the named location, then describe the SINGLE physical action + camera move over {clipSeconds} seconds with realistic physics and timing. End with 'No on-screen text, captions, or watermarks.'>"",
-      ""narration"": ""<short spoken line for this clip, present tense, at most {Math.Max(6, clipSeconds * 2)} words>"",
+      ""narration"": ""<{language} narrator voiceover line for this clip, present tense, short>"",
+      ""dialog"": ""<{language} words a character speaks on screen in this clip — spoken words only, no name prefix; empty string if no one speaks>"",
       ""endState"": ""<one sentence: what the last frame shows>""
     }}
   ]
@@ -1256,7 +1320,7 @@ Output JSON only. Define every character in `cast` and every place in `locations
 
     var user = $@"User film idea: {req.Prompt}
 
-Cast the characters and locations this idea needs (support multiple characters), then produce the {clipCount}-clip storyboard ({clipSeconds}s per clip, {clipCount * clipSeconds}s total, aspect {size}) as ONE continuous story — a single physically-plausible action per clip, each clip listing which cast members and location appear{(narrate ? $", plus a short {language} narration line per clip written in sync with that clip's action" : ", with narration left empty")}. Output JSON only.";
+Cast the characters and locations this idea needs (support multiple characters), then produce the {clipCount}-clip storyboard ({clipSeconds}s per clip, {clipCount * clipSeconds}s total, aspect {size}) as ONE continuous story — a single physically-plausible action per clip, each clip listing which cast members and location appear{(narrate ? $", plus a short {language} narrator NARRATION line and (when a character speaks) a {language} DIALOG line per clip, both written in sync with that clip's action" : ", with narration and dialog left empty")}. Output JSON only.";
 
     var client = hf.CreateClient();
     client.Timeout = TimeSpan.FromSeconds(90);
@@ -1304,6 +1368,7 @@ Cast the characters and locations this idea needs (support multiple characters),
                 narration = i == 1
                     ? "Our story begins."
                     : i == clipCount ? "And so it ends." : "The moment builds.",
+                dialog = "",
                 endState = i == clipCount
                     ? "Final frame settles into a composed ending shot."
                     : "Final frame lands in a stable pose that can continue."
@@ -1369,12 +1434,22 @@ Cast the characters and locations this idea needs (support multiple characters),
     if (jsonStart >= 0 && jsonEnd > jsonStart)
         raw = raw.Substring(jsonStart, jsonEnd - jsonStart + 1);
 
-    object? story;
-    try { story = JsonSerializer.Deserialize<object>(raw); }
+    System.Text.Json.Nodes.JsonNode? story;
+    try { story = System.Text.Json.Nodes.JsonNode.Parse(raw); }
     catch
     {
         var fallback = BuildFallbackStoryboard();
         return Results.Ok(new { story = fallback, clipSeconds, clipCount, totalSeconds, size, fallback = true });
+    }
+
+    // The per-clip duration is a PRODUCTION constant (Wan renders 1-5s clips), NOT the
+    // model's choice. Force clipSeconds to the server-clamped value so e.g. a 45s film
+    // never comes back as 2s clips, and keep clipCount in sync with the real clips array.
+    if (story is System.Text.Json.Nodes.JsonObject sobj)
+    {
+        sobj["clipSeconds"] = clipSeconds;
+        sobj["clipCount"] = (sobj["clips"] is System.Text.Json.Nodes.JsonArray sarr && sarr.Count > 0)
+            ? sarr.Count : clipCount;
     }
 
     return Results.Ok(new { story, clipSeconds, clipCount, totalSeconds, size });
@@ -2157,6 +2232,7 @@ public record ExtractFrameRequest(string VideoUrl, string? Size);
 public record StoryboardRequest(string Prompt, int? TotalSeconds, int? ClipSeconds, string? Size, string? Language, bool? Narrate);
 public record NarrationScriptRequest(string? Idea, string? Title, string? Logline, string[]? Actions, int? TotalSeconds, string? Prompt, string? Voice);
 public record MuxAudioRequest(string VideoUrl, string AudioUrl, string? Mode);
+public record ConcatAudioRequest(string[]? AudioUrls, int? GapMs);
 
 // In-memory store for PromptCraft jobs. Single-instance F1 deployment, so a
 // process-local concurrent dictionary is the simplest viable storage. Jobs

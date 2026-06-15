@@ -454,13 +454,14 @@ function App() {
   const [scCast, setScCast] = useState([]);              // casting sheet [{id,name,description,refName,previewUrl,status}]
   const [scCasting, setScCasting] = useState(false);     // generating canonical reference snapshots
   const scSize = scAspect === "vertical" ? "480x832" : "832x480";
-  const scClipSec = scStory?.clipSeconds || 5;
+  const scClipSec = Math.min(5, Math.max(3, Number(scStory?.clipSeconds) || 5));
   const scClipCount = scStory?.clips?.length || Math.ceil(scTotalSec / 5);
   const scCastReady = Array.isArray(scCast) && scCast.length > 0 && scCast.every(c => c.refName);
 
   // Narration (audio) laid over the finished film.
   // mode: 'off' = silent · 'auto' = AI writes it · 'prompt' = AI writes it from your direction.
   const [scNarrationMode, setScNarrationMode] = useState("auto");
+  const [scDialogVoice, setScDialogVoice] = useState("");      // character voice for spoken dialogue ("" = same as narrator)
   const [scNarrationPrompt, setScNarrationPrompt] = useState("");
   const [scNarrationText, setScNarrationText] = useState(""); // editable script — the user's words win
   const [scNarrating, setScNarrating] = useState(false);      // script generation in flight
@@ -774,6 +775,15 @@ function App() {
     });
   }
 
+  // Edit a single clip's on-screen dialogue line inline (the character's spoken words).
+  function editClipDialog(idx, value) {
+    setScStory(s => {
+      if (!s) return s;
+      const clips = s.clips.map(c => c.index === idx ? { ...c, dialog: value } : c);
+      return { ...s, clips };
+    });
+  }
+
   // Submit an I2V job, tolerating GPU cold-start (503 warming) and rate limits.
   async function submitI2V(startImage, thePrompt, clipSec, label) {
     for (let attempt = 0; attempt < 40; attempt++) {
@@ -983,8 +993,11 @@ function App() {
       cont = `This clip continues STRICTLY from the previous shot — its first frame IS the previous shot's final frame, so keep the exact same character identities, faces, wardrobe, location, lighting and camera continuity. Previously: ${pa}${pn ? ` (voiceover then, audio only — never shown on screen: “${pn}”)` : ""}. Now the story moves forward: `;
     }
     const base = clip.motionPrompt || clip.action || scPrompt;
-    const cur = (narrating && (clip.narration || "").trim())
-      ? ` The visible action is timed to this clip's voiceover (audio only — never shown on screen): “${clip.narration.trim()}”.`
+    const nLine = narrating ? (clip.narration || "").trim() : "";
+    const dLine = narrating ? (clip.dialog || "").trim() : "";
+    const aud = [dLine && `a character speaks: “${dLine}”`, nLine && `voiceover: “${nLine}”`].filter(Boolean).join("; ");
+    const cur = aud
+      ? ` The on-screen action is timed to the audio (audio only — never shown as on-screen text): ${aud}.`
       : "";
     return `${idn}${where}${cont}${base}${cur}`.trim();
   }
@@ -1025,7 +1038,7 @@ function App() {
     setRunning(true); setOuts([]); setStitched(null);
     const clips = scStory.clips;
     const N = clips.length;
-    const clipSec = scStory.clipSeconds || 5;
+    const clipSec = Math.min(5, Math.max(3, Number(scStory.clipSeconds) || 5));
     const castMap = {}; (scCast || []).forEach(c => castMap[c.id] = c);
     const narrating = scNarrationMode !== "off";
     setScProgress(clips.map(c => ({ index: c.index, title: c.title || `clip ${c.index}`, status: "pending", clipUrl: null, startUrl: null })));
@@ -1092,27 +1105,49 @@ function App() {
           }
         }
 
-        // Per-clip narration → mux onto THIS clip so audio is aligned to its action.
+        // Per-clip audio: speak the DIALOGUE (character voice) and the NARRATION (narrator
+        // voice), concatenate dialogue→narration into one track, and mux it onto THIS clip so
+        // the audio lands in sync with its action. Either line may be empty.
         if (narrating && !cancelRef.current) {
-          const line = (clip.narration || "").trim();
-          if (line) {
-            try {
-              setStatus(s => ({ ...s, label: `${label}: narrating` }));
-              const tr = await fetch("/api/narrate", {
+          const nLine = (clip.narration || "").trim();
+          const dLine = (clip.dialog || "").trim();
+          const dVoice = scDialogVoice || voice;
+          try {
+            const tracks = [];
+            if (dLine) {
+              setStatus(s => ({ ...s, label: `${label}: dialogue` }));
+              const dr = await fetch("/api/narrate", {
                 method: "POST", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ text: line, voice })
+                body: JSON.stringify({ text: dLine, voice: dVoice })
               });
-              const tj = await jsonOrThrow(tr);
+              tracks.push((await jsonOrThrow(dr)).url);
+            }
+            if (nLine) {
+              setStatus(s => ({ ...s, label: `${label}: narrating` }));
+              const nr = await fetch("/api/narrate", {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ text: nLine, voice })
+              });
+              tracks.push((await jsonOrThrow(nr)).url);
+            }
+            if (tracks.length) {
+              let audioUrl = tracks[0];
+              if (tracks.length > 1) {
+                const cr = await fetch("/api/concat-audio", {
+                  method: "POST", headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ audioUrls: tracks, gapMs: 350 })
+                });
+                audioUrl = (await jsonOrThrow(cr)).url;
+              }
               const mr = await fetch("/api/mux-audio", {
                 method: "POST", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ videoUrl: clipUrl, audioUrl: tj.url, mode: "replace" })
+                body: JSON.stringify({ videoUrl: clipUrl, audioUrl, mode: "replace" })
               });
-              const mj = await jsonOrThrow(mr);
-              clipUrl = mj.url;
-              dbg("ok", `${label} narrated`);
-            } catch (e) {
-              dbg("warn", `${label} narration failed (${e.message}); clip kept silent`);
+              clipUrl = (await jsonOrThrow(mr)).url;
+              dbg("ok", `${label} voiced (${[dLine && "dialogue", nLine && "narration"].filter(Boolean).join(" + ")})`);
             }
+          } catch (e) {
+            dbg("warn", `${label} audio failed (${e.message}); clip kept silent`);
           }
         }
 
@@ -1216,7 +1251,7 @@ function App() {
             <!-- STEP 2: AI voiceover — chosen BEFORE writing the story so the script and
                  narration are generated together, in one language, in sync. -->
             <div>
-              <label>② AI voiceover <span class="muted small">(script + narration written together, same language, in sync)</span></label>
+              <label>② AI voiceover <span class="muted small">(narration + dialogue written together, same language, in sync)</span></label>
               <div class="seg" style=${{display:"flex",gap:6,flexWrap:"wrap",margin:"4px 0 8px"}}>
                 ${[["off","🔇 No voiceover"],["auto","🎙️ AI voiceover"]].map(([v,lbl]) => html`
                   <button key=${v} type="button" onClick=${() => setScNarrationMode(v)}
@@ -1234,6 +1269,17 @@ function App() {
                       ${Object.entries(voiceGroups).map(([g, list]) => list.length > 0 && html`
                         <optgroup label=${g} key=${g}>
                           ${list.map(v => html`<option value=${v.shortName} key=${v.shortName}>${v.localName || v.shortName} (${v.gender || "?"})</option>`)}
+                        </optgroup>
+                      `)}
+                    </select>
+                  </div>
+                  <div>
+                    <label>Character voice <span class="muted small">· spoken dialogue (defaults to the narrator voice)</span></label>
+                    <select value=${scDialogVoice} onChange=${e => setScDialogVoice(e.target.value)}>
+                      <option value="">Same as narrator</option>
+                      ${Object.entries(voiceGroups).map(([g, list]) => list.length > 0 && html`
+                        <optgroup label=${g} key=${"d" + g}>
+                          ${list.map(v => html`<option value=${v.shortName} key=${"d" + v.shortName}>${v.localName || v.shortName} (${v.gender || "?"})</option>`)}
                         </optgroup>
                       `)}
                     </select>
@@ -1289,8 +1335,12 @@ function App() {
                         onInput=${e => editClipPrompt(c.index, e.target.value)}></textarea>
                     </${Accordion}>
                     <${Accordion} title=${"narration · " + ((c.narration||"").trim() ? ((c.narration||"").trim().split(" ").filter(Boolean).length + " words") : "empty")}>
-                      <textarea rows="2" style=${{fontSize:12}} placeholder="Spoken line for this clip (kept short so it fits the clip)."
+                      <textarea rows="2" style=${{fontSize:12}} placeholder="Narrator voiceover for this clip (kept short so it fits)."
                         value=${c.narration || ""} onInput=${e => editClipNarration(c.index, e.target.value)}></textarea>
+                    </${Accordion}>
+                    <${Accordion} title=${"dialogue · " + ((c.dialog||"").trim() ? ((c.dialog||"").trim().split(" ").filter(Boolean).length + " words") : "none")}>
+                      <textarea rows="2" style=${{fontSize:12}} placeholder="What a character actually says on screen in this clip (leave empty if silent)."
+                        value=${c.dialog || ""} onInput=${e => editClipDialog(c.index, e.target.value)}></textarea>
                     </${Accordion}>
                   </div>
                 `)}
