@@ -2,6 +2,7 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using System.Collections.Concurrent;
+using Microsoft.AspNetCore.Mvc;
 using Azure.Core;
 using Azure.Identity;
 using Azure.Storage.Blobs;
@@ -1570,7 +1571,6 @@ Write it as a vivid, single paragraph film treatment.";
         
         if (!resp.IsSuccessStatusCode)
         {
-            Log(dbg, "warn", $"generate-story-idea AOAI call failed: {(int)resp.StatusCode} - {body.Slice(0, 200)}");
             return Results.Ok(new { suggestion = userInput }); // graceful fallback
         }
 
@@ -1584,7 +1584,6 @@ Write it as a vivid, single paragraph film treatment.";
     }
     catch (Exception ex)
     {
-        Log(dbg, "warn", $"generate-story-idea failed: {ex.Message.Slice(0, 100)}");
         return Results.Ok(new { suggestion = userInput }); // graceful fallback
     }
 });
