@@ -233,6 +233,32 @@ public sealed class WanClient
     }
 
     /// <summary>
+    /// Asks ComfyUI to unload all cached models and release CUDA memory (POST /free
+    /// with unload_models + free_memory). Used between the FLUX portrait phase and the
+    /// Wan2.2 I2V clip phase: the 17 GB FLUX checkpoint must be evicted before the far
+    /// larger video models load, otherwise both resident at once OOMs the 80 GB A100.
+    /// ComfyUI processes the flag on its idle loop, so allow ~1-2s before enqueuing work.
+    /// </summary>
+    public async Task FreeMemoryAsync(CancellationToken ct)
+    {
+        var http = _hf.CreateClient();
+        http.Timeout = TimeSpan.FromSeconds(30);
+        using var req = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/free")
+        {
+            Content = new StringContent("{\"unload_models\":true,\"free_memory\":true}", Encoding.UTF8, "application/json")
+        };
+        if (!string.IsNullOrEmpty(_authKey)) req.Headers.Add("X-Wan-Auth", _authKey);
+        using var resp = await http.SendAsync(req, ct);
+        if (!resp.IsSuccessStatusCode)
+        {
+            var body = await resp.Content.ReadAsStringAsync(ct);
+            throw new InvalidOperationException($"ComfyUI /free failed ({(int)resp.StatusCode}): {Trunc(body, 200)}");
+        }
+    }
+
+    private static string Trunc(string s, int n) => string.IsNullOrEmpty(s) || s.Length <= n ? s : s[..n];
+
+    /// <summary>
     /// Returns a Sora-shaped status JSON ({id, status, progress, ...}) so existing
     /// callers (frontend poll, push watcher, finalize) stay unchanged. Also includes
     /// outputFilename + outputSubfolder when the job finishes, used by Finalize.

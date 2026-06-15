@@ -519,6 +519,22 @@ app.MapPost("/api/flux-image", async (FluxImageRequest req, WanClient wan,
     finally { try { Directory.Delete(work, recursive: true); } catch { } }
 });
 
+// 2b. Free GPU VRAM (unload cached ComfyUI models). Called by the background render
+//     worker between the FLUX portrait phase and the Wan2.2 I2V clip phase so the
+//     17 GB FLUX checkpoint is evicted before the larger video models load (avoids OOM).
+app.MapPost("/api/gpu-free", async (WanClient wan, CancellationToken ct) =>
+{
+    try
+    {
+        await wan.FreeMemoryAsync(ct);
+        return Results.Ok(new { ok = true });
+    }
+    catch (Exception ex) when (!ct.IsCancellationRequested)
+    {
+        return Results.Problem($"gpu-free failed: {ex.Message}");
+    }
+});
+
 // 3a. List previously finalized videos (mp4 blobs in the container) with fresh SAS URLs.
 app.MapGet("/api/videos", async (IConfiguration cfg, TokenCredential cred, CancellationToken ct,
     int? limit) =>

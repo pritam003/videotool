@@ -287,6 +287,7 @@ public sealed class StoryRenderWorker : BackgroundService
         // ---- 1) CAST: render a canonical reference for every character that
         //         doesn't already have one (uploaded leads keep their RefName). ----
         var castList = cast.Values.ToList();
+        var renderedPortrait = false;
         for (int i = 0; i < castList.Count; i++)
         {
             ct.ThrowIfCancellationRequested();
@@ -297,6 +298,23 @@ public sealed class StoryRenderWorker : BackgroundService
             var prompt = CastSnapshotPrompt(c, story);
             var (name, _) = await RenderPortraitAsync(prompt, engine, size, ct);
             c.RefName = name;
+            renderedPortrait = true;
+        }
+
+        // FLUX portraits leave the 17 GB checkpoint resident in VRAM; evict it before
+        // the far larger Wan2.2 I2V models load, or both-at-once OOMs the 80 GB A100.
+        if (engine == "flux" && renderedPortrait)
+        {
+            job.Label = "freeing GPU memory before video render";
+            try
+            {
+                await PostJsonAsync("/api/gpu-free", new { }, ct);
+                // ComfyUI processes the unload flag on its idle loop (~1s); pause briefly
+                // so FLUX is gone before we enqueue the first I2V prompt.
+                await Task.Delay(TimeSpan.FromSeconds(3), ct);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) { _log.LogWarning(ex, "gpu-free failed (continuing)"); }
         }
 
         // ---- 2) CLIP CHAIN: first clip seeds from the cast reference; every
