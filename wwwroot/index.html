@@ -662,6 +662,51 @@ function App() {
     return groups;
   }, [voices]);
 
+  // ── Language is a first-class choice ──────────────────────────────────────
+  // The user picks ONE language for the whole film. That single choice drives the
+  // narrator voice, every character voice and the storyboard language, so the
+  // voiceover is always spoken in the chosen language (never silently English).
+  function localeOf(v) { const p = String(v || "en-US").split("-"); return p.length >= 2 ? `${p[0]}-${p[1]}` : "en-US"; }
+  function langLabel(loc) {
+    try {
+      const [l, r] = String(loc).split("-");
+      const ln = new Intl.DisplayNames(["en"], { type: "language" }).of(l) || l;
+      const rn = r ? (new Intl.DisplayNames(["en"], { type: "region" }).of(r) || r) : "";
+      return rn ? `${ln} (${rn})` : ln;
+    } catch { return loc; }
+  }
+  // Locale of the currently selected narrator voice = the film's language.
+  const curLoc = localeOf(voice);
+  // Every language present in the loaded voice catalogue (common ones first).
+  const LANGUAGES = useMemo(() => {
+    const seen = new Map();
+    voices.forEach(v => { const loc = v.locale; if (loc && !seen.has(loc)) seen.set(loc, langLabel(loc)); });
+    if (!seen.size) seen.set("en-US", "English (United States)");
+    const order = ["en-US", "en-IN", "hi-IN", "bn-IN"];
+    return [...seen.entries()].sort((a, b) => {
+      const ia = order.indexOf(a[0]), ib = order.indexOf(b[0]);
+      if (ia >= 0 || ib >= 0) return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+      return a[1].localeCompare(b[1]);
+    }).map(([code, label]) => ({ code, label }));
+  }, [voices]);
+  // The voices that speak the selected language — narration AND dialogue come from here,
+  // so nothing is ever voiced in the wrong language.
+  const langVoices = useMemo(() => {
+    const inLoc = voices.filter(v => v.locale === curLoc);
+    return inLoc.length ? inLoc : voices;
+  }, [voices, curLoc]);
+  // Switch the whole film to a language: default the narrator to a natural voice in that
+  // locale and clear per-character voices so they get re-picked in the new language.
+  function pickLanguage(loc) {
+    const inLoc = voices.filter(v => v.locale === loc);
+    const pref = inLoc.find(v => /Multilingual/i.test(v.shortName) && v.gender === "Female")
+      || inLoc.find(v => v.gender === "Female") || inLoc[0];
+    if (pref) setVoice(pref.shortName);
+    setScDialogVoice("");
+    voiceSuggestStoryRef.current = null;
+    setScCast(prev => (prev || []).map(c => ({ ...c, voice: "" })));
+  }
+
   // Wan2.2 can take a while per clip. Start with longer poll intervals
   // to avoid wasting round trips, then tighten as render approaches completion.
   // Bails out promptly if cancelRef is set (and tells backend to cancel server-side).
@@ -1128,7 +1173,7 @@ function App() {
   };
   function bundlesForCurrentLanguage() {
     const loc = String(voice || "en-US").split("-").slice(0, 2).join("-");
-    return VOICE_BUNDLES[loc] || VOICE_BUNDLES["en-US"];
+    return VOICE_BUNDLES[loc] || [];
   }
   function applyVoiceBundle(bundle) {
     const avail = new Set(voices.map(v => v.shortName));
@@ -1219,9 +1264,8 @@ function App() {
     2: () => true,
     3: () => !!(scStory && Array.isArray(scStory.clips) && scStory.clips.length),
     4: () => true,
-    5: () => true,
   };
-  function wizNext() { if (wizStep < 6 && (wizCanNext[wizStep] ? wizCanNext[wizStep]() : true)) setWizStep(wizStep + 1); }
+  function wizNext() { if (wizStep < 5 && (wizCanNext[wizStep] ? wizCanNext[wizStep]() : true)) setWizStep(wizStep + 1); }
   function wizBack() { if (wizStep > 1) setWizStep(wizStep - 1); }
 
   // ── Casting phase: generate ONE canonical reference image per character BEFORE
@@ -1538,9 +1582,9 @@ function App() {
       <!-- LEFT: Compose -->
       <div>
         <div class="card" style=${{borderColor:"var(--accent)",borderWidth:1,borderStyle:"solid"}}>
-          <h3 style=${{display:"flex",alignItems:"center",gap:8}}>🎬 Make a film <span class="pill ok small">step ${wizStep}/6</span></h3>
+          <h3 style=${{display:"flex",alignItems:"center",gap:8}}>🎬 Make a film <span class="pill ok small">step ${wizStep}/5</span></h3>
           <div style=${{display:"flex",gap:4,flexWrap:"wrap",margin:"6px 0 12px"}}>
-            ${[[1,"Idea"],[2,"Language"],[3,"Story"],[4,"Voices"],[5,"Cast"],[6,"Render"]].map(([n,lbl]) => html`
+            ${[[1,"Idea"],[2,"Language"],[3,"Story"],[4,"Cast"],[5,"Render"]].map(([n,lbl]) => html`
               <button key=${n} type="button" class="ghost small" title=${lbl}
                 onClick=${() => { if (n <= wizStep) setWizStep(n); }}
                 style=${{flex:"1 1 0",minWidth:48,fontSize:11,padding:"4px 2px",cursor:n<=wizStep?"pointer":"default",...(wizStep===n ? {background:"var(--accent)",color:"#fff",borderColor:"var(--accent)"} : {}),...(n<wizStep ? {opacity:.85} : n>wizStep ? {opacity:.45} : {})}}>
@@ -1598,24 +1642,22 @@ function App() {
               ${scNarrationMode !== "off" ? html`
                 <div class="stack" style=${{gap:8}}>
                   <div>
-                    <label>Language / narrator voice <span class="muted small">· language: <strong>${voiceLanguage(voice)}</strong></span></label>
-                    <select value=${voice} onChange=${e => setVoice(e.target.value)}>
-                      ${Object.entries(voiceGroups).map(([g, list]) => list.length > 0 && html`
-                        <optgroup label=${g} key=${g}>
-                          ${list.map(v => html`<option value=${v.shortName} key=${v.shortName}>${v.localName || v.shortName} (${v.gender || "?"})</option>`)}
-                        </optgroup>
-                      `)}
+                    <label>Language <span class="muted small">· the whole film — script, narration &amp; every spoken line — is written and voiced in this language</span></label>
+                    <select value=${curLoc} onChange=${e => pickLanguage(e.target.value)}>
+                      ${LANGUAGES.map(l => html`<option value=${l.code} key=${l.code}>${l.label}</option>`)}
                     </select>
                   </div>
                   <div>
-                    <label>Default character voice <span class="muted small">· dialogue fallback when a cast member has no voice set in step 4</span></label>
+                    <label>Narrator voice <span class="muted small">· speaks the narration in <strong>${langLabel(curLoc)}</strong></span></label>
+                    <select value=${voice} onChange=${e => setVoice(e.target.value)}>
+                      ${langVoices.map(v => html`<option value=${v.shortName} key=${v.shortName}>${v.localName || v.shortName} (${v.gender || "?"})</option>`)}
+                    </select>
+                  </div>
+                  <div>
+                    <label>Default character voice <span class="muted small">· dialogue fallback when a cast member has no voice set in the cast step</span></label>
                     <select value=${scDialogVoice} onChange=${e => setScDialogVoice(e.target.value)}>
                       <option value="">Same as narrator</option>
-                      ${Object.entries(voiceGroups).map(([g, list]) => list.length > 0 && html`
-                        <optgroup label=${g} key=${"d" + g}>
-                          ${list.map(v => html`<option value=${v.shortName} key=${"d" + v.shortName}>${v.localName || v.shortName} (${v.gender || "?"})</option>`)}
-                        </optgroup>
-                      `)}
+                      ${langVoices.map(v => html`<option value=${v.shortName} key=${"d" + v.shortName}>${v.localName || v.shortName} (${v.gender || "?"})</option>`)}
                     </select>
                   </div>
                 </div>
@@ -1688,48 +1730,10 @@ function App() {
               `}
             `)}
 
-            <!-- STEP 4: voices (per character) -->
-            ${wizStep === 4 && (scNarrationMode === "off" ? html`<p class="muted small">Voiceover is off, so there are no voices to pick. Continue to casting →</p>` : html`
-              <div>
-                <label>④ Voices <span class="muted small">· a distinct voice per character, in ${voiceLanguage(voice)}</span></label>
-                <div style=${{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center",margin:"6px 0 8px"}}>
-                  <span class="muted small">Suggested bundles:</span>
-                  ${bundlesForCurrentLanguage().map((b,bi) => html`<button key=${bi} class="ghost small" onClick=${() => applyVoiceBundle(b)} disabled=${!voices.length}>${b.label}</button>`)}
-                  <button class="ghost small" onClick=${resuggestVoices} disabled=${!voices.length}>↻ Auto-suggest by character</button>
-                </div>
-                <div class="stack" style=${{gap:8}}>
-                  <div>
-                    <label class="muted small">Narrator voice</label>
-                    <select value=${voice} onChange=${e => setVoice(e.target.value)}>
-                      ${Object.entries(voiceGroups).map(([g, list]) => list.length > 0 && html`
-                        <optgroup label=${g} key=${"nv" + g}>
-                          ${list.map(v => html`<option value=${v.shortName} key=${"nv" + v.shortName}>${v.localName || v.shortName} (${v.gender || "?"})</option>`)}
-                        </optgroup>
-                      `)}
-                    </select>
-                  </div>
-                  ${(scCast || []).length === 0 ? html`<p class="muted small">No named characters — only the narrator speaks.</p>` : (scCast || []).map((c,i) => html`
-                    <div key=${c.id} style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
-                      <span class="pill small" style=${{flex:"0 0 auto"}}>${i+1}</span>
-                      <strong style=${{flex:"0 0 auto",fontSize:13}}>${c.name || c.id}</strong>
-                      <select style=${{flex:"1 1 160px"}} value=${c.voice || ""} onChange=${e => updateCastMember(c.id, { voice: e.target.value })}>
-                        <option value="">Default character voice</option>
-                        ${Object.entries(voiceGroups).map(([g, list]) => list.length > 0 && html`
-                          <optgroup label=${g} key=${"cv" + c.id + g}>
-                            ${list.map(v => html`<option value=${v.shortName} key=${"cv" + c.id + v.shortName}>${v.localName || v.shortName} (${v.gender || "?"})</option>`)}
-                          </optgroup>
-                        `)}
-                      </select>
-                    </div>
-                  `)}
-                </div>
-              </div>
-            `)}
-
-            <!-- STEP 5: cast (canonical character references) -->
-            ${wizStep === 5 && html`
+            <!-- STEP 4: characters + image + per-character voices -->
+            ${wizStep === 4 && html`
             <div>
-              <label>⑤ Characters <span class="muted small">(upload a face for the lead, or let AI generate everyone — carried across every clip)</span></label>
+              <label>④ Characters &amp; voices <span class="muted small">(upload a face for the lead, or let AI generate everyone — carried across every clip)</span></label>
               <p class="muted small" style=${{margin:"2px 0 8px"}}>
                 Review the cast the story proposed — edit any description, drop in a template, or add/remove characters. Optionally upload a photo for the lead. Each character is rendered once and reused in every clip so identities stay locked.
               </p>
@@ -1761,8 +1765,15 @@ function App() {
               ${scStory && scCast.length > 0 && html`
                 <div class="stack" style=${{gap:8,margin:"8px 0 4px"}}>
                   <div class="muted small">
-                    <strong>Cast (${scCast.length})</strong> — edit a look, drop in a template, or add/remove characters. Changing a description re-renders that character's reference. Voices are set in step 4.
+                    <strong>Cast (${scCast.length})</strong> — edit a look, drop in a template, or add/remove characters. Changing a description re-renders that character's reference.${scNarrationMode !== "off" ? " Pick each character's voice below." : ""}
                   </div>
+                  ${scNarrationMode !== "off" && html`
+                    <div style=${{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
+                      <span class="muted small">Voices in ${langLabel(curLoc)}:</span>
+                      ${bundlesForCurrentLanguage().map((b,bi) => html`<button key=${bi} class="ghost small" onClick=${() => applyVoiceBundle(b)} disabled=${!voices.length}>${b.label}</button>`)}
+                      <button class="ghost small" onClick=${resuggestVoices} disabled=${!voices.length}>↻ Auto-suggest voices</button>
+                    </div>
+                  `}
                   ${scCast.map((c, i) => html`
                     <div key=${c.id} style=${{border:"1px solid var(--border)",borderRadius:"var(--radius-sm)",padding:8,display:"flex",flexDirection:"column",gap:6,background:"var(--surface-2)"}}>
                       <div style=${{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
@@ -1781,6 +1792,15 @@ function App() {
                       <textarea rows="2" style=${{fontSize:12}} value=${c.description||""}
                         placeholder="Locked look: age, build, skin tone, hair, wardrobe, distinguishing features"
                         onInput=${e => updateCastMember(c.id, { description: e.target.value })}></textarea>
+                      ${scNarrationMode !== "off" && html`
+                        <div style=${{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
+                          <span class="muted small" style=${{flex:"0 0 auto"}}>🔊 Voice</span>
+                          <select style=${{flex:"1 1 160px",fontSize:12}} value=${c.voice || ""} onChange=${e => updateCastMember(c.id, { voice: e.target.value })}>
+                            <option value="">Default character voice</option>
+                            ${langVoices.map(v => html`<option value=${v.shortName} key=${"cv" + c.id + v.shortName}>${v.localName || v.shortName} (${v.gender || "?"})</option>`)}
+                          </select>
+                        </div>
+                      `}
                     </div>
                   `)}
                   <div style=${{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
@@ -1798,10 +1818,10 @@ function App() {
             </div>
             `}
 
-            <!-- STEP 6: render -->
-            ${wizStep === 6 && html`
+            <!-- STEP 5: render -->
+            ${wizStep === 5 && html`
             <div>
-              <label>⑥ Render</label>
+              <label>⑤ Render</label>
               <div class="plan" style=${{marginTop:6}}>
                 <div class="plan-head"><strong>${(scStory && scStory.title) || "Your film"}</strong><span class="pill">${scClipCount} clips · ${scClipSec}s</span></div>
                 <div class="muted small" style=${{padding:"0 12px 10px",display:"flex",flexDirection:"column",gap:4}}>
@@ -1825,8 +1845,8 @@ function App() {
             <!-- wizard navigation -->
             <div style=${{display:"flex",gap:8,alignItems:"center",justifyContent:"space-between",marginTop:8,borderTop:"1px solid var(--border)",paddingTop:10}}>
               <button class="ghost" onClick=${wizBack} disabled=${wizStep === 1}>← Back</button>
-              <span class="muted small">Step ${wizStep} of 6</span>
-              ${wizStep < 6
+              <span class="muted small">Step ${wizStep} of 5</span>
+              ${wizStep < 5
                 ? html`<button class="primary" onClick=${wizNext} disabled=${wizCanNext[wizStep] && !wizCanNext[wizStep]()}>Next →</button>`
                 : html`<span style=${{width:64}}></span>`}
             </div>
