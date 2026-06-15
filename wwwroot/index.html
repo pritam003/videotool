@@ -460,7 +460,7 @@ function App() {
 
   // Narration (audio) laid over the finished film.
   // mode: 'off' = silent · 'auto' = AI writes it · 'prompt' = AI writes it from your direction.
-  const [scNarrationMode, setScNarrationMode] = useState("off");
+  const [scNarrationMode, setScNarrationMode] = useState("auto");
   const [scNarrationPrompt, setScNarrationPrompt] = useState("");
   const [scNarrationText, setScNarrationText] = useState(""); // editable script — the user's words win
   const [scNarrating, setScNarrating] = useState(false);      // script generation in flight
@@ -723,14 +723,26 @@ function App() {
     setScCharPreview(file ? URL.createObjectURL(file) : null);
   }
 
+  // Human-readable language of the selected narrator voice (e.g. "hi-IN-..." → "Hindi").
+  // The storyboard writes the whole script + narration in THIS language so the spoken
+  // audio and the on-screen story share one language and stay in sync.
+  function voiceLanguage(v) {
+    try {
+      const sub = String(v || "en-US").split("-")[0];
+      const name = new Intl.DisplayNames(["en"], { type: "language" }).of(sub);
+      return name || "English";
+    } catch { return "English"; }
+  }
+
   // Step 1: turn the idea into a story spread over N=ceil(total/5) clips.
   async function buildStoryboard() {
     if (!scPrompt.trim()) { toast("Enter a story idea first.", true); return; }
+    const narrating = scNarrationMode !== "off";
     setScBuilding(true); setScStory(null); setScProgress([]); setScCast([]);
     try {
       const r = await fetch("/api/storyboard", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: scPrompt, totalSeconds: scTotalSec, clipSeconds: 5, size: scSize })
+        body: JSON.stringify({ prompt: scPrompt, totalSeconds: scTotalSec, clipSeconds: 5, size: scSize, narrate: narrating, language: narrating ? voiceLanguage(voice) : "English" })
       });
       const j = await jsonOrThrow(r);
       const story = j.story || {};
@@ -911,20 +923,19 @@ function App() {
     if (!cast) cast = [{ id: "hero", name: "Lead", description: scStory.subject || scPrompt || "the main subject" }];
     cancelRef.current = false; currentJobIdRef.current = null;
     setScCasting(true);
-    setScCast(cast.map(c => ({ ...c, status: "pending", refName: null, previewUrl: null })));
-    setStatus({ phase: "running", pct: 1, label: "casting characters…" });
+    setScCast(cast.map(c => ({ ...c, status: "rendering", refName: null, previewUrl: null })));
+    setStatus({ phase: "running", pct: 1, label: `casting ${cast.length} character${cast.length > 1 ? "s" : ""} in parallel…` });
     try {
-      for (let i = 0; i < cast.length; i++) {
+      // Cast every character at once (parallel) — the user's "casting happens parallely".
+      // The GPU serialises actual rendering, but all snapshots are submitted together.
+      await Promise.all(cast.map(async (c, i) => {
         if (cancelRef.current) throw new Error("Cancelled by user");
-        const c = cast[i];
-        setScCast(p => p.map(x => x.id === c.id ? { ...x, status: "rendering" } : x));
-        setStatus(s => ({ ...s, label: `casting ${i + 1}/${cast.length}: ${c.name || c.id}` }));
         let ref;
         if (i === 0 && scCharFile) ref = await uploadCharImage(scCharFile, `cast ${c.name || c.id}`);
         else ref = await renderStillFromText(castSnapshotPrompt(c, scStory), `cast ${c.name || c.id}`);
         setScCast(p => p.map(x => x.id === c.id ? { ...x, status: "done", refName: ref.name, previewUrl: ref.previewUrl } : x));
         dbg("ok", `cast ready: ${c.name || c.id}`);
-      }
+      }));
       setStatus({ phase: "idle", pct: 0, label: "cast ready" });
       toast(`Cast ready — ${cast.length} character${cast.length > 1 ? "s" : ""}. Review, then render the film.`);
     } catch (e) {
@@ -955,7 +966,7 @@ function App() {
   // Compose a clip's text prompt: prepend the LOCKED descriptions of the
   // characters present + the location, so identity is anchored in text as well
   // as in the seed image. This reinforces consistency across the whole film.
-  function buildClipPrompt(clip, story) {
+  function buildClipPrompt(clip, story, prevClip, narrating) {
     const castById = {}; (story.cast || []).forEach(c => castById[c.id] = c);
     const locById = {}; (story.locations || []).forEach(l => locById[l.id] = l);
     const present = (clip.characters || []).map(id => castById[id]).filter(Boolean);
@@ -963,8 +974,19 @@ function App() {
     const who = present.map(c => `${c.name || c.id} — ${c.description || ""}`).join("; ");
     const where = loc ? `Location: ${loc.name || loc.id}, ${loc.description || ""}. ` : "";
     const idn = who ? `Featuring ${who}. ` : "";
+    // Strict 5s→5s continuity: feed the PREVIOUS clip's action + spoken line so this
+    // clip (whose first frame IS the previous clip's last frame) continues seamlessly.
+    let cont = "";
+    if (prevClip) {
+      const pa = (prevClip.action || "").trim();
+      const pn = narrating ? (prevClip.narration || "").trim() : "";
+      cont = `This clip continues STRICTLY from the previous shot — its first frame IS the previous shot's final frame, so keep the exact same character identities, faces, wardrobe, location, lighting and camera continuity. Previously: ${pa}${pn ? ` (voiceover then, audio only — never shown on screen: “${pn}”)` : ""}. Now the story moves forward: `;
+    }
     const base = clip.motionPrompt || clip.action || scPrompt;
-    return `${idn}${where}${base}`.trim();
+    const cur = (narrating && (clip.narration || "").trim())
+      ? ` The visible action is timed to this clip's voiceover (audio only — never shown on screen): “${clip.narration.trim()}”.`
+      : "";
+    return `${idn}${where}${cont}${base}${cur}`.trim();
   }
 
   // Pick (single character) or compose (multiple characters) the canonical start
@@ -998,7 +1020,7 @@ function App() {
     if (!scStory || !Array.isArray(scStory.clips) || scStory.clips.length === 0) {
       toast("Generate a storyboard first.", true); return;
     }
-    if (!scCastReady) { toast("Generate the cast first (② Generate cast).", true); return; }
+    if (!scCastReady) { toast("Generate the cast first (③ Generate cast).", true); return; }
     cancelRef.current = false; currentJobIdRef.current = null;
     setRunning(true); setOuts([]); setStitched(null);
     const clips = scStory.clips;
@@ -1012,6 +1034,7 @@ function App() {
     toast(`Rendering ${N}-clip film · est. ~${etaMin} min on Wan2.2 I2V`);
     try {
       const finals = [];
+      let prevFrameName = null, prevFramePreview = null, prevClip = null;
       for (let i = 0; i < N; i++) {
         if (cancelRef.current) throw new Error("Cancelled by user");
         const clip = clips[i];
@@ -1021,12 +1044,25 @@ function App() {
         setScProgress(p => p.map(x => x.index === clip.index ? { ...x, status: "rendering" } : x));
         setStatus({ phase: "running", pct: basePct, label: `${label}: ${clip.title || "rendering"}` });
 
-        // Canonical seed (no drift): single character reuses its reference;
-        // multi-character clips compose a fresh establishing still.
-        const startImage = await clipStartImage(clip, scStory, castMap, label);
-        if (!startImage) throw new Error(`${label}: no character reference available — generate the cast first`);
+        // Seed selection. Clip 1 — and any clip that INTRODUCES a character not in the
+        // previous shot — is seeded from the canonical casting reference so the new face
+        // is correct. Every other clip is seeded STRICTLY from the previous clip's last
+        // frame so motion + scene continue seamlessly (the user's 5s→5s iteration).
+        const prevChars = prevClip ? new Set(prevClip.characters || []) : new Set();
+        const introducesNew = (clip.characters || []).some(id => !prevChars.has(id));
+        let startImage, seedKind;
+        if (i === 0 || introducesNew || !prevFrameName) {
+          startImage = await clipStartImage(clip, scStory, castMap, label);
+          seedKind = "casting";
+          if (!startImage) throw new Error(`${label}: no character reference available — generate the cast first`);
+        } else {
+          startImage = prevFrameName;
+          seedKind = "last-frame";
+          setScProgress(p => p.map(x => x.index === clip.index ? { ...x, startUrl: prevFramePreview } : x));
+        }
 
-        const thePrompt = buildClipPrompt(clip, scStory);
+        const thePrompt = buildClipPrompt(clip, scStory, prevClip, narrating);
+        dbg("info", `${label} seed=${seedKind}`);
         const job = await submitI2V(startImage, thePrompt, clipSec, label);
         pushSubscribeForJob(job.id, label);
         const etaMs = clipSec * 16000;
@@ -1038,6 +1074,22 @@ function App() {
         const fr = await fetch(`/api/jobs/${job.id}/finalize`, { method: "POST" });
         const fj = await jsonOrThrow(fr);
         let clipUrl = fj.url;
+
+        // Extract THIS clip's last frame (from the silent render) to seed the NEXT clip
+        // — the core of the strict 5s→5s continuation chain the user asked for.
+        if (i < N - 1 && !cancelRef.current) {
+          try {
+            const ef = await fetch("/api/extract-last-frame", {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ videoUrl: clipUrl, size: scSize })
+            });
+            const ej = await jsonOrThrow(ef);
+            prevFrameName = ej.name; prevFramePreview = ej.previewUrl;
+          } catch (e) {
+            dbg("warn", `${label}: last-frame extract failed (${e.message}); next clip re-seeds from casting`);
+            prevFrameName = null; prevFramePreview = null;
+          }
+        }
 
         // Per-clip narration → mux onto THIS clip so audio is aligned to its action.
         if (narrating && !cancelRef.current) {
@@ -1066,7 +1118,8 @@ function App() {
         finals.push({ url: clipUrl, seconds: clipSec, size: scSize });
         setOuts([...finals]);
         setScProgress(p => p.map(x => x.index === clip.index ? { ...x, status: "done", clipUrl } : x));
-        dbg("ok", `${label} rendered`);
+        dbg("ok", `${label} rendered (seed=${seedKind})`);
+        prevClip = clip;
       }
 
       // Stitch the clips into the final film. Narrated chains use hard cuts so the
@@ -1127,9 +1180,11 @@ function App() {
         <div class="card" style=${{borderColor:"var(--accent)",borderWidth:1,borderStyle:"solid"}}>
           <h3 style=${{display:"flex",alignItems:"center",gap:8}}>🎬 Story Chain <span class="pill ok small">I2V continuation</span></h3>
           <p class="muted small" style=${{marginTop:-4}}>
-            One idea → a cast of characters and a story across ${scClipCount} clips. We render a
-            canonical reference for every character first, then seed each clip from it (not the
-            previous frame) so identities never drift — and each clip gets its own synced narration.
+            Idea → pick a voiceover (script + narration are written together, in the same
+            language, fully in sync) → cast every character in parallel → then render the clip
+            chain, where each 5s is seeded from the previous clip's last frame plus the locked
+            cast, and fed the previous + current script and narration so the story stays
+            continuous. ${`${scClipCount} clips · ${scClipSec}s each.`}
           </p>
           <div class="stack">
             <!-- STEP 1: story idea → storyboard -->
@@ -1156,9 +1211,45 @@ function App() {
                 </select>
               </div>
             </div>
+            <!-- STEP 2: AI voiceover — chosen BEFORE writing the story so the script and
+                 narration are generated together, in one language, in sync. -->
+            <div>
+              <label>② AI voiceover <span class="muted small">(script + narration written together, same language, in sync)</span></label>
+              <div class="seg" style=${{display:"flex",gap:6,flexWrap:"wrap",margin:"4px 0 8px"}}>
+                ${[["off","🔇 No voiceover"],["auto","🎙️ AI voiceover"]].map(([v,lbl]) => html`
+                  <button key=${v} type="button" onClick=${() => setScNarrationMode(v)}
+                    class="ghost small"
+                    style=${scNarrationMode===v ? {background:"var(--accent)",color:"#fff",borderColor:"var(--accent)"} : {}}>
+                    ${lbl}
+                  </button>
+                `)}
+              </div>
+              ${scNarrationMode !== "off" && html`
+                <div class="stack" style=${{gap:8}}>
+                  <div>
+                    <label>Narrator voice <span class="muted small">· language: <strong>${voiceLanguage(voice)}</strong> — the whole script is written in this language</span></label>
+                    <select value=${voice} onChange=${e => setVoice(e.target.value)}>
+                      ${Object.entries(voiceGroups).map(([g, list]) => list.length > 0 && html`
+                        <optgroup label=${g} key=${g}>
+                          ${list.map(v => html`<option value=${v.shortName} key=${v.shortName}>${v.localName || v.shortName} (${v.gender || "?"})</option>`)}
+                        </optgroup>
+                      `)}
+                    </select>
+                  </div>
+                  ${scStory && html`
+                    <div class="btn-row" style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                      <button class="ghost" onClick=${previewNarration}>🔊 Preview voice</button>
+                      <span class="muted small">per-clip lines are in the storyboard below — edit any freely</span>
+                    </div>
+                  `}
+                  ${scNarrAudio && html`<audio src=${scNarrAudio.url} controls style=${{width:"100%"}}></audio>`}
+                </div>
+              `}
+            </div>
+
             <div class="btn-row" style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
               <button class="primary" onClick=${buildStoryboard} disabled=${scBuilding || running || !scPrompt.trim()}>
-                ${scBuilding ? "Writing story…" : "① Generate storyboard"}
+                ${scBuilding ? "Writing story…" : (scNarrationMode !== "off" ? "① Generate story + voiceover" : "① Generate storyboard")}
               </button>
               <span class="muted small">${scClipCount} clips · ${scClipSec}s each · one continuous arc</span>
             </div>
@@ -1206,7 +1297,7 @@ function App() {
 
             <!-- STEP 2: cast (canonical character references) -->
             <div>
-              <label>② Cast & locations <span class="muted small">(canonical references generated before any clip)</span></label>
+              <label>③ Cast & locations <span class="muted small">(generated in parallel, before any clip)</span></label>
               <p class="muted small" style=${{margin:"2px 0 8px"}}>
                 Optionally upload a photo for the lead; every other character is generated from the story.
                 Each character is rendered once and reused in every clip so identities stay locked.
@@ -1221,7 +1312,7 @@ function App() {
               `}
               <div class="btn-row" style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",marginTop:8}}>
                 <button class="primary" onClick=${generateCast} disabled=${!scStory || scCasting || running}>
-                  ${scCasting ? "Casting…" : (scCast.length ? "↻ Regenerate cast" : "② Generate cast")}
+                  ${scCasting ? "Casting…" : (scCast.length ? "↻ Regenerate cast" : "③ Generate cast")}
                 </button>
                 <span class="muted small">${!scStory ? "build a storyboard first" : scCastReady ? "cast ready — render below" : "renders one reference per character"}</span>
               </div>
@@ -1242,41 +1333,7 @@ function App() {
               `}
             </div>
 
-            <!-- STEP 3: narration (per-clip, in sync) -->
-            <div>
-              <label>③ Narration <span class="muted small">(each clip gets its own spoken line, synced to that clip)</span></label>
-              <div class="seg" style=${{display:"flex",gap:6,flexWrap:"wrap",margin:"4px 0 8px"}}>
-                ${[["off","🔇 Off (silent)"],["auto","🎙️ AI voiceover"]].map(([v,lbl]) => html`
-                  <button key=${v} type="button" onClick=${() => setScNarrationMode(v)}
-                    class="ghost small"
-                    style=${scNarrationMode===v ? {background:"var(--accent)",color:"#fff",borderColor:"var(--accent)"} : {}}>
-                    ${lbl}
-                  </button>
-                `)}
-              </div>
-
-              ${scNarrationMode !== "off" && html`
-                <div class="stack" style=${{gap:8}}>
-                  <div>
-                    <label>Narrator voice <span class="muted small">(non-English voices auto-translate each line)</span></label>
-                    <select value=${voice} onChange=${e => setVoice(e.target.value)}>
-                      ${Object.entries(voiceGroups).map(([g, list]) => list.length > 0 && html`
-                        <optgroup label=${g} key=${g}>
-                          ${list.map(v => html`<option value=${v.shortName} key=${v.shortName}>${v.localName || v.shortName} (${v.gender || "?"})</option>`)}
-                        </optgroup>
-                      `)}
-                    </select>
-                  </div>
-                  <div class="btn-row" style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
-                    ${scStory && html`<button class="ghost" onClick=${previewNarration}>🔊 Preview voice</button>`}
-                    <span class="muted small">${scStory ? "narration lines are written per-clip in the storyboard above — edit any of them freely" : "build a storyboard first — it writes a line per clip"}</span>
-                  </div>
-                  ${scNarrAudio && html`<audio src=${scNarrAudio.url} controls style=${{width:"100%"}}></audio>`}
-                </div>
-              `}
-            </div>
-
-            <!-- STEP 3/4: render the chain -->
+            <!-- ④ render the chain -->
             <div class="btn-row" style=${{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
               <button class="primary" onClick=${runStoryChain}
                 disabled=${running || scCasting || !scStory || !scCastReady}>

@@ -1194,6 +1194,15 @@ app.MapPost("/api/storyboard", async (StoryboardRequest req, IHttpClientFactory 
     var totalSeconds = Math.Clamp(req.TotalSeconds ?? 60, clipSeconds, 120);
     var clipCount = Math.Clamp((int)Math.Ceiling(totalSeconds / (double)clipSeconds), 1, 24);
     var size = req.Size ?? "832x480";
+    var language = string.IsNullOrWhiteSpace(req.Language) ? "English" : req.Language!.Trim();
+    var narrate = req.Narrate ?? true;
+    var narrationRule = narrate
+        ? $@"NARRATION (voiceover — written TOGETHER with the visuals so audio and video stay in sync):
+- Write a SHORT spoken voiceover line for EACH clip in {language} — the EXACT words spoken aloud during that clip. At most {Math.Max(6, clipSeconds * 2)} words so it fits within {clipSeconds} seconds when spoken. Present tense, plain spoken language, no stage directions.
+- Each clip's narration MUST match THAT clip's on-screen action so the voiceover lands in sync with the picture, and the narration of consecutive clips MUST read as ONE continuous script (no repeats, each line follows from the last).
+- Keep title, style, action and motionPrompt in ENGLISH (the video model needs English). ONLY the narration field is written in {language}."
+        : @"NARRATION:
+- Set every clip's narration to an empty string. The user turned voiceover off.";
 
     var sys = $@"You are a film director and casting director planning a SINGLE continuous short film produced as a CHAIN of {clipCount} image-to-video clips, each {clipSeconds} seconds long, played back-to-back into one ~{clipCount * clipSeconds}-second film.
 
@@ -1212,8 +1221,7 @@ STORY RULES:
 - Exactly ONE clear, physically plausible action per clip (real gravity, weight, momentum, balance, natural human motion and timing). Do not cram multiple simultaneous actions into {clipSeconds} seconds.
 - Photorealistic. No on-screen text, captions, logos, or watermarks. One consistent visual style/lens/lighting (state once in `style`).
 
-NARRATION:
-- Write a SHORT spoken voiceover line for EACH clip that matches THAT clip's action, present tense, at most {Math.Max(6, clipSeconds * 2)} words so it fits within {clipSeconds} seconds when spoken. Plain language, no stage directions.
+{narrationRule}
 
 Return ONE JSON object, no markdown, exactly this shape:
 {{
@@ -1248,7 +1256,7 @@ Output JSON only. Define every character in `cast` and every place in `locations
 
     var user = $@"User film idea: {req.Prompt}
 
-Cast the characters and locations this idea needs (support multiple characters), then produce the {clipCount}-clip storyboard ({clipSeconds}s per clip, {clipCount * clipSeconds}s total, aspect {size}) as ONE continuous story — a single physically-plausible action per clip, each clip listing which cast members and location appear, plus a short narration line per clip. Output JSON only.";
+Cast the characters and locations this idea needs (support multiple characters), then produce the {clipCount}-clip storyboard ({clipSeconds}s per clip, {clipCount * clipSeconds}s total, aspect {size}) as ONE continuous story — a single physically-plausible action per clip, each clip listing which cast members and location appear{(narrate ? $", plus a short {language} narration line per clip written in sync with that clip's action" : ", with narration left empty")}. Output JSON only.";
 
     var client = hf.CreateClient();
     client.Timeout = TimeSpan.FromSeconds(90);
@@ -2146,7 +2154,7 @@ public record TailRequest(string VideoUrl, double? Seconds, string? Size);
 public record SliceRequest(string VideoUrl, double? StartSec, double? DurationSec, string? Size, bool? FromEnd);
 public record RemixRequest(string VideoId, string Prompt, int? Seconds, string? Size);
 public record ExtractFrameRequest(string VideoUrl, string? Size);
-public record StoryboardRequest(string Prompt, int? TotalSeconds, int? ClipSeconds, string? Size);
+public record StoryboardRequest(string Prompt, int? TotalSeconds, int? ClipSeconds, string? Size, string? Language, bool? Narrate);
 public record NarrationScriptRequest(string? Idea, string? Title, string? Logline, string[]? Actions, int? TotalSeconds, string? Prompt, string? Voice);
 public record MuxAudioRequest(string VideoUrl, string AudioUrl, string? Mode);
 
