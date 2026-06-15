@@ -1562,6 +1562,7 @@ Remember to use the [STORY] [/STORY] and [DIALOGUE] [/DIALOGUE] delimiters.";
     try
     {
         var client = hf.CreateClient();
+        client.Timeout = TimeSpan.FromSeconds(120); // gpt-5-mini reasoning model: 30-60s typical
         var reqBody = new
         {
             messages = new[]
