@@ -1366,6 +1366,28 @@ app.MapPost("/api/narration-script", async (NarrationScriptRequest req, IHttpCli
     var totalSeconds = Math.Clamp(req.TotalSeconds ?? 30, 3, 180);
     var wordBudget = Math.Max(8, (int)Math.Round(totalSeconds * 2.4)); // ~145 wpm spoken
 
+    var locale = "en-US";
+    if (!string.IsNullOrWhiteSpace(req.Voice))
+    {
+        var parts = req.Voice.Split('-', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length >= 2)
+            locale = $"{parts[0]}-{parts[1]}";
+    }
+    var languageName = locale switch
+    {
+        "en-US" => "English (US)",
+        "en-IN" => "English (India)",
+        "hi-IN" => "Hindi (India)",
+        "bn-IN" => "Bengali (India)",
+        _ => locale
+    };
+    var scriptHint = locale switch
+    {
+        "hi-IN" => "Use Devanagari script.",
+        "bn-IN" => "Use Bengali script.",
+        _ => "Use the normal writing system for that language."
+    };
+
     var beats = (req.Actions is { Length: > 0 })
         ? string.Join("\n", req.Actions.Select((a, i) => $"  {i + 1}. {a}"))
         : "(no beat list provided)";
@@ -1380,7 +1402,8 @@ RULES:
 - Output ONLY the words the narrator will speak. No stage directions, no scene labels, no quotation marks, no markdown.
 - Aim for about {wordBudget} words so it fits naturally in {totalSeconds} seconds when read aloud at a calm pace.
 - One flowing voiceover that matches the story's arc from start to finish. Do not enumerate clips or say 'clip one'.
-- Write in natural English (it may be translated to the target language afterwards).
+- Write in {languageName} (locale {locale}). Do not switch to another language.
+- {scriptHint}
 - {steer}
 
 Return ONE JSON object, no markdown: {{ ""script"": ""<the narration words>"" }}";
@@ -1392,6 +1415,39 @@ Beats (in order):
 {beats}
 
 Write the voiceover now. JSON only.";
+
+    static string ExtractChatContent(string responseBody)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(responseBody);
+            var content = doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content");
+            if (content.ValueKind == JsonValueKind.String)
+                return (content.GetString() ?? "").Trim();
+
+            if (content.ValueKind == JsonValueKind.Array)
+            {
+                var sb = new StringBuilder();
+                foreach (var part in content.EnumerateArray())
+                {
+                    if (part.ValueKind == JsonValueKind.String)
+                    {
+                        sb.Append(part.GetString());
+                        continue;
+                    }
+                    if (part.ValueKind == JsonValueKind.Object
+                        && part.TryGetProperty("text", out var txt)
+                        && txt.ValueKind == JsonValueKind.String)
+                    {
+                        sb.Append(txt.GetString());
+                    }
+                }
+                return sb.ToString().Trim();
+            }
+        }
+        catch { }
+        return "";
+    }
 
     var client = hf.CreateClient();
     client.Timeout = TimeSpan.FromSeconds(60);
@@ -1413,12 +1469,49 @@ Write the voiceover now. JSON only.";
     if (!resp.IsSuccessStatusCode)
         return Results.Problem($"Narration script failed ({(int)resp.StatusCode}): {body}");
 
-    using var doc = JsonDocument.Parse(body);
-    var raw = doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString()?.Trim() ?? "{}";
+    var raw = ExtractChatContent(body);
     string script = "";
-    try { using var sd = JsonDocument.Parse(raw); if (sd.RootElement.TryGetProperty("script", out var sc)) script = sc.GetString() ?? ""; }
-    catch { script = raw; }
-    return Results.Ok(new { script = script.Trim() });
+    if (!string.IsNullOrWhiteSpace(raw))
+    {
+        try
+        {
+            using var sd = JsonDocument.Parse(raw);
+            if (sd.RootElement.TryGetProperty("script", out var sc)) script = sc.GetString() ?? "";
+            else if (sd.RootElement.TryGetProperty("narration", out var nr)) script = nr.GetString() ?? "";
+            else if (sd.RootElement.TryGetProperty("text", out var tx)) script = tx.GetString() ?? "";
+        }
+        catch { script = raw; }
+    }
+
+    // Some model responses return an empty/invalid JSON object despite 200.
+    // Retry once without JSON mode and accept plain text if needed.
+    if (string.IsNullOrWhiteSpace(script))
+    {
+        using var msg2 = new HttpRequestMessage(HttpMethod.Post,
+            $"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=2024-10-21");
+        msg2.Headers.Add("api-key", key);
+        var payload2 = new
+        {
+            messages = new object[] {
+                new { role = "system", content = sys + " Return only the narration words as plain text." },
+                new { role = "user",   content = user }
+            },
+            max_completion_tokens = 1200
+        };
+        msg2.Content = new StringContent(JsonSerializer.Serialize(payload2), Encoding.UTF8, "application/json");
+        using var resp2 = await client.SendAsync(msg2, ct);
+        var body2 = await resp2.Content.ReadAsStringAsync(ct);
+        if (resp2.IsSuccessStatusCode)
+        {
+            script = ExtractChatContent(body2);
+        }
+    }
+
+    script = (script ?? "").Trim();
+    if (string.IsNullOrWhiteSpace(script))
+        return Results.Problem("Narration script returned empty content.");
+
+    return Results.Ok(new { script, locale, language = languageName });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
