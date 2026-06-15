@@ -427,6 +427,51 @@ app.MapPost("/api/extract-last-frame", async (ExtractFrameRequest req, IHttpClie
     finally { try { Directory.Delete(work, recursive: true); } catch { } }
 });
 
+// Generate a character portrait with FLUX.1 Schnell on the A100 (shares the Wan2.2 GPU,
+// ~$0 extra). Returns the SAME shape as /api/comfy-image ({name, previewUrl}) so the
+// casting flow can seed clip 1 from it identically. If the FLUX checkpoint isn't on the
+// share yet, ComfyUI errors and we surface a Problem so the UI can fall back to the Wan
+// T2V still. Body: { prompt, size? }.
+app.MapPost("/api/flux-image", async (FluxImageRequest req, WanClient wan,
+    IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
+{
+    if (string.IsNullOrWhiteSpace(req.Prompt))
+        return Results.BadRequest(new { error = "prompt is required" });
+
+    var ffmpeg = LocateFfmpeg();
+    if (ffmpeg is null) return Results.Problem("ffmpeg binary not found.");
+    var (W, H) = ParseSize(req.Size);
+
+    var work = Path.Combine(Path.GetTempPath(), $"flux-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(work);
+    try
+    {
+        var (fn, sf) = await wan.GenerateImageAsync(req.Prompt!, W, H, ct);
+        var png = Path.Combine(work, "flux.png");
+        using (var resp = await wan.DownloadAsync(fn, sf, ct))
+        {
+            if (!resp.IsSuccessStatusCode)
+                return Results.Problem($"FLUX image download failed ({(int)resp.StatusCode}).");
+            await using var s = await resp.Content.ReadAsStreamAsync(ct);
+            await using var f = File.Create(png);
+            await s.CopyToAsync(f, ct);
+        }
+        // Normalise to the clip W×H and stage into ComfyUI input + a blob preview.
+        return await PublishFrameAsync(png, W, H, "char", wan, cfg, cred, ffmpeg, ct);
+    }
+    catch (Exception ex) when (!ct.IsCancellationRequested && IsWarmingError(ex))
+    {
+        return Results.Json(
+            new { warming = true, error = "GPU is warming up (scale-from-zero). Retry shortly." },
+            statusCode: 503);
+    }
+    catch (Exception ex) when (!ct.IsCancellationRequested)
+    {
+        return Results.Problem($"FLUX image generation failed: {ex.Message}");
+    }
+    finally { try { Directory.Delete(work, recursive: true); } catch { } }
+});
+
 // 3a. List previously finalized videos (mp4 blobs in the container) with fresh SAS URLs.
 app.MapGet("/api/videos", async (IConfiguration cfg, TokenCredential cred, CancellationToken ct,
     int? limit) =>
@@ -2367,6 +2412,7 @@ public record TailRequest(string VideoUrl, double? Seconds, string? Size);
 public record SliceRequest(string VideoUrl, double? StartSec, double? DurationSec, string? Size, bool? FromEnd);
 public record RemixRequest(string VideoId, string Prompt, int? Seconds, string? Size);
 public record ExtractFrameRequest(string VideoUrl, string? Size);
+public record FluxImageRequest(string? Prompt, string? Size);
 public record StoryboardRequest(string Prompt, int? TotalSeconds, int? ClipSeconds, string? Size, string? Language, bool? Narrate, string? DialogDirection);
 public record NarrationScriptRequest(string? Idea, string? Title, string? Logline, string[]? Actions, int? TotalSeconds, string? Prompt, string? Voice);
 public record MuxAudioRequest(string VideoUrl, string AudioUrl, string? Mode);

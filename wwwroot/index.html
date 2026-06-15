@@ -468,6 +468,10 @@ function App() {
   const [scNarrationText, setScNarrationText] = useState(""); // editable script — the user's words win
   const [scNarrating, setScNarrating] = useState(false);      // script generation in flight
   const [scNarrAudio, setScNarrAudio] = useState(null);       // last voice preview { url }
+  // Portrait/cast image engine: "flux" = FLUX.1 Schnell (fast, sharp) · "comfy" = the
+  // original Wan 1s-T2V still. Both run on the same A100; the toggle picks which renders
+  // the cast references, and the two paths work independently.
+  const [scImageEngine, setScImageEngine] = useState("flux");
 
   const [running, setRunning] = useState(false);
 
@@ -598,6 +602,7 @@ function App() {
   // POST /api/jobs/{id}/cancel to stop server-side billing immediately.
   const cancelRef = useRef(false);
   const currentJobIdRef = useRef(null);
+  const voiceSuggestStoryRef = useRef(null); // story we've already auto-suggested voices for
   const [, force] = useState(0);
 
   useEffect(() => {
@@ -626,6 +631,17 @@ function App() {
       } catch (e) { dbg("warn", "voices load failed", e.message); }
     })();
   }, []);
+
+  // After a storyboard is built (and once the voice list has loaded), auto-suggest a
+  // distinct voice per character — matched to each character's role and the narrator's
+  // language — so the cast comes up pre-suggested with multiple voices the user can tweak.
+  useEffect(() => {
+    if (!scStory || !Array.isArray(scCast) || scCast.length === 0 || voices.length === 0) return;
+    if (voiceSuggestStoryRef.current === scStory) return;          // suggest once per storyboard
+    if (scCast.some(c => c.voice)) { voiceSuggestStoryRef.current = scStory; return; }
+    voiceSuggestStoryRef.current = scStory;
+    setScCast(prev => suggestCastVoices(prev));
+  }, [scStory, scCast, voices]);
 
   const voiceGroups = useMemo(() => {
     const groups = { "English (US)": [], "English (India)": [], "Hindi (India)": [], "Bengali (India)": [], "Other": [] };
@@ -934,6 +950,45 @@ function App() {
     return { name: ej.name, previewUrl: ej.previewUrl };
   }
 
+  // Render a clean portrait with FLUX.1 Schnell on the A100 (fast, sharp, a few seconds).
+  // Same {name, previewUrl} shape as the Wan still, so it drops straight into casting.
+  // Tolerates GPU cold start; throws a fluxUnavailable error for any other failure
+  // (e.g. the FLUX checkpoint isn't staged on the share yet) so callers can fall back.
+  async function fluxPortrait(thePrompt, label) {
+    for (let attempt = 0; attempt < 40; attempt++) {
+      if (cancelRef.current) throw new Error("Cancelled by user");
+      const r = await fetch("/api/flux-image", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: thePrompt, size: scSize })
+      });
+      if (r.ok) { const j = await r.json(); return { name: j.name, previewUrl: j.previewUrl }; }
+      const txt = await r.text();
+      let warming = false; try { warming = !!JSON.parse(txt).warming; } catch {}
+      if (r.status === 503 && (warming || /warming|cold start|50[234]|ActivationFailed|no capacity/i.test(txt))) {
+        setStatus(s => ({ ...s, label: `${label}: GPU warming up… (try ${attempt + 1})` }));
+        await sleep(15000); continue;
+      }
+      const e = new Error("flux: " + txt.slice(0, 200)); e.fluxUnavailable = true; throw e;
+    }
+    const e = new Error("GPU did not become ready for FLUX"); e.fluxUnavailable = true; throw e;
+  }
+
+  // Portrait with graceful degradation: FLUX.1 Schnell first; if it isn't available
+  // (weights not staged, node error, …) fall back to the slower 1s Wan T2V still so
+  // casting never hard-fails just because FLUX isn't ready.
+  async function renderPortrait(thePrompt, label) {
+    // ComfyUI still engine: the original Wan 1s-T2V → last-frame path (always available).
+    if (scImageEngine === "comfy") return await renderStillFromText(thePrompt, label);
+    // FLUX engine: FLUX.1 Schnell first, with a graceful fallback to the Wan still so
+    // casting never hard-fails just because FLUX hit an error.
+    try { return await fluxPortrait(thePrompt, label); }
+    catch (e) {
+      if (cancelRef.current || /Cancelled by user/i.test(e.message || "")) throw e;
+      dbg("warn", `${label}: FLUX unavailable (${(e.message || "").slice(0, 80)}) — falling back to ComfyUI still`);
+      return await renderStillFromText(thePrompt, label);
+    }
+  }
+
   // Upload a user-provided image as a canonical character reference (tolerates GPU cold start).
   async function uploadCharImage(file, label) {
     for (let attempt = 0; attempt < 40; attempt++) {
@@ -1000,6 +1055,52 @@ function App() {
     return `Cinematic full-body character portrait of ${c.name || "the character"}: ${look}. Single subject, standing, facing camera, neutral seamless studio backdrop, soft even key light, sharp focus, photorealistic, accurate human anatomy and proportions. ${(story && story.style) || ""}. No on-screen text, captions, or watermarks.`;
   }
 
+  // Infer a character's likely gender from its name + description so we can suggest a
+  // fitting voice. Returns "female" | "male" | "" (unknown/neutral).
+  function inferGender(c) {
+    const t = `${c.name || ""} ${c.description || ""}`.toLowerCase();
+    const f = /\b(woman|women|girl|girls|lady|ladies|she|her|hers|mother|mom|mum|mommy|wife|daughter|sister|aunt|auntie|grandmother|grandma|granny|actress|queen|princess|businesswoman|madam|miss|mrs|ms|female|feminine|heroine|widow|bride|niece)\b/.test(t);
+    const m = /\b(man|men|boy|boys|guy|gentleman|he|his|him|father|dad|daddy|husband|son|brother|uncle|grandfather|grandpa|king|prince|businessman|sir|mr|male|masculine|hero|widower|groom|nephew)\b/.test(t);
+    return f && !m ? "female" : m && !f ? "male" : "";
+  }
+
+  // Pick a distinct voice for one character from a candidate pool, matching gender when
+  // known and avoiding voices already taken by other characters / the narrator.
+  function suggestVoiceForCharacter(c, pool, used) {
+    if (!pool.length) return "";
+    const want = inferGender(c);
+    let cands = pool.filter(v => !used.has(v.shortName));
+    if (want) { const g = cands.filter(v => v.gender === want); if (g.length) cands = g; }
+    if (!cands.length) cands = pool.filter(v => !used.has(v.shortName));
+    if (!cands.length) cands = pool;
+    const pick = cands[0];
+    used.add(pick.shortName);
+    return pick.shortName;
+  }
+
+  // Auto-suggest a distinct per-character voice for the whole cast, in the narrator's
+  // language. Respects any voice the user already chose; only fills the blanks.
+  function suggestCastVoices(list) {
+    if (!Array.isArray(list) || !list.length || !voices.length) return list;
+    const loc = String(voice || "en-US").split("-").slice(0, 2).join("-"); // e.g. "hi-IN"
+    const lang2 = String(voice || "en").split("-")[0];                     // e.g. "hi"
+    let pool = voices.filter(v => v.locale === loc);
+    if (pool.length < 2) pool = voices.filter(v => (v.locale || "").startsWith(lang2 + "-"));
+    if (pool.length < 2) pool = voices.slice();
+    const used = new Set();
+    if (voice) used.add(voice); // keep character voices distinct from the narrator's
+    return list.map(c => {
+      if (c.voice) { used.add(c.voice); return c; }
+      return { ...c, voice: suggestVoiceForCharacter(c, pool, used) };
+    });
+  }
+
+  // Clear and re-roll all character-voice suggestions (the "↻ Re-suggest" button).
+  function resuggestVoices() {
+    if (scStory) voiceSuggestStoryRef.current = scStory;
+    setScCast(prev => suggestCastVoices((prev || []).map(c => ({ ...c, voice: "" }))));
+  }
+
   // ── Casting phase: generate ONE canonical reference image per character BEFORE
   //    any clip is rendered, so every clip can be seeded from a stable identity
   //    (instead of the previous clip's degrading last frame). Supports multiple
@@ -1022,7 +1123,7 @@ function App() {
         if (cancelRef.current) throw new Error("Cancelled by user");
         let ref;
         if (i === 0 && scCharFile) ref = await uploadCharImage(scCharFile, `cast ${c.name || c.id}`);
-        else ref = await renderStillFromText(castSnapshotPrompt(c, scStory), `cast ${c.name || c.id}`);
+        else ref = await renderPortrait(castSnapshotPrompt(c, scStory), `cast ${c.name || c.id}`);
         setScCast(p => p.map(x => x.id === c.id ? { ...x, status: "done", refName: ref.name, previewUrl: ref.previewUrl } : x));
         dbg("ok", `cast ready: ${c.name || c.id}`);
       }));
@@ -1043,7 +1144,7 @@ function App() {
     setScCast(p => p.map(x => x.id === id ? { ...x, status: "rendering" } : x));
     setStatus({ phase: "running", pct: 1, label: `re-casting ${c.name || c.id}…` });
     try {
-      const ref = await renderStillFromText(castSnapshotPrompt(c, scStory), `recast ${c.name || c.id}`);
+      const ref = await renderPortrait(castSnapshotPrompt(c, scStory), `recast ${c.name || c.id}`);
       setScCast(p => p.map(x => x.id === id ? { ...x, status: "done", refName: ref.name, previewUrl: ref.previewUrl } : x));
       setStatus({ phase: "idle", pct: 0, label: "cast ready" });
       toast(`Re-cast ${c.name || c.id}`);
@@ -1106,7 +1207,7 @@ function App() {
     const where = loc ? `${loc.name || loc.id} — ${loc.description || ""}` : (story.setting || "");
     const prompt = `Cinematic establishing wide shot showing multiple characters together in the same frame. ${who}. Setting: ${where}. ${clip.action || ""}. All characters fully visible and in-frame, photorealistic, consistent lighting, physically plausible composition. ${story.style || ""}. No on-screen text, captions, or watermarks.`;
     setStatus(s => ({ ...s, label: `${label}: composing multi-character scene…` }));
-    const still = await renderStillFromText(prompt, `${label} scene`);
+    const still = await renderPortrait(prompt, `${label} scene`);
     setScProgress(p => p.map(x => x.index === clip.index ? { ...x, startUrl: still.previewUrl } : x));
     return still.name;
   }
@@ -1456,6 +1557,23 @@ function App() {
               <p class="muted small" style=${{margin:"2px 0 8px"}}>
                 Review the cast the story proposed below — edit any description, drop in a template, set a per-character voice, or add/remove characters. Optionally upload a photo for the lead. Each character is then rendered once and reused in every clip so identities stay locked.
               </p>
+              <div style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",margin:"0 0 10px"}}>
+                <span class="muted small" style=${{flex:"0 0 auto"}}>Portrait engine</span>
+                <div class="seg" style=${{display:"flex",gap:6}}>
+                  ${[["flux","⚡ FLUX.1 Schnell"],["comfy","🎬 ComfyUI still"]].map(([v,lbl]) => html`
+                    <button key=${v} type="button" onClick=${() => setScImageEngine(v)}
+                      class="ghost small" disabled=${scCasting || running}
+                      style=${scImageEngine===v ? {background:"var(--accent)",color:"#fff",borderColor:"var(--accent)"} : {}}>
+                      ${lbl}
+                    </button>
+                  `)}
+                </div>
+                <span class="muted small" style=${{flex:"1 1 100%"}}>
+                  ${scImageEngine==="flux"
+                    ? "FLUX.1 Schnell renders sharp portraits in a few seconds (auto-falls back to the ComfyUI still if FLUX is unavailable)."
+                    : "The original Wan 1-second-clip still — slower, but always available."}
+                </span>
+              </div>
               <label class="muted small">Lead reference photo <span class="muted small">(optional)</span></label>
               <input type="file" accept="image/*" onChange=${e => pickCharImage(e.target.files[0] || null)} />
               ${scCharPreview && html`
@@ -1469,6 +1587,15 @@ function App() {
                   <div class="muted small">
                     <strong>Cast (${scCast.length})</strong> — edit a look, drop in a template, or pick a voice. Changing a description re-renders that character's reference.
                   </div>
+                  ${scNarrationMode !== "off" && html`
+                    <div style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",padding:"6px 8px",border:"1px dashed var(--border)",borderRadius:"var(--radius-sm)",background:"var(--surface-2)"}}>
+                      <span class="muted small" style=${{flex:"1 1 200px"}}>
+                        🔊 <strong>Suggested voices</strong> in <strong>${voiceLanguage(voice)}</strong> — one per character, picked from each role. Tweak any below.
+                      </span>
+                      <button class="ghost small" onClick=${resuggestVoices} disabled=${!voices.length}
+                        title="Re-roll the suggested character voices">↻ Re-suggest voices</button>
+                    </div>
+                  `}
                   ${scCast.map((c, i) => html`
                     <div key=${c.id} style=${{border:"1px solid var(--border)",borderRadius:"var(--radius-sm)",padding:8,display:"flex",flexDirection:"column",gap:6,background:"var(--surface-2)"}}>
                       <div style=${{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>

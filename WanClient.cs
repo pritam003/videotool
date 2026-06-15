@@ -18,6 +18,7 @@ public sealed class WanClient
     private readonly string? _authKey;
     private readonly Lazy<string> _workflowJson;
     private readonly Lazy<string> _i2vWorkflowJson;
+    private readonly Lazy<string> _fluxWorkflowJson;
     private readonly ILogger<WanClient> _log;
 
     public WanClient(IHttpClientFactory hf, IConfiguration cfg, IHostEnvironment env, ILogger<WanClient> log)
@@ -36,6 +37,11 @@ public sealed class WanClient
         var i2vWorkflowPath = cfg["WAN_I2V_WORKFLOW_PATH"]
             ?? Path.Combine(env.ContentRootPath, "workflows", "wan22-i2v.json");
         _i2vWorkflowJson = new Lazy<string>(() => File.ReadAllText(i2vWorkflowPath));
+        // FLUX.1 Schnell text-to-image workflow (ComfyUI core CheckpointLoaderSimple).
+        // Runs on the same A100 as Wan2.2 for fast, high-quality character portraits.
+        var fluxWorkflowPath = cfg["WAN_FLUX_WORKFLOW_PATH"]
+            ?? Path.Combine(env.ContentRootPath, "workflows", "flux-schnell.json");
+        _fluxWorkflowJson = new Lazy<string>(() => File.ReadAllText(fluxWorkflowPath));
     }
 
     /// <summary>
@@ -76,6 +82,69 @@ public sealed class WanClient
             .Replace("__FRAMES__", frames.ToString(System.Globalization.CultureInfo.InvariantCulture))
             .Replace("__SEED__", seed.ToString(System.Globalization.CultureInfo.InvariantCulture));
         return await PostGraphAsync(workflow, ct);
+    }
+
+    /// <summary>
+    /// Generate a still image with FLUX.1 Schnell (text-to-image) on the same A100 that
+    /// runs Wan2.2. Submits the FLUX workflow graph, polls /history until the SaveImage
+    /// node emits an output, and returns the (filename, subfolder) of the produced PNG
+    /// (download it with <see cref="DownloadAsync"/>). FLUX Schnell is a 4-step model so a
+    /// portrait renders in a few seconds once the checkpoint is resident in VRAM.
+    /// </summary>
+    public async Task<(string filename, string? subfolder)> GenerateImageAsync(
+        string prompt, int width, int height, CancellationToken ct)
+    {
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
+        // FLUX likes dims that are multiples of 16; clamp to a sane portrait/landscape range.
+        var w = Math.Clamp((width / 16) * 16, 256, 1536);
+        var h = Math.Clamp((height / 16) * 16, 256, 1536);
+        var seed = Random.Shared.NextInt64() & 0x7FFFFFFFFFFFFFFFL;
+        var workflow = _fluxWorkflowJson.Value
+            .Replace("__PROMPT__", JsonSerializer.Serialize(prompt ?? string.Empty))
+            .Replace("__WIDTH__", w.ToString(inv))
+            .Replace("__HEIGHT__", h.ToString(inv))
+            .Replace("__SEED__", seed.ToString(inv));
+        var promptId = await PostGraphAsync(workflow, ct);
+
+        var http = _hf.CreateClient();
+        http.Timeout = TimeSpan.FromSeconds(30);
+        if (!string.IsNullOrEmpty(_authKey)) http.DefaultRequestHeaders.Add("X-Wan-Auth", _authKey);
+
+        // FLUX Schnell is fast, but the first call after a cold start must also load the
+        // ~17 GB checkpoint into VRAM — allow generous headroom before giving up.
+        var deadline = DateTime.UtcNow.AddMinutes(6);
+        while (DateTime.UtcNow < deadline)
+        {
+            ct.ThrowIfCancellationRequested();
+            using var hResp = await http.GetAsync($"{_baseUrl}/history/{Uri.EscapeDataString(promptId)}", ct);
+            if (hResp.IsSuccessStatusCode)
+            {
+                using var hist = JsonDocument.Parse(await hResp.Content.ReadAsStringAsync(ct));
+                if (hist.RootElement.TryGetProperty(promptId, out var entry))
+                {
+                    if (entry.TryGetProperty("status", out var st) &&
+                        st.TryGetProperty("status_str", out var ss) &&
+                        string.Equals(ss.GetString(), "error", StringComparison.OrdinalIgnoreCase))
+                        throw new InvalidOperationException("FLUX image generation failed in ComfyUI (check checkpoint is on the share).");
+
+                    if (entry.TryGetProperty("outputs", out var outs))
+                    {
+                        foreach (var node in outs.EnumerateObject())
+                        {
+                            if (node.Value.TryGetProperty("images", out var imgs) && imgs.GetArrayLength() > 0)
+                            {
+                                var fn = imgs[0].GetProperty("filename").GetString()
+                                    ?? throw new InvalidOperationException("FLUX output had no filename");
+                                string? sf = imgs[0].TryGetProperty("subfolder", out var s) ? s.GetString() : null;
+                                return (fn, sf);
+                            }
+                        }
+                    }
+                }
+            }
+            await Task.Delay(1500, ct);
+        }
+        throw new TimeoutException("FLUX image generation timed out.");
     }
 
     /// <summary>
