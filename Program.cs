@@ -1256,11 +1256,98 @@ Produce the {clipCount}-clip storyboard ({clipSeconds}s per clip, {clipCount * c
     if (!resp.IsSuccessStatusCode)
         return Results.Problem($"Storyboard failed ({(int)resp.StatusCode}): {body}");
 
-    using var doc = JsonDocument.Parse(body);
-    var raw = doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString()?.Trim() ?? "{}";
+    object BuildFallbackStoryboard()
+    {
+        var clean = (req.Prompt ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(clean)) clean = "A cinematic story";
+        var titleWords = string.Join(" ", clean.Split(' ', StringSplitOptions.RemoveEmptyEntries).Take(5));
+        var title = string.IsNullOrWhiteSpace(titleWords) ? "Continuous Story" : titleWords;
+        var clips = Enumerable.Range(1, clipCount).Select(i =>
+        {
+            var phase = i == 1 ? "setup" : i == clipCount ? "resolution" : "development";
+            var camera = i % 3 == 1 ? "slow push-in" : i % 3 == 2 ? "handheld follow" : "steady tracking";
+            return new
+            {
+                index = i,
+                title = $"Beat {i}",
+                action = i == 1
+                    ? "The story begins with a clear establishing action that introduces the scene and intention."
+                    : i == clipCount
+                        ? "The action resolves naturally into a clear ending moment that concludes the story."
+                        : "The action advances the situation with a visible change that raises stakes and momentum.",
+                camera,
+                motionPrompt = $"First frame continues seamlessly from the previous clip. Over {clipSeconds} seconds, show a {phase} beat for this story idea: {clean}. Keep movement clear and progressive, with realistic timing and physical continuity. Maintain the same cinematic style and lighting throughout. No on-screen text, captions, or watermarks.",
+                endState = i == clipCount
+                    ? "Final frame settles into a composed ending shot that feels complete."
+                    : "Final frame lands in a stable pose and framing that can continue seamlessly into the next clip."
+            };
+        }).ToArray();
+
+        return new
+        {
+            title,
+            logline = clean,
+            subject = "the main subject from the character image",
+            style = "photoreal cinematic look, natural color grade, consistent lensing and lighting",
+            setting = "one continuous environment with smooth spatial continuity",
+            clipSeconds,
+            clipCount,
+            clips
+        };
+    }
+
+    string raw = "";
+    try
+    {
+        using var doc = JsonDocument.Parse(body);
+        var content = doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content");
+        if (content.ValueKind == JsonValueKind.String)
+        {
+            raw = content.GetString() ?? "";
+        }
+        else if (content.ValueKind == JsonValueKind.Array)
+        {
+            var sb = new StringBuilder();
+            foreach (var part in content.EnumerateArray())
+            {
+                if (part.ValueKind == JsonValueKind.String)
+                {
+                    sb.Append(part.GetString());
+                }
+                else if (part.ValueKind == JsonValueKind.Object
+                         && part.TryGetProperty("text", out var txt)
+                         && txt.ValueKind == JsonValueKind.String)
+                {
+                    sb.Append(txt.GetString());
+                }
+            }
+            raw = sb.ToString();
+        }
+    }
+    catch
+    {
+        raw = "";
+    }
+
+    raw = (raw ?? "").Trim();
+    if (string.IsNullOrWhiteSpace(raw))
+    {
+        var fallback = BuildFallbackStoryboard();
+        return Results.Ok(new { story = fallback, clipSeconds, clipCount, totalSeconds, size, fallback = true });
+    }
+
+    var jsonStart = raw.IndexOf('{');
+    var jsonEnd = raw.LastIndexOf('}');
+    if (jsonStart >= 0 && jsonEnd > jsonStart)
+        raw = raw.Substring(jsonStart, jsonEnd - jsonStart + 1);
+
     object? story;
     try { story = JsonSerializer.Deserialize<object>(raw); }
-    catch { return Results.Problem($"Storyboard returned non-JSON: {raw[..Math.Min(raw.Length, 400)]}"); }
+    catch
+    {
+        var fallback = BuildFallbackStoryboard();
+        return Results.Ok(new { story = fallback, clipSeconds, clipCount, totalSeconds, size, fallback = true });
+    }
 
     return Results.Ok(new { story, clipSeconds, clipCount, totalSeconds, size });
 });
