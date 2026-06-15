@@ -1570,9 +1570,7 @@ Remember to use the [STORY] [/STORY] and [DIALOGUE] [/DIALOGUE] delimiters.";
                 new { role = "system", content = systemPrompt },
                 new { role = "user", content = userPrompt }
             },
-            temperature = 0.8m,
-            max_completion_tokens = 400,
-            top_p = 0.9m
+            max_completion_tokens = 400
         };
 
         using var msg = new HttpRequestMessage(HttpMethod.Post,
