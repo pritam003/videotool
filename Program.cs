@@ -136,6 +136,113 @@ static BlobContainerClient Container(IConfiguration c, TokenCredential cred)
     return svc.GetBlobContainerClient(name);
 }
 
+// ── LLM-based translation (gpt-5-mini) ────────────────────────────────────────
+// Azure Translator produces stiff, literal Hindi/Bengali; the chat model translates far
+// more naturally (idiom, tone, register) and always in NATIVE SCRIPT. Used by /api/narrate
+// and /api/translate, with Azure Translator kept as an automatic fallback.
+static string TranslateLangName(string? code) => (code ?? "").Trim().ToLowerInvariant() switch
+{
+    "hi" => "Hindi",   "bn" => "Bengali",  "ta" => "Tamil",     "te" => "Telugu",
+    "mr" => "Marathi", "gu" => "Gujarati", "kn" => "Kannada",   "ml" => "Malayalam",
+    "pa" => "Punjabi", "ur" => "Urdu",     "or" => "Odia",      "as" => "Assamese",
+    "ne" => "Nepali",  "en" => "English",
+    _ => string.IsNullOrWhiteSpace(code) ? "the target language" : code!
+};
+
+// True when `text` already contains a meaningful share of the target language's native
+// script — so we SKIP re-translating storyboard text that is already native Devanagari/
+// Bengali/etc. (avoids latency and avoids mangling already-good text).
+static bool AlreadyInScript(string text, string? code)
+{
+    if (string.IsNullOrWhiteSpace(text)) return false;
+    (int lo, int hi) = (code ?? "").Trim().ToLowerInvariant() switch
+    {
+        "hi" or "mr" or "ne" => (0x0900, 0x097F), // Devanagari
+        "bn" or "as"         => (0x0980, 0x09FF), // Bengali / Assamese
+        "pa"                 => (0x0A00, 0x0A7F), // Gurmukhi (Punjabi)
+        "gu"                 => (0x0A80, 0x0AFF), // Gujarati
+        "or"                 => (0x0B00, 0x0B7F), // Odia
+        "ta"                 => (0x0B80, 0x0BFF), // Tamil
+        "te"                 => (0x0C00, 0x0C7F), // Telugu
+        "kn"                 => (0x0C80, 0x0CFF), // Kannada
+        "ml"                 => (0x0D00, 0x0D7F), // Malayalam
+        "ur"                 => (0x0600, 0x06FF), // Arabic (Urdu)
+        _ => (0, 0)
+    };
+    if (lo == 0) return false;
+    int inScript = 0, letters = 0;
+    foreach (var ch in text)
+        if (char.IsLetter(ch)) { letters++; if (ch >= lo && ch <= hi) inScript++; }
+    return letters > 0 && inScript >= letters * 0.5;
+}
+
+// Translate `text` into the language named by `targetCode` (e.g. "hi") using the chat
+// model. Returns null on any failure so the caller can fall back to Azure Translator.
+static async Task<string?> LlmTranslateAsync(string text, string? targetCode,
+    IHttpClientFactory hf, IConfiguration cfg, CancellationToken ct)
+{
+    if (string.IsNullOrWhiteSpace(text)) return null;
+    string endpoint, key, deployment;
+    try
+    {
+        endpoint = Cfg(cfg, "AOAI_ENDPOINT").TrimEnd('/');
+        key = Cfg(cfg, "AOAI_KEY");
+        deployment = cfg["CHAT_DEPLOYMENT"] ?? "gpt-4o-mini";
+    }
+    catch { return null; }
+
+    var langName = TranslateLangName(targetCode);
+    var sys = $@"You are an expert literary translator and film dialogue writer.
+Translate the user's text into {langName}, written ONLY in its NATIVE SCRIPT (Devanagari for Hindi/Marathi, Bengali script for Bengali, Tamil script for Tamil, etc.) — NEVER romanized or transliterated into Latin letters.
+Rules:
+- Produce NATURAL, idiomatic, emotionally faithful {langName} the way a native screenwriter would actually say it for a voiceover — NOT a stiff word-for-word gloss. Preserve tone, emotion and subtext.
+- Keep roughly the same length and keep it smoothly speakable aloud. Keep real proper names as themselves.
+- If the text is ALREADY in {langName}, simply return it (only fixing obvious errors); do not change its meaning.
+- Output ONLY the translated text — no quotes, no notes, no alternatives, no explanation.";
+
+    var client = hf.CreateClient();
+    client.Timeout = TimeSpan.FromSeconds(60);
+    for (int attempt = 1; attempt <= 2; attempt++)
+    {
+        try
+        {
+            var payload = new
+            {
+                messages = new object[] {
+                    new { role = "system", content = sys },
+                    new { role = "user",   content = text }
+                },
+                max_completion_tokens = 2000,
+                reasoning_effort = "low"
+            };
+            using var msg = new HttpRequestMessage(HttpMethod.Post,
+                $"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=2024-10-21");
+            msg.Headers.Add("api-key", key);
+            msg.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+            using var resp = await client.SendAsync(msg, ct);
+            var body = await resp.Content.ReadAsStringAsync(ct);
+            if (!resp.IsSuccessStatusCode)
+            {
+                var transient = (int)resp.StatusCode == 429 || (int)resp.StatusCode == 408 || (int)resp.StatusCode >= 500;
+                if (transient && attempt < 2) { await Task.Delay(1000, ct); continue; }
+                return null;
+            }
+            string outText;
+            try
+            {
+                using var doc = JsonDocument.Parse(body);
+                outText = doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString() ?? "";
+            }
+            catch { outText = ""; }
+            outText = outText.Trim().Trim('"', '\u201c', '\u201d').Trim();
+            return string.IsNullOrWhiteSpace(outText) ? null : outText;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch { if (attempt >= 2) return null; try { await Task.Delay(1000, ct); } catch { return null; } }
+    }
+    return null;
+}
+
 // Streaming upload: avoids buffering large payloads (e.g. Sora MP4 downloads) in memory.
 // Critical on App Service F1 (1GB RAM) where a few concurrent finalize calls + a byte[]
 // MP4 was OOM-recycling the container mid-request. byte[] callers wrap with MemoryStream
@@ -1831,25 +1938,35 @@ app.MapPost("/api/narrate", async (NarrateRequest req, IHttpClientFactory hf,
     var lang = voice.Length >= 5 && voice[2] == '-' ? voice.Substring(0, 5) : "en-US";
     var langPrefix = lang.Substring(0, 2).ToLowerInvariant();
 
-    // Auto-translate to target language if voice is non-English (Bengali, Hindi, etc.)
+    // Translate to the target language when the voice is non-English (Hindi, Bengali, …).
+    // Prefer the LLM (natural, native-script) and fall back to Azure Translator; SKIP entirely
+    // when the text is already in the target script (e.g. the storyboard already wrote Devanagari).
     var text = req.Text!;
-    if (langPrefix != "en")
+    if (langPrefix != "en" && !AlreadyInScript(text, langPrefix))
     {
-        var client0 = hf.CreateClient();
-        client0.Timeout = TimeSpan.FromSeconds(30);
-        using var trMsg = new HttpRequestMessage(HttpMethod.Post,
-            $"https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to={langPrefix}");
-        trMsg.Headers.Add("Ocp-Apim-Subscription-Key", key);
-        trMsg.Headers.Add("Ocp-Apim-Subscription-Region", region);
-        trMsg.Content = new StringContent(
-            System.Text.Json.JsonSerializer.Serialize(new[] { new { Text = text } }),
-            Encoding.UTF8, "application/json");
-        using var trResp = await client0.SendAsync(trMsg, ct);
-        if (trResp.IsSuccessStatusCode)
+        var llm = await LlmTranslateAsync(text, langPrefix, hf, cfg, ct);
+        if (!string.IsNullOrWhiteSpace(llm))
         {
-            using var doc = System.Text.Json.JsonDocument.Parse(await trResp.Content.ReadAsStringAsync(ct));
-            var translated = doc.RootElement[0].GetProperty("translations")[0].GetProperty("text").GetString();
-            if (!string.IsNullOrWhiteSpace(translated)) text = translated!;
+            text = llm!;
+        }
+        else
+        {
+            var client0 = hf.CreateClient();
+            client0.Timeout = TimeSpan.FromSeconds(30);
+            using var trMsg = new HttpRequestMessage(HttpMethod.Post,
+                $"https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to={langPrefix}");
+            trMsg.Headers.Add("Ocp-Apim-Subscription-Key", key);
+            trMsg.Headers.Add("Ocp-Apim-Subscription-Region", region);
+            trMsg.Content = new StringContent(
+                System.Text.Json.JsonSerializer.Serialize(new[] { new { Text = text } }),
+                Encoding.UTF8, "application/json");
+            using var trResp = await client0.SendAsync(trMsg, ct);
+            if (trResp.IsSuccessStatusCode)
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(await trResp.Content.ReadAsStringAsync(ct));
+                var translated = doc.RootElement[0].GetProperty("translations")[0].GetProperty("text").GetString();
+                if (!string.IsNullOrWhiteSpace(translated)) text = translated!;
+            }
         }
     }
 
@@ -1919,6 +2036,12 @@ app.MapPost("/api/translate", async (TranslateRequest req, IHttpClientFactory hf
 {
     if (string.IsNullOrWhiteSpace(req.Text) || string.IsNullOrWhiteSpace(req.To))
         return Results.BadRequest(new { error = "text and to are required" });
+
+    // Prefer the LLM translator (natural, native-script Hindi/Bengali/etc.); fall back to Azure below.
+    var llmTr = await LlmTranslateAsync(req.Text!, req.To, hf, cfg, ct);
+    if (!string.IsNullOrWhiteSpace(llmTr))
+        return Results.Ok(new { translated = llmTr, to = req.To });
+
     var key = Cfg(cfg, "AOAI_KEY");
     var region = Cfg(cfg, "SPEECH_REGION");
     var client = hf.CreateClient();
