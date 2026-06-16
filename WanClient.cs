@@ -19,6 +19,7 @@ public sealed class WanClient
     private readonly Lazy<string> _workflowJson;
     private readonly Lazy<string> _i2vWorkflowJson;
     private readonly Lazy<string> _fluxWorkflowJson;
+    private readonly Lazy<string> _foleyWorkflowJson;
     private readonly ILogger<WanClient> _log;
 
     public WanClient(IHttpClientFactory hf, IConfiguration cfg, IHostEnvironment env, ILogger<WanClient> log)
@@ -42,6 +43,13 @@ public sealed class WanClient
         var fluxWorkflowPath = cfg["WAN_FLUX_WORKFLOW_PATH"]
             ?? Path.Combine(env.ContentRootPath, "workflows", "flux-schnell.json");
         _fluxWorkflowJson = new Lazy<string>(() => File.ReadAllText(fluxWorkflowPath));
+        // HunyuanVideo-Foley workflow (neural video->audio SFX/ambience). Only loaded when the
+        // gated /api/foley endpoint is hit (WAN_AUDIO_ENABLED + the audio-enabled GPU image with
+        // the ComfyUI-HunyuanVideoFoley custom node + weights on the share). The file is a
+        // starter graph — validate node ids against the installed node version at activation.
+        var foleyWorkflowPath = cfg["WAN_FOLEY_WORKFLOW_PATH"]
+            ?? Path.Combine(env.ContentRootPath, "workflows", "hunyuan-foley.json");
+        _foleyWorkflowJson = new Lazy<string>(() => File.ReadAllText(foleyWorkflowPath));
     }
 
     /// <summary>
@@ -392,5 +400,102 @@ public sealed class WanClient
         if (!string.IsNullOrEmpty(subfolder)) url += $"&subfolder={Uri.EscapeDataString(subfolder)}";
 
         return await http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
+    }
+
+    /// <summary>
+    /// Neural foley: synthesize a synced SFX/ambience track FROM a rendered clip using
+    /// HunyuanVideo-Foley on the GPU. Uploads the video into ComfyUI's input dir, runs the
+    /// foley workflow, polls /history, then downloads and returns the produced audio bytes +
+    /// content type. Requires the audio-enabled GPU image (ComfyUI-HunyuanVideoFoley node +
+    /// weights on the share). Throws if the node/weights/output aren't present, so the caller
+    /// (the gated /api/foley endpoint) can fall back to the procedural soundscape.
+    /// </summary>
+    public async Task<(byte[] audio, string contentType)> RunFoleyAsync(
+        Stream video, string videoFilename, string prompt, CancellationToken ct)
+    {
+        var inputName = await UploadVideoAsync(video, videoFilename, ct);
+        var workflow = _foleyWorkflowJson.Value
+            .Replace("__VIDEO__", JsonSerializer.Serialize(inputName))
+            .Replace("__PROMPT__", JsonSerializer.Serialize(prompt ?? string.Empty));
+        var promptId = await PostGraphAsync(workflow, ct);
+
+        var http = _hf.CreateClient();
+        http.Timeout = TimeSpan.FromSeconds(30);
+        if (!string.IsNullOrEmpty(_authKey)) http.DefaultRequestHeaders.Add("X-Wan-Auth", _authKey);
+
+        var deadline = DateTime.UtcNow.AddMinutes(6);
+        while (DateTime.UtcNow < deadline)
+        {
+            ct.ThrowIfCancellationRequested();
+            using var hResp = await http.GetAsync($"{_baseUrl}/history/{Uri.EscapeDataString(promptId)}", ct);
+            if (hResp.IsSuccessStatusCode)
+            {
+                using var hist = JsonDocument.Parse(await hResp.Content.ReadAsStringAsync(ct));
+                if (hist.RootElement.TryGetProperty(promptId, out var entry))
+                {
+                    if (entry.TryGetProperty("status", out var st) &&
+                        st.TryGetProperty("status_str", out var ss) &&
+                        string.Equals(ss.GetString(), "error", StringComparison.OrdinalIgnoreCase))
+                        throw new InvalidOperationException("HunyuanVideo-Foley failed in ComfyUI (check the audio node + weights are present).");
+
+                    if (entry.TryGetProperty("outputs", out var outs))
+                    {
+                        foreach (var node in outs.EnumerateObject())
+                        {
+                            // SaveAudio emits under "audio"; some video-foley nodes re-mux and emit
+                            // under "gifs"/"videos" — accept whichever the installed node produces.
+                            foreach (var key in new[] { "audio", "gifs", "videos" })
+                            {
+                                if (node.Value.TryGetProperty(key, out var arr) && arr.GetArrayLength() > 0)
+                                {
+                                    var fn = arr[0].GetProperty("filename").GetString()
+                                        ?? throw new InvalidOperationException("foley output had no filename");
+                                    string? sf = arr[0].TryGetProperty("subfolder", out var s) ? s.GetString() : null;
+                                    using var dl = await DownloadAsync(fn, sf, ct);
+                                    dl.EnsureSuccessStatusCode();
+                                    var bytes = await dl.Content.ReadAsByteArrayAsync(ct);
+                                    var ctype = dl.Content.Headers.ContentType?.ToString() ?? "audio/wav";
+                                    return (bytes, ctype);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            await Task.Delay(1500, ct);
+        }
+        throw new TimeoutException("HunyuanVideo-Foley timed out.");
+    }
+
+    /// <summary>
+    /// Upload a video into ComfyUI's input directory so a VHS_LoadVideo node can read it.
+    /// ComfyUI's core /upload/image endpoint stores any uploaded file into input/ (the field is
+    /// historically named "image"); the returned name is what the workflow's loader references.
+    /// </summary>
+    private async Task<string> UploadVideoAsync(Stream video, string filename, CancellationToken ct)
+    {
+        var http = _hf.CreateClient();
+        http.Timeout = TimeSpan.FromMinutes(3);
+        using var content = new MultipartFormDataContent();
+        var fileContent = new StreamContent(video);
+        fileContent.Headers.ContentType = new MediaTypeHeaderValue("video/mp4");
+        content.Add(fileContent, "image", filename);
+        content.Add(new StringContent("true"), "overwrite");
+        content.Add(new StringContent("input"), "type");
+
+        using var req = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/upload/image") { Content = content };
+        if (!string.IsNullOrEmpty(_authKey)) req.Headers.Add("X-Wan-Auth", _authKey);
+
+        using var resp = await http.SendAsync(req, ct);
+        var body = await resp.Content.ReadAsStringAsync(ct);
+        if (!resp.IsSuccessStatusCode)
+            throw new InvalidOperationException($"ComfyUI video upload failed ({(int)resp.StatusCode}): {body}");
+
+        using var doc = JsonDocument.Parse(body);
+        var name = doc.RootElement.GetProperty("name").GetString()
+            ?? throw new InvalidOperationException("ComfyUI upload did not return a name");
+        if (doc.RootElement.TryGetProperty("subfolder", out var sf) && !string.IsNullOrEmpty(sf.GetString()))
+            name = $"{sf.GetString()}/{name}";
+        return name;
     }
 }

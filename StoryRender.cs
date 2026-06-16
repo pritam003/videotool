@@ -60,6 +60,12 @@ public sealed record StorySpec
     public List<CastMemberSpec> Cast { get; init; } = new();
     public string? BackgroundMusic { get; init; }   // mood: "" | cinematic | dramatic | ambient | uplifting | suspenseful
     public double MusicVolume { get; init; } = 0.5;  // 0–1 bed level for the background music
+    public bool Soundscape { get; init; } = true;    // lay a per-clip ambient bed (wind/rain/crowd/room…) under the voice
+    public double SoundscapeVolume { get; init; } = 0.5; // 0–1 level for the ambient bed
+    // Allow the worker to try GPU HunyuanVideo-Foley first (real synced SFX) and fall back to the
+    // procedural bed. Defaults true so activation is a SINGLE server switch: until WAN_AUDIO_ENABLED
+    // is set, /api/foley returns 501 instantly (no GPU touched) and the procedural bed is used.
+    public bool NeuralFoley { get; init; } = true;
 }
 
 public sealed class StoryJob
@@ -414,6 +420,7 @@ public sealed class StoryRenderWorker : BackgroundService
             // Per-clip audio: a NARRATOR voiceover carries the story where dialogue can't, plus
             // the character's spoken line at key beats — whichever the storyboard provides for
             // this clip. Narration first, then dialogue; fit the shot to the audio so nothing cuts.
+            var clipHasVoice = false;
             if (narrating)
             {
                 try
@@ -456,10 +463,67 @@ public sealed class StoryRenderWorker : BackgroundService
                             new { videoUrl = clipUrl, audioUrl, mode = "fit" }, ct);
                         clipUrl = mr.GetProperty("url").GetString()!;
                         anyAudio = true;
+                        clipHasVoice = true;
                     }
                 }
                 catch (OperationCanceledException) { throw; }
                 catch (Exception ex) { _log.LogWarning(ex, "{Label} audio failed; clip kept silent", label); }
+            }
+
+            // Per-clip AMBIENT SOUNDSCAPE: give the shot a sense of place (wind/rain/crowd/room/
+            // waves/city…) drawn from its mood + location + action, laid UNDER the voice with
+            // sidechain ducking so dialogue stays crisp. This is the always-available FREE bed;
+            // when NeuralFoley is on AND the GPU audio image is live, prefer real synced foley and
+            // fall back to the procedural bed on any failure. Best-effort — never blocks the film.
+            if (spec.Soundscape)
+            {
+                try
+                {
+                    job.Label = $"{label}: ambient sound";
+                    string? bedUrl = null;
+
+                    if (spec.NeuralFoley)
+                    {
+                        try
+                        {
+                            var (code, body) = await PostJsonRawAsync("/api/foley",
+                                new { videoUrl = clipUrl, prompt = S(clip["action"], ""), size }, ct);
+                            if (code >= 200 && code < 300)
+                                bedUrl = JsonDocument.Parse(body).RootElement.GetProperty("url").GetString();
+                            else
+                                _log.LogInformation("{Label} neural foley unavailable ({Code}); using procedural soundscape", label, code);
+                        }
+                        catch (OperationCanceledException) { throw; }
+                        catch (Exception fx) { _log.LogInformation(fx, "{Label} neural foley failed; using procedural soundscape", label); }
+                    }
+
+                    if (string.IsNullOrWhiteSpace(bedUrl))
+                    {
+                        var locText = ResolveLocationText(clip, story);
+                        var sg = await PostJsonAsync("/api/generate-soundscape", new
+                        {
+                            mood = S(clip["mood"], ""),
+                            location = locText,
+                            action = S(clip["action"], ""),
+                            durationSeconds = clipSec + 5,
+                            volume = spec.SoundscapeVolume
+                        }, ct);
+                        bedUrl = sg.GetProperty("url").GetString();
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(bedUrl))
+                    {
+                        // Duck the bed under the voice when the clip already has a spoken track;
+                        // otherwise the bed simply becomes the clip's sound (trimmed to the shot).
+                        var mode = clipHasVoice ? "duckmix" : "replace";
+                        var mm = await PostJsonAsync("/api/mux-audio",
+                            new { videoUrl = clipUrl, audioUrl = bedUrl, mode }, ct);
+                        var withBed = mm.GetProperty("url").GetString();
+                        if (!string.IsNullOrWhiteSpace(withBed)) { clipUrl = withBed!; anyAudio = true; }
+                    }
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex) { _log.LogWarning(ex, "{Label} soundscape failed; clip kept as-is", label); }
             }
 
             finals.Add(clipUrl);
@@ -547,6 +611,19 @@ public sealed class StoryRenderWorker : BackgroundService
         if (Has("angry", "furious", "rage", "frustrat")) return "angry";
         if (Has("serious", "solemn", "grave", "stern", "somber", "sombre")) return "serious";
         return "";
+    }
+
+    // Resolve a clip's location id to a "Name, description" string for the soundscape keyword
+    // match; falls back to the story-level setting, then the raw location id.
+    private static string ResolveLocationText(JsonNode clip, JsonNode story)
+    {
+        var locId = S(clip["location"], "");
+        if (story["locations"] is JsonArray sl)
+            foreach (var l in sl)
+                if (l is not null && S(l["id"], "") == locId)
+                    return $"{S(l["name"], "")}, {S(l["description"], "")}";
+        var setting = S(story["setting"], "");
+        return setting.Length > 0 ? setting : locId;
     }
 
     private static string CastSnapshotPrompt(CastWork c, JsonNode story)

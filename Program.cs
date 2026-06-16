@@ -842,6 +842,13 @@ app.MapPost("/api/mux-audio", async (MuxAudioRequest req, IHttpClientFactory hf,
             // audio. normalize=0 keeps narration at full volume; duration=first clamps the
             // mix to the film's audio so over-long music is trimmed to the film.
             ? $"-y -i \"{vIn}\" -i \"{aIn}\" -filter_complex \"[0:a][1:a]amix=inputs=2:duration=first:normalize=0[a]\" -map 0:v -map \"[a]\" -c:v copy -c:a aac -b:a 192k -movflags +faststart \"{outPath}\""
+            : mode == "duckmix"
+            // Lay an ambient soundscape bed (input 1) UNDER the video's existing spoken track
+            // (input 0) with broadcast-style DUCKING: a sidechain compressor keyed off the voice
+            // dips the bed whenever someone speaks, then lifts it back in the gaps — so dialogue
+            // stays crisp and the scene still feels alive. duration=first trims the bed to the shot;
+            // normalize=0 keeps the voice at full level. Requires input 0 to already carry audio.
+            ? $"-y -i \"{vIn}\" -i \"{aIn}\" -filter_complex \"[1:a][0:a]sidechaincompress=threshold=0.03:ratio=8:attack=20:release=300[duck];[0:a][duck]amix=inputs=2:duration=first:normalize=0[a]\" -map 0:v -map \"[a]\" -c:v copy -c:a aac -b:a 192k -movflags +faststart \"{outPath}\""
             : $"-y -i \"{vIn}\" -i \"{aIn}\" -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 192k -shortest -movflags +faststart \"{outPath}\"";
 
         var (ec, stderr) = await RunProcessAsync(ffmpeg, args, ct);
@@ -983,6 +990,102 @@ app.MapPost("/api/generate-background-music", async (GenerateBackgroundMusicRequ
     }
 });
 
+// Generate a per-clip AMBIENT SOUNDSCAPE (room tone / wind / rain / crowd / waves / city / fire …)
+// from the clip's mood + location + action keywords, so every shot has a real sense of place
+// instead of dead silence. It is FREE and GPU-free — synthesized with ffmpeg noise sources + filters
+// (no samples, no model) — and the worker lays it UNDER the spoken track with sidechain ducking.
+// (For true neural SFX synced to the picture, activate /api/foley; this is the always-available bed.)
+app.MapPost("/api/generate-soundscape", async (SoundscapeRequest req,
+    IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
+{
+    var durationSec = Math.Clamp(req?.DurationSeconds ?? 6, 2, 60);
+    // The bed sits UNDER the voice; keep its absolute level low. Slider 0–1 → modest level.
+    var bedVol = Math.Clamp(req?.Volume ?? 0.5, 0, 1) * 0.32;
+
+    var ffmpeg = LocateFfmpeg();
+    if (ffmpeg is null)
+        return Results.Problem("ffmpeg binary not found. Expected at ./bin/ffmpeg (bundled by CI).");
+
+    var work = Path.Combine(Path.GetTempPath(), $"ss-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(work);
+    try
+    {
+        var outPath = Path.Combine(work, "out.wav");
+        var ci = System.Globalization.CultureInfo.InvariantCulture;
+        var keywords = $"{req?.Location} {req?.Mood} {req?.Action}".ToLowerInvariant();
+        var (chain, kind) = SoundscapeChain(keywords);
+
+        var v = bedVol.ToString("0.###", ci);
+        var fadeOut = Math.Max(0, durationSec - 1).ToString(ci);
+        // `chain` is a single -f lavfi source+filter graph with a __DUR__ placeholder; append
+        // the bed volume and gentle in/out fades so clips don't click at the cut.
+        var lavfi = chain.Replace("__DUR__", durationSec.ToString(ci))
+                  + $",volume={v},afade=t=in:st=0:d=0.8,afade=t=out:st={fadeOut}:d=1";
+        var args = $"-f lavfi -i \"{lavfi}\" -c:a pcm_s16le -y \"{outPath}\"";
+
+        var (ec, stderr) = await RunProcessAsync(ffmpeg, args, ct);
+        if (ec != 0 || !File.Exists(outPath))
+            return Results.Problem($"ffmpeg soundscape failed (exit {ec}): {stderr.Substring(0, Math.Min(stderr.Length, 1500))}");
+
+        var wav = await File.ReadAllBytesAsync(outPath, ct);
+        var account = Cfg(cfg, "STORAGE_ACCOUNT");
+        var svc = new BlobServiceClient(new Uri($"https://{account}.blob.core.windows.net"), cred);
+        var container = svc.GetBlobContainerClient(cfg["STORAGE_CONTAINER"] ?? "videos");
+        var name = $"soundscape/{DateTime.UtcNow:yyyyMMdd-HHmmss}-{kind}-{Guid.NewGuid():N}.wav";
+        using var ms = new MemoryStream(wav);
+        var url = await UploadAndSign(container, name, ms, "audio/wav", svc, account, ct);
+        return Results.Ok(new { url, blob = name, bytes = wav.Length, kind });
+    }
+    finally
+    {
+        try { Directory.Delete(work, recursive: true); } catch { }
+    }
+});
+
+// NEURAL FOLEY (HunyuanVideo-Foley) — generate real SFX/ambience synced to a rendered clip on the
+// GPU. This is the optional UPGRADE over the procedural soundscape above. It is GATED behind
+// WAN_AUDIO_ENABLED=1 AND the audio-enabled GPU image (the ComfyUI-HunyuanVideoFoley custom node +
+// its weights staged to the model share). Until activated it returns 501 so the render worker
+// transparently falls back to /api/generate-soundscape — nothing breaks if it's never turned on.
+app.MapPost("/api/foley", async (FoleyRequest req, WanClient wan, IHttpClientFactory hf,
+    IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
+{
+    var enabled = string.Equals(cfg["WAN_AUDIO_ENABLED"], "1", StringComparison.Ordinal)
+               || string.Equals(cfg["WAN_AUDIO_ENABLED"], "true", StringComparison.OrdinalIgnoreCase);
+    if (!enabled)
+        return Results.StatusCode(501); // not activated — caller uses the procedural soundscape
+    if (string.IsNullOrWhiteSpace(req?.VideoUrl))
+        return Results.BadRequest(new { error = "videoUrl is required" });
+    try
+    {
+        var http = hf.CreateClient();
+        http.Timeout = TimeSpan.FromMinutes(3);
+        using var vresp = await http.GetAsync(req.VideoUrl, HttpCompletionOption.ResponseHeadersRead, ct);
+        vresp.EnsureSuccessStatusCode();
+        await using var vstream = await vresp.Content.ReadAsStreamAsync(ct);
+        var (audio, ctype) = await wan.RunFoleyAsync(vstream, $"foley-{Guid.NewGuid():N}.mp4", req.Prompt ?? "", ct);
+
+        var ext = ctype.Contains("wav", StringComparison.OrdinalIgnoreCase) ? "wav"
+                : (ctype.Contains("mpeg", StringComparison.OrdinalIgnoreCase) || ctype.Contains("mp3", StringComparison.OrdinalIgnoreCase)) ? "mp3"
+                : "wav";
+        var account = Cfg(cfg, "STORAGE_ACCOUNT");
+        var svc = new BlobServiceClient(new Uri($"https://{account}.blob.core.windows.net"), cred);
+        var container = svc.GetBlobContainerClient(cfg["STORAGE_CONTAINER"] ?? "videos");
+        var name = $"foley/{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}.{ext}";
+        using var ms = new MemoryStream(audio);
+        var url = await UploadAndSign(container, name, ms, ctype, svc, account, ct);
+        return Results.Ok(new { url, blob = name, bytes = audio.Length });
+    }
+    catch (Exception ex) when (IsWarmingError(ex))
+    {
+        return Results.Json(new { warming = true }, statusCode: 503);
+    }
+    catch (Exception ex) when (!ct.IsCancellationRequested)
+    {
+        return Results.Problem($"foley failed: {ex.Message}");
+    }
+});
+
 // Re-sign a stored blob URL with a fresh short-lived SAS so persisted story-job
 // result/clip URLs (signed once at render time with a 2h SAS) keep playing afterwards.
 // Any failure (not our blob, parse error) returns the original URL unchanged.
@@ -1026,6 +1129,40 @@ static async Task<(string account, string container, Azure.Storage.Blobs.Models.
         return (account, container, udk.Value);
     }
     catch { return null; }
+}
+
+// Map a clip's location + mood + action keywords onto a single ffmpeg lavfi ambience graph
+// (a noise source + character filters with a __DUR__ duration placeholder). Place wins over
+// mood; mood tints when no place is named; an airy neutral bed is the floor so a shot is never
+// truly silent. All graphs are single-source for robustness on the bundled static ffmpeg.
+static (string chain, string kind) SoundscapeChain(string k)
+{
+    bool Has(params string[] ks) => ks.Any(x => k.Contains(x));
+    if (Has("ocean", "sea", "beach", "coast", "shore", "wave", "seaside", "harbor", "harbour", "tide"))
+        return ("anoisesrc=color=brown:amplitude=0.9:d=__DUR__,lowpass=f=1000,tremolo=f=0.12:d=0.85", "waves");
+    if (Has("river", "stream", "creek", "waterfall", "fountain", "brook", "rapids"))
+        return ("anoisesrc=color=white:amplitude=0.7:d=__DUR__,highpass=f=500,lowpass=f=5500,tremolo=f=1.6:d=0.5", "water");
+    if (Has("rain", "storm", "monsoon", "downpour", "drizzle", "thunder", "wet"))
+        return ("anoisesrc=color=white:amplitude=0.6:d=__DUR__,highpass=f=1200,lowpass=f=9000", "rain");
+    if (Has("forest", "jungle", "wood", "grove", "tree", "garden", "park", "meadow", "orchard"))
+        return ("anoisesrc=color=pink:amplitude=0.45:d=__DUR__,highpass=f=1800,tremolo=f=3:d=0.4", "forest");
+    if (Has("market", "bazaar", "crowd", "cafe", "restaurant", "party", "station", "airport", "mall", "shop", "fair", "festival", "stadium", "queue", "school", "class"))
+        return ("anoisesrc=color=pink:amplitude=0.7:d=__DUR__,bandpass=f=600:width_type=h:w=1400,tremolo=f=6:d=0.35", "crowd");
+    if (Has("street", "city", "road", "traffic", "town", "urban", "highway", "avenue", "downtown", "alley", "bus", "car"))
+        return ("anoisesrc=color=brown:amplitude=0.9:d=__DUR__,lowpass=f=550,tremolo=f=0.4:d=0.5", "city");
+    if (Has("desert", "mountain", "cliff", "hill", "field", "plain", "valley", "sky", "tundra", "canyon", "windy", "wind", "rooftop"))
+        return ("anoisesrc=color=brown:amplitude=0.9:d=__DUR__,lowpass=f=700,tremolo=f=0.15:d=0.7", "wind");
+    if (Has("fire", "camp", "hearth", "flame", "bonfire", "fireplace", "candle", "furnace"))
+        return ("anoisesrc=color=white:amplitude=0.5:d=__DUR__,highpass=f=800,lowpass=f=6000,tremolo=f=9:d=0.6", "fire");
+    if (Has("night", "midnight", "cricket", "dusk", "nocturnal"))
+        return ("anoisesrc=color=pink:amplitude=0.4:d=__DUR__,highpass=f=2800,tremolo=f=11:d=0.85", "night");
+    if (Has("room", "house", "home", "indoor", "office", "kitchen", "bedroom", "hall", "inside", "apartment", "cabin", "temple", "church", "library", "studio", "shrine"))
+        return ("anoisesrc=color=brown:amplitude=0.5:d=__DUR__,lowpass=f=220", "room");
+    if (Has("tense", "suspense", "fear", "afraid", "scary", "dread", "danger", "threat", "ominous", "dark"))
+        return ("anoisesrc=color=brown:amplitude=0.8:d=__DUR__,lowpass=f=130,tremolo=f=0.1:d=0.6", "tension");
+    if (Has("calm", "peace", "serene", "gentle", "soft", "quiet", "still", "tender", "warm"))
+        return ("anoisesrc=color=brown:amplitude=0.45:d=__DUR__,lowpass=f=260", "calm");
+    return ("anoisesrc=color=pink:amplitude=0.35:d=__DUR__,highpass=f=120,lowpass=f=2200", "air");
 }
 
 static string? LocateFfmpeg()
@@ -3387,6 +3524,14 @@ public record NarrationScriptRequest(string? Idea, string? Title, string? Loglin
 public record MuxAudioRequest(string VideoUrl, string AudioUrl, string? Mode);
 public record ConcatAudioRequest(string[]? AudioUrls, int? GapMs);
 public record GenerateBackgroundMusicRequest(string? Mood, int? DurationSeconds, double? MusicVolume);
+// A per-clip ambient soundscape (room tone / wind / rain / crowd / waves / city …) synthesized
+// from the clip's mood + location keywords, laid UNDER the spoken track so each shot has a real
+// sense of place instead of silence. Action text adds incidental cues (e.g. footsteps, traffic).
+public record SoundscapeRequest(string? Mood, string? Location, string? Action, int? DurationSeconds, double? Volume);
+// Neural foley (HunyuanVideo-Foley) on the GPU: generate synced SFX/ambience FROM a rendered clip.
+// Only runs when WAN_AUDIO_ENABLED is set AND the audio-enabled GPU image is deployed; otherwise
+// returns 501 and the worker falls back to the procedural soundscape above.
+public record FoleyRequest(string VideoUrl, string? Prompt, string? Size);
 public record DialogueClip(int Index, string? Title, string? Action, string? Narration);
 public record DialogueRequest(string? Direction, string? Language, DialogueClip[]? Clips);
 
