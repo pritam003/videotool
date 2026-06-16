@@ -762,7 +762,7 @@ function App() {
     } finally { setChatLoading(false); }
   }
 
-  function applyCharactersToForm(characters) {
+  function applyCharactersToForm(characters, dialogue) {
     if (!Array.isArray(characters) || characters.length === 0) return;
     
     const castList = characters.map((char, i) => ({
@@ -773,9 +773,10 @@ function App() {
     }));
     
     setScCast(castList);
-    setScDialogPrompt(castList.map(c => `${c.name} (${c.role})`).join(", "));
-    setWizStep(3); // Go to cast selection step
-    toast(`${characters.length} character${characters.length > 1 ? "s" : ""} added! Review and adjust in step ③.`);
+    // Populate with actual dialogue if available, otherwise use character names
+    setScDialogPrompt(dialogue && dialogue.trim() ? dialogue : castList.map(c => `${c.name} (${c.role})`).join(", "));
+    setWizStep(1); // Go to step 1 to review story + dialogue together
+    toast(`${characters.length} character${characters.length > 1 ? "s" : ""} added! Story & dialogue ready. Review in step ①.`);
   }
 
 
@@ -1837,7 +1838,7 @@ function App() {
                 ${chatLoading?"Generating...":"👥 Generate Characters"}
               </button>
               ${lastCharactersData && html`
-                <button class="ghost small" onClick=${() => applyCharactersToForm(lastCharactersData.characters)} title="Apply characters to form">Apply Characters</button>
+                <button class="ghost small" onClick=${() => applyCharactersToForm(lastCharactersData.characters, lastCharactersData.dialogue)} title="Apply characters and dialogue to form">Apply Characters</button>
               `}
             `}
           </div>
