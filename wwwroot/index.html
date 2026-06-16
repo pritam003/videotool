@@ -497,6 +497,24 @@ function App() {
   const [scNarrating, setScNarrating] = useState(false);      // script generation in flight
   const [scNarrAudio, setScNarrAudio] = useState(null);       // last voice preview { url }
 
+  // ── Audio Lab: hear the whole narration in every Indian voice BEFORE building a story ──
+  // One English script is synthesized in English, Hindi and Bengali at once (Hindi/Bengali are
+  // auto-translated for the preview) so you can compare voices and see how the audio lands on
+  // the fixed video cuts.
+  const AUDIO_LAB_SAMPLE = [
+    "The morning train slides into the old station, steam curling in the cold light.",
+    "On the crowded platform, a young woman searches every passing face.",
+    "She has waited here every day for a letter that never came.",
+    "A stranger stops, holds out a faded envelope, and smiles.",
+    "She reads the first line, and the grey morning turns to gold.",
+  ].join("\n");
+  const [alScript, setAlScript] = useState(AUDIO_LAB_SAMPLE);
+  const [alClipSec, setAlClipSec] = useState(5);
+  const [alResults, setAlResults] = useState({}); // { [locale]: { voice, lines:[{text,url,dur,translated}], wholeUrl, totalDur, busy, error } }
+  const [alVoiceSel, setAlVoiceSel] = useState({}); // { [locale]: shortName } — user voice override per language
+  const [alBusy, setAlBusy] = useState(false);
+  const alAudioRef = useRef(null); // the currently-playing whole-narration <audio>
+
   // Background music
   const [scBackgroundMusic, setScBackgroundMusic] = useState(""); // music mood: "none", "cinematic", "dramatic", "ambient", "uplifting", "suspenseful"
   const [scMusicVolume, setScMusicVolume] = useState(0.5);    // music volume 0-1, mixed with narration
@@ -1160,6 +1178,89 @@ function App() {
       setScNarrAudio({ url: j.url });
       try { new Audio(j.url).play(); } catch {}
     } catch (e) { toast("Voice preview failed: " + e.message.slice(0, 160), true); }
+  }
+
+  // ── Audio Lab helpers ───────────────────────────────────────────────────────
+  // The Indian languages previewed side by side (only those present in the catalogue).
+  function alLanguages() {
+    const have = new Set(voices.map(v => v.locale));
+    const list = ["en-IN", "hi-IN", "bn-IN"].filter(l => have.has(l));
+    return list.length ? list : ["en-US"];
+  }
+  // Most natural voice in a locale, honouring the user's per-language override.
+  function alVoiceFor(loc) {
+    const override = alVoiceSel[loc];
+    if (override && voices.some(v => v.shortName === override)) return override;
+    const inLoc = voices.filter(v => v.locale === loc).slice().sort((a, b) => voiceRank(a) - voiceRank(b));
+    const pref = inLoc.find(v => v.gender === "female") || inLoc[0];
+    return pref ? pref.shortName : "en-US-AvaMultilingualNeural";
+  }
+  // Real spoken duration of an audio clip, read from the browser's media metadata.
+  function measureAudio(url) {
+    return new Promise(resolve => {
+      const a = new Audio();
+      a.preload = "metadata";
+      const done = d => resolve(Number.isFinite(d) && d > 0 ? d : 0);
+      a.onloadedmetadata = () => done(a.duration);
+      a.onerror = () => done(0);
+      a.src = url;
+    });
+  }
+  function alLines() { return alScript.split("\n").map(s => s.trim()).filter(Boolean); }
+  // Synthesize every line in one language's voice, measure each, then stitch ONE continuous
+  // track — exactly how the real film plays its narration.
+  async function previewLanguage(loc) {
+    const lines = alLines();
+    if (!lines.length) { toast("Write a few narration lines first.", true); return; }
+    const vname = alVoiceFor(loc);
+    setAlResults(prev => ({ ...prev, [loc]: { voice: vname, busy: true, lines: [], error: null } }));
+    try {
+      const synth = await Promise.all(lines.map(async (text) => {
+        const r = await fetch("/api/narrate", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text, voice: vname })
+        });
+        const j = await jsonOrThrow(r);
+        const dur = await measureAudio(j.url);
+        return { text, url: j.url, dur, translated: j.translated || null };
+      }));
+      let wholeUrl = synth.length ? synth[0].url : null;
+      if (synth.length > 1) {
+        const cr = await fetch("/api/concat-audio", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ audioUrls: synth.map(s => s.url), gapMs: 320 })
+        });
+        wholeUrl = (await jsonOrThrow(cr)).url;
+      }
+      const totalDur = synth.reduce((a, s) => a + s.dur, 0) + Math.max(0, synth.length - 1) * 0.32;
+      setAlResults(prev => ({ ...prev, [loc]: { voice: vname, busy: false, lines: synth, wholeUrl, totalDur, error: null } }));
+      dbg("ok", `audio preview ${loc} (${vname}) ready`);
+    } catch (e) {
+      setAlResults(prev => ({ ...prev, [loc]: { voice: vname, busy: false, lines: [], error: (e.message || "failed").slice(0, 200) } }));
+      toast(`Preview failed for ${loc}: ${(e.message || "").slice(0, 140)}`, true);
+    }
+  }
+  async function previewAllIndian() {
+    setAlBusy(true);
+    try { for (const loc of alLanguages()) await previewLanguage(loc); }
+    finally { setAlBusy(false); }
+  }
+  function playWhole(url) {
+    if (!url) return;
+    try { if (alAudioRef.current) alAudioRef.current.pause(); const a = new Audio(url); alAudioRef.current = a; a.play(); } catch {}
+  }
+  // Instant, offline writing tips: flag lines too long to speak inside one cut.
+  function alSuggestions() {
+    const lines = alLines();
+    const budget = Math.round(alClipSec * 2.6); // speakable words per cut (~155 wpm)
+    const out = [];
+    lines.forEach((ln, i) => {
+      const w = ln.split(/\s+/).filter(Boolean).length;
+      if (w > budget + 3) out.push({ clip: i + 1, kind: "long", msg: `Clip ${i + 1}: ${w} words — trim to about ${budget} so it fits a ${alClipSec}s cut without slowing the video.` });
+    });
+    if (!lines.length) out.push({ clip: 0, kind: "ok", msg: "Add a line for each shot to preview the narration." });
+    else if (!out.length) out.push({ clip: 0, kind: "ok", msg: `Every line fits a ${alClipSec}s cut (about ${budget} words). Nicely paced.` });
+    return out;
   }
 
   // Submit a TEXT-TO-VIDEO job (no start image) — used to render canonical
@@ -1841,6 +1942,8 @@ function App() {
       <div style=${{display:"flex",gap:4,marginLeft:12}}>
         <button class="ghost small" onClick=${() => setPage("studio")}
           style=${page==="studio" ? {background:"var(--accent)",color:"#fff",borderColor:"var(--accent)"} : {}}>Studio</button>
+        <button class="ghost small" onClick=${() => setPage("voices")}
+          style=${page==="voices" ? {background:"var(--accent)",color:"#fff",borderColor:"var(--accent)"} : {}}>Voices</button>
         <button class="ghost small" onClick=${() => { setPage("history"); setRefreshLib(x => x + 1); }}
           style=${page==="history" ? {background:"var(--accent)",color:"#fff",borderColor:"var(--accent)"} : {}}>History</button>
       </div>
@@ -1921,6 +2024,103 @@ function App() {
               `}
             `;
           })()}
+        </div>
+      </div>
+      ` : page === "voices" ? html`
+      <!-- VOICES: preview the whole narration in every Indian voice, before building a story -->
+      <div style=${{gridColumn:"1 / -1"}}>
+        <div class="card">
+          <h3 style=${{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>🎙️ Audio preview lab <span class="muted small" style=${{fontWeight:400}}>· hear your narration in every Indian voice before you build the film</span></h3>
+          <p class="muted small" style=${{marginTop:0}}>Write a few narration lines — one per ${alClipSec}-second cut. We synthesize the WHOLE story in <strong>English</strong>, <strong>Hindi</strong> and <strong>Bengali</strong> at once, using the most natural voice for each, so you can pick the language and voice that sound right and see exactly how the audio lands on the ${alClipSec}s cuts. <span class="muted">Hindi & Bengali are auto-translated from your English lines for this preview.</span></p>
+
+          <label>Narration script <span class="muted small">· one line = one ${alClipSec}s cut</span></label>
+          <textarea rows="6" value=${alScript} onInput=${e => setAlScript(e.target.value)} style=${{fontSize:13,fontFamily:"inherit",lineHeight:1.5,width:"100%"}}></textarea>
+
+          <div style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",marginTop:8}}>
+            <label class="muted small">Cut length</label>
+            <select value=${alClipSec} onChange=${e => setAlClipSec(Number(e.target.value))}>
+              ${[3,4,5].map(s => html`<option value=${s} key=${s}>${s}s</option>`)}
+            </select>
+            <span class="muted small">${alLines().length} cuts · ${alLines().length * alClipSec}s of video</span>
+            ${scStory && (scStory.clips||[]).some(c => (c.narration||"").trim())
+              ? html`<button class="ghost small" onClick=${() => setAlScript((scStory.clips||[]).map(c => (c.narration||"").trim()).filter(Boolean).join("\n"))}>↧ Load from current storyboard</button>`
+              : ""}
+            <div class="spacer"></div>
+            <button class="primary" onClick=${previewAllIndian} disabled=${alBusy || !voices.length}>
+              ${alBusy ? "Synthesizing…" : "🔊 Preview English · Hindi · Bengali"}
+            </button>
+          </div>
+
+          <!-- instant writing suggestions -->
+          <div style=${{marginTop:12,padding:"8px 12px",border:"1px solid var(--border)",borderRadius:8,background:"var(--surface-2)"}}>
+            <div class="muted small" style=${{textTransform:"uppercase",fontSize:11,letterSpacing:".4px",marginBottom:4}}>✍️ Suggestions</div>
+            ${alSuggestions().map((s,i) => html`<div key=${i} class="small" style=${{color: s.kind==="long" ? "#d97706" : "var(--muted)"}}>${s.kind==="long" ? "⚠️ " : "✓ "}${s.msg}</div>`)}
+          </div>
+
+          ${!alLanguages().some(l => ["en-IN","hi-IN","bn-IN"].includes(l))
+            ? html`<p class="muted small" style=${{marginTop:10}}>Indian voices are still loading from Azure — give it a moment and they will appear below.</p>`
+            : ""}
+
+          <!-- one panel per language -->
+          <div style=${{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(300px,1fr))",gap:12,marginTop:14}}>
+            ${alLanguages().map(loc => {
+              const res = alResults[loc];
+              const inLoc = voices.filter(v => v.locale === loc).slice().sort((a,b)=>voiceRank(a)-voiceRank(b));
+              const film = alLines().length * alClipSec;
+              return html`
+                <div key=${loc} style=${{border:"1px solid var(--border)",borderRadius:10,padding:12,background:"var(--surface-2)"}}>
+                  <div style=${{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+                    <strong style=${{fontSize:14}}>${langLabel(loc)}</strong>
+                    ${res && !res.busy && res.lines && res.lines.length ? html`<span class="pill ok small">${res.totalDur.toFixed(1)}s total</span>` : ""}
+                  </div>
+                  <div style=${{display:"flex",gap:6,alignItems:"center",marginTop:8,flexWrap:"wrap"}}>
+                    <label class="muted small">Voice</label>
+                    <select value=${alVoiceFor(loc)} onChange=${e => setAlVoiceSel(prev => ({...prev,[loc]:e.target.value}))} style=${{fontSize:12,flex:"1 1 120px"}}>
+                      ${inLoc.map(v => html`<option value=${v.shortName} key=${v.shortName}>${(v.localName||v.shortName)} (${v.gender||"?"})${voiceRank(v)<=1?" · HD":""}</option>`)}
+                    </select>
+                    <button class="ghost small" onClick=${() => previewLanguage(loc)} disabled=${res && res.busy}>${res && res.busy ? "…" : "▶ Render"}</button>
+                  </div>
+
+                  ${res && res.busy ? html`<div class="muted small" style=${{marginTop:10}}>Synthesizing ${alLines().length} lines in ${langLabel(loc)}…</div>` : ""}
+                  ${res && res.error ? html`<div class="small" style=${{marginTop:10,color:"#ef4444"}}>${res.error}</div>` : ""}
+
+                  ${res && !res.busy && res.lines && res.lines.length ? html`
+                    <div style=${{margin:"10px 0 6px",display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                      <button class="primary small" onClick=${() => playWhole(res.wholeUrl)}>▶ Play whole narration</button>
+                      <a class="ghost small" href=${res.wholeUrl} target="_blank" rel="noopener" style=${{textDecoration:"none"}}>open ↗</a>
+                    </div>
+                    <div class="muted small" style=${{textTransform:"uppercase",fontSize:11,letterSpacing:".4px",margin:"8px 0 4px"}}>How it lands on ${alClipSec}s cuts</div>
+                    <div class="stack" style=${{gap:7}}>
+                      ${res.lines.map((ln,i) => {
+                        const over = ln.dur > alClipSec + 0.25;
+                        const scale = Math.max(alClipSec, ln.dur) || alClipSec;
+                        const greenPct = Math.min(ln.dur, alClipSec) / scale * 100;
+                        const amberPct = Math.max(0, ln.dur - alClipSec) / scale * 100;
+                        return html`
+                          <div key=${i}>
+                            <div style=${{display:"flex",justifyContent:"space-between",gap:8,fontSize:12}}>
+                              <span><strong>Clip ${i+1}</strong> <span class="muted">/ ${alClipSec}s</span></span>
+                              <span style=${{color: over ? "#d97706" : "var(--muted)"}}>${ln.dur.toFixed(1)}s ${over ? ("⚠ over " + (ln.dur-alClipSec).toFixed(1) + "s") : "✓ fits"}</span>
+                            </div>
+                            <div style=${{display:"flex",height:8,borderRadius:4,overflow:"hidden",background:"var(--border)",margin:"3px 0"}}>
+                              <div style=${{width:greenPct+"%",background:"#16a34a"}}></div>
+                              <div style=${{width:amberPct+"%",background:"#f59e0b"}}></div>
+                            </div>
+                            <div class="muted small" style=${{whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}} title=${ln.translated || ln.text}>${ln.translated || ln.text}</div>
+                          </div>`;
+                      })}
+                    </div>
+                    ${(() => {
+                      const ratio = res.totalDur / Math.max(1, film);
+                      const slow = ratio > 1.05;
+                      return html`<div class="small" style=${{marginTop:8,padding:"6px 8px",borderRadius:8,background: slow ? "rgba(245,158,11,.14)" : "rgba(22,163,74,.14)"}}>
+                        Narration ${res.totalDur.toFixed(1)}s vs ${film}s of video — ${slow ? ("the film gently slows ~" + ratio.toFixed(2) + "× to fit the voice.") : "fits comfortably; no slow-down needed."}
+                      </div>`;
+                    })()}
+                  ` : ""}
+                </div>`;
+            })}
+          </div>
         </div>
       </div>
       ` : html`
