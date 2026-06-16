@@ -1052,6 +1052,46 @@ function App() {
     });
   }
 
+  // Format a number of seconds as mm:ss (for the narration timeline box).
+  function fmtClock(sec) {
+    const t = Math.max(0, Math.round(sec));
+    const m = Math.floor(t / 60), s = t % 60;
+    return String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
+  }
+
+  // Build the whole film's narration + dialogue as one timestamped script string.
+  // Timestamps are the NOMINAL per-clip cut points (clipCount × clipSec); the rendered
+  // film may stretch slightly when a spoken line runs long ("fit" pacing), but this gives
+  // an accurate at-a-glance read of the running order.
+  function buildNarrationScript() {
+    const clips = scStory?.clips || [];
+    const lines = [];
+    clips.forEach((c, i) => {
+      const t0 = fmtClock(i * scClipSec), t1 = fmtClock((i + 1) * scClipSec);
+      const narr = (c.narration || "").trim();
+      const dlg = (c.dialog || "").trim();
+      const spk = dlg ? ((scCast.find(x => x.id === c.speaker) || {}).name || "") : "";
+      let block = `[${t0}–${t1}]  Clip ${i + 1}`;
+      if (narr) block += `\n  ${narr}`;
+      if (dlg) block += `\n  💬 ${spk ? spk + ": " : ""}${dlg}`;
+      lines.push(block);
+    });
+    return lines.join("\n\n");
+  }
+
+  // Copy the full timestamped narration script to the clipboard.
+  async function copyNarrationScript() {
+    const txt = buildNarrationScript();
+    if (!txt.trim()) { toast("No narration yet — generate the story first.", true); return; }
+    try {
+      await navigator.clipboard.writeText(txt);
+      toast("✓ Narration script copied");
+    } catch (e) {
+      dbg("warn", "clipboard copy failed", e.message);
+      toast("Copy failed — select & copy from the box manually.", true);
+    }
+  }
+
   // Generate (or rewrite) the spoken dialogue for every clip from the current story +
   // narration, in the chosen voice language. scDialogPrompt steers what's said; if it's
   // empty the model writes natural in-character dialogue on its own. Kept in sync because
@@ -2597,6 +2637,35 @@ function App() {
                   <button class="ghost" onClick=${buildStoryboard} disabled=${scBuilding}>${scBuilding ? "Rewriting…" : "↻ Rewrite story"}</button>
                 </div>
                 ${scNarrAudio && html`<audio src=${scNarrAudio.url} controls style=${{width:"100%"}}></audio>`}
+              `}
+              ${Array.isArray(scStory.clips) && scStory.clips.length > 0 && html`
+                <div class="plan" style=${{marginTop:10}}>
+                  <div class="plan-head">
+                    <strong>📜 Narration &amp; dialogue timeline</strong>
+                    <span class="pill">${fmtClock(scStory.clips.length * scClipSec)} total</span>
+                    <button class="ghost small" style=${{marginLeft:"auto"}} onClick=${copyNarrationScript} title="Copy the whole timestamped script">⧉ Copy</button>
+                  </div>
+                  <div class="muted small" style=${{padding:"0 12px 6px"}}>The full spoken track in order — narrator voiceover and character lines, with the cut times each falls on.</div>
+                  <div style=${{padding:"2px 12px 12px",display:"flex",flexDirection:"column",gap:8}}>
+                    ${scStory.clips.map((c, i) => {
+                      const t0 = fmtClock(i * scClipSec), t1 = fmtClock((i + 1) * scClipSec);
+                      const narr = (c.narration || "").trim();
+                      const dlg = (c.dialog || "").trim();
+                      const spk = dlg ? ((scCast.find(x => x.id === c.speaker) || {}).name || "") : "";
+                      return html`
+                        <div key=${i} style=${{display:"flex",gap:10,alignItems:"flex-start",borderTop: i ? "1px solid var(--border)" : "none",paddingTop: i ? 8 : 0}}>
+                          <span class="pill small" style=${{flex:"0 0 auto",fontFamily:"var(--mono)",whiteSpace:"nowrap"}}>${t0}–${t1}</span>
+                          <div style=${{flex:"1 1 auto",display:"flex",flexDirection:"column",gap:4,minWidth:0}}>
+                            ${narr
+                              ? html`<div style=${{lineHeight:1.4}}><span class="muted small" style=${{opacity:.6}}>🎙️ </span>${narr}</div>`
+                              : html`<div class="muted small" style=${{fontStyle:"italic",opacity:.6}}>— no narration —</div>`}
+                            ${dlg && html`<div class="muted small" style=${{lineHeight:1.4}}>💬 ${spk ? html`<strong>${spk}:</strong> ` : ""}${dlg}</div>`}
+                          </div>
+                        </div>
+                      `;
+                    })}
+                  </div>
+                </div>
               `}
               ${Array.isArray(scStory.clips) && html`
               <div class="plan">
