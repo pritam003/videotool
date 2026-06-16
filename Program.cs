@@ -55,6 +55,7 @@ var _internalToken = app.Services.GetRequiredService<InternalAuth>().Token;
 static bool IsPublicAuthPath(PathString p) =>
     p.StartsWithSegments("/health") ||
     p.StartsWithSegments("/.auth") ||
+    p.StartsWithSegments("/api/generate-story-idea") ||
     p.Equals("/sw.js", StringComparison.OrdinalIgnoreCase) ||
     p.Equals("/favicon.ico", StringComparison.OrdinalIgnoreCase) ||
     p.Equals("/api/push/vapid-public-key", StringComparison.OrdinalIgnoreCase);
