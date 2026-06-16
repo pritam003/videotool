@@ -540,9 +540,17 @@ function App() {
   // Background music
   const [scBackgroundMusic, setScBackgroundMusic] = useState(""); // music mood: "none", "cinematic", "dramatic", "ambient", "uplifting", "suspenseful"
   const [scMusicVolume, setScMusicVolume] = useState(0.5);    // music volume 0-1, mixed with narration
+  const [scMusicUrl, setScMusicUrl] = useState(null);        // generated background music URL
+  const [scMusicBusy, setScMusicBusy] = useState(false);      // generating background music
   // Ambient soundscape: a per-scene bed (wind/rain/crowd/room…) tucked under the voice. Free, on by default.
   const [scSoundscape, setScSoundscape] = useState(true);
   const [scSoundscapeVolume, setScSoundscapeVolume] = useState(0.5);
+  // Sound step chat: edit narration + dialog per clip, track refinements
+  const [scChatMessages, setScChatMessages] = useState([]);   // {role, content, clipIndex?}
+  const [scChatInput, setScChatInput] = useState("");
+  const [scChatBusy, setScChatBusy] = useState(false);
+  // Background downloads: track ongoing reference video downloads without blocking UI
+  const bgDownloadsRef = useRef({});                          // { urlHash: {promise, blobUrl, error} }
   // Portrait/cast image engine: "flux" = FLUX.1 Schnell (fast, sharp) · "comfy" = the
   // original Wan 1s-T2V still. Both run on the same A100; the toggle picks which renders
   // the cast references, and the two paths work independently.
@@ -1300,18 +1308,85 @@ function App() {
   async function downloadReferenceVideo() {
     if (!anYoutubeUrl.trim()) return;
     setAnDownloadBusy(true);
+    const urlHash = anYoutubeUrl.trim();
+    toast("⏳ Downloading in background...");
+    
+    // Fire background download without waiting
+    const downloadPromise = (async () => {
+      try {
+        const r = await fetch("/api/download-reference-video", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: anYoutubeUrl.trim(), seconds: anSeconds })
+        });
+        const j = await jsonOrThrow(r);
+        bgDownloadsRef.current[urlHash] = { blobUrl: j.url, error: null };
+        setAnVideo({ _blobUrl: j.url, name: "reference.mp4" });
+        setAnVideoPreview(j.url);
+        toast("✓ Reference video ready (" + (j.bytes/1024/1024).toFixed(1) + " MB)");
+        return j.url;
+      } catch (e) {
+        bgDownloadsRef.current[urlHash] = { error: e.message.slice(0, 160) };
+        toast("❌ Download failed: " + e.message.slice(0, 160), true);
+        throw e;
+      }
+    })();
+    
+    bgDownloadsRef.current[urlHash] = { promise: downloadPromise };
+    downloadPromise.finally(() => setAnDownloadBusy(false));
+  }
+  async function generateBackgroundMusic() {
+    if (!scBackgroundMusic || scBackgroundMusic === "none") { toast("Select a music mood first.", true); return; }
+    setScMusicBusy(true);
     try {
-      const r = await fetch("/api/download-reference-video", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: anYoutubeUrl.trim(), seconds: anSeconds })
+      const dur = (scStory?.clips?.length || 1) * (scClipSec || 5);
+      const r = await fetch("/api/generate-background-music", {
+        method: "POST", headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({ mood: scBackgroundMusic, durationSeconds: Math.ceil(dur), musicVolume: scMusicVolume })
       });
       const j = await jsonOrThrow(r);
-      // Store the blob URL as a special "File-like" marker — we'll send videoUrl to animate-submit.
-      setAnVideo({ _blobUrl: j.url, name: "reference.mp4" });
-      setAnVideoPreview(j.url);
-      toast("✓ Reference video downloaded (" + (j.bytes/1024/1024).toFixed(1) + " MB)");
-    } catch (e) { toast("❌ Download failed: " + e.message.slice(0, 160), true); }
-    finally { setAnDownloadBusy(false); }
+      setScMusicUrl(j.url);
+      toast("✓ Background music generated (" + scBackgroundMusic + ")");
+    } catch (e) { toast("Music generation failed: " + e.message.slice(0,100), true); }
+    finally { setScMusicBusy(false); }
+  }
+  async function sendSoundChat() {
+    if (!scChatInput.trim()) return;
+    const msg = scChatInput.trim();
+    setScChatMessages(prev => [...prev, {role: "user", content: msg}]);
+    setScChatInput("");
+    setScChatBusy(true);
+    try {
+      const clipContext = (scStory?.clips || []).map((c, i) => ({
+        index: i,
+        title: c.title,
+        narration: c.narration,
+        dialog: c.dialog,
+        speaker: c.speaker
+      }));
+      const r = await fetch("/api/refine-sound-chat", {
+        method: "POST", headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({ message: msg, clips: clipContext, history: scChatMessages })
+      });
+      if (r.status === 404) {
+        // Fallback: send to local analysis if endpoint doesn't exist
+        setScChatMessages(prev => [...prev, {
+          role: "assistant",
+          content: "I can help refine your narration and dialog. What would you like to change? (e.g., 'Make clip 1 more dramatic' or 'Change the dialog in clip 3')"
+        }]);
+      } else {
+        const j = await jsonOrThrow(r);
+        setScChatMessages(prev => [...prev, {role: "assistant", content: j.response, suggestions: j.suggestions}]);
+        if (j.suggestions?.length) {
+          j.suggestions.forEach(sug => {
+            if (sug.clipIndex >= 0 && sug.field) {
+              setScClipAudio(prev => prev.map((c, i) => i === sug.clipIndex ? {...c, url: null, dur: 0} : c));
+            }
+          });
+        }
+      }
+    } catch (e) {
+      setScChatMessages(prev => [...prev, {role: "assistant", content: "❌ Error: " + e.message.slice(0,100)}]);
+    } finally { setScChatBusy(false); }
   }
   function cancelAnimate() { anCancelRef.current = true; setAnBusy(false); setAnStatus(""); }
   async function submitAnimate() {
@@ -2659,7 +2734,7 @@ function App() {
             <!-- STEP 5: Sound — per-clip audio preview + approve before render -->
             ${wizStep === 5 && html`
             <div>
-              <label>⑥ Sound <span class="muted small">· hear each 5s cut, redo any line, then render</span></label>
+              <label>⑤ Sound <span class="muted small">· synthesize narration, refine dialog, add background music</span></label>
               ${scNarrationMode === "off" ? html`<p class="muted small" style=${{marginTop:6}}>Voiceover is off. Turn it on in step 2 to preview and edit the story audio here.</p>` : html`
               <p class="muted small" style=${{marginTop:4}}>We synthesize each cut’s narration + dialogue so you can hear it, adjust the voice, and redo any line. The audio you approve here is used exactly in the render — no re-synthesis, full sync control.</p>
               <div style=${{display:"flex",gap:8,flexWrap:"wrap",marginBottom:10}}>
@@ -2672,8 +2747,52 @@ function App() {
                     ${soundPreviewBusy ? "…" : "▶ Play whole narration"}
                   </button>` : ""}
               </div>
-              <div class="stack" style=${{gap:8}}>
-                ${(scStory?.clips||[]).map((clip,i) => {
+              
+              <!-- Background Music -->
+              <div style=${{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:12,padding:10,background:"var(--surface-2)",borderRadius:"var(--radius-sm)",border:"1px solid var(--border)"}}>
+                <div>
+                  <label class="muted small">🎵 Background Music Mood</label>
+                  <select style=${{marginTop:4}} value=${scBackgroundMusic} onChange=${e => setScBackgroundMusic(e.target.value)}>
+                    <option value="">None</option>
+                    <option value="ambient">Ambient</option>
+                    <option value="cinematic">Cinematic</option>
+                    <option value="dramatic">Dramatic</option>
+                    <option value="uplifting">Uplifting</option>
+                    <option value="suspenseful">Suspenseful</option>
+                  </select>
+                </div>
+                <div>
+                  <label class="muted small">Volume: ${(scMusicVolume * 100).toFixed(0)}%</label>
+                  <input type="range" min="0" max="1" step="0.1" value=${scMusicVolume} onInput=${e => setScMusicVolume(parseFloat(e.target.value))} style=${{marginTop:4,width:"100%"}} />
+                </div>
+              </div>
+              ${scBackgroundMusic && scBackgroundMusic !== "none" ? html`
+                <div style=${{display:"flex",gap:6,marginBottom:12}}>
+                  <button class="ghost small" onClick=${generateBackgroundMusic} disabled=${scMusicBusy}>${scMusicBusy ? "Generating…" : "Generate music"}</button>
+                  ${scMusicUrl ? html`<button class="ghost small" onClick=${() => {try{const a = new Audio(scMusicUrl); a.play();}catch{}}} >▶ Preview</button>` : ""}
+                </div>
+              ` : ""}
+              
+              <!-- Chat Box for Dialog Refinement -->
+              <div style=${{border:"1px solid var(--border)",borderRadius:"var(--radius)",padding:10,background:"var(--surface-2)",marginBottom:12}}>
+                <div class="muted small" style=${{marginBottom:8,fontWeight:600}}>💬 Refine Dialog & Narration</div>
+                <div style=${{maxHeight:"180px",overflowY:"auto",marginBottom:8,padding:8,background:"var(--surface)",borderRadius:"var(--radius-sm)",border:"1px solid var(--border)",display:"flex",flexDirection:"column",gap:6}}>
+                  ${scChatMessages.length === 0 ? html`<div class="muted small" style=${{textAlign:"center",padding:8}}>Ask me to adjust any clip's dialog or narration...</div>` : 
+                    scChatMessages.map((m, i) => html`
+                    <div key=${i} style=${{padding:6,borderRadius:6,background: m.role === "user" ? "var(--accent-soft)" : "#f0f0f0",color: m.role === "user" ? "var(--text)" : "#1c1d22"}}>
+                      <div class="muted small" style=${{fontSize:11,marginBottom:2,fontWeight:600}}>${m.role === "user" ? "You" : "Assistant"}</div>
+                      <div style=${{fontSize:12}}>${m.content}</div>
+                    </div>
+                  `)}
+                </div>
+                <div style=${{display:"flex",gap:6}}>
+                  <textarea value=${scChatInput} onInput=${e => setScChatInput(e.target.value)} placeholder="e.g., 'Make clip 1 more dramatic' or 'Change dialog in clip 3'" style=${{flex:1,minHeight:"44px",fontSize:12}} disabled=${scChatBusy}></textarea>
+                  <button class="primary small" onClick=${sendSoundChat} disabled=${scChatBusy || !scChatInput.trim()} style=${{flex:"0 0 auto",height:"44px"}}>Send</button>
+                </div>
+              </div>
+              
+              <div class="muted small" style=${{marginBottom:8,fontWeight:600}}>Per-clip narration & dialogue:</div>
+              <div style=${{display:"flex",flexDirection:"column",gap:8}}>
                   const ca = scClipAudio.find(c=>c.index===i) || {index:i,url:null,dur:0,busy:false,error:null};
                   const clipSec = scClipSec;
                   const nLine = (clip.narration||"").trim();
