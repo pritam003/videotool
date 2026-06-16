@@ -12,3 +12,4 @@ Minimal .NET 8 web app deployed to Azure App Service via GitHub Actions (OIDC).
 
 Every push to `main` triggers the GitHub Actions workflow, which builds and
 deploys to Azure App Service using OIDC federated credentials (no secrets).
+# Trigger redeploy
