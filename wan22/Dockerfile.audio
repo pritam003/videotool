@@ -32,12 +32,12 @@ FROM wan22acr23247.azurecr.io/wan22-comfyui:latest
 
 # The community ComfyUI wrapper for Tencent's HunyuanVideo-Foley. Override at build time
 # with `--build-arg FOLEY_NODE_REPO=<your fork>` if you prefer a different/pinned node.
-ARG FOLEY_NODE_REPO=https://github.com/if-ai/ComfyUI-HunyuanVideoFoley.git
+ARG FOLEY_NODE_REPO=https://github.com/if-ai/ComfyUI_HunyuanVideoFoley.git
 
 WORKDIR /opt/ComfyUI
-RUN git clone --depth 1 ${FOLEY_NODE_REPO} custom_nodes/ComfyUI-HunyuanVideoFoley \
- && if [ -f custom_nodes/ComfyUI-HunyuanVideoFoley/requirements.txt ]; then \
-        pip install --no-cache-dir -r custom_nodes/ComfyUI-HunyuanVideoFoley/requirements.txt ; \
+RUN git clone --depth 1 ${FOLEY_NODE_REPO} custom_nodes/ComfyUI_HunyuanVideoFoley \
+ && if [ -f custom_nodes/ComfyUI_HunyuanVideoFoley/requirements.txt ]; then \
+        pip install --no-cache-dir -r custom_nodes/ComfyUI_HunyuanVideoFoley/requirements.txt ; \
     fi
 
 # Weights are NOT baked into the image — they are mounted from the Azure Files model share
