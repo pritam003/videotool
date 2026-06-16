@@ -650,6 +650,16 @@ function App() {
   const [editedStory, setEditedStory] = useState(""); // user-edited story
   const [workflowStep, setWorkflowStep] = useState("prompt"); // "prompt", "skeleton", "edit", "characters"
 
+  // Deep reasoning workflow state
+  const [reasoningWorkflow, setReasoningWorkflow] = useState(null); // null | "analyzing" | "questions" | "generating" | "results"
+  const [reasoningInitialPrompt, setReasoningInitialPrompt] = useState("");
+  const [reasoningAnalysis, setReasoningAnalysis] = useState(null); // { reasoning, questions }
+  const [userRefinements, setUserRefinements] = useState({}); // user answers to follow-up questions
+  const [generatedStoryIdea, setGeneratedStoryIdea] = useState("");
+  const [generatedDialogueIdea, setGeneratedDialogueIdea] = useState("");
+  const [generatedCharacters, setGeneratedCharacters] = useState([]);
+  const [generatedReasoning, setGeneratedReasoning] = useState(null);
+
   async function generateSkeletonStory() {
     if (!chatInput.trim() || chatLoading) return;
     const userPrompt = chatInput.trim();
@@ -784,6 +794,92 @@ function App() {
     setScDialogPrompt(dialogue && dialogue.trim() ? dialogue : castList.map(c => `${c.name} (${c.role})`).join(", "));
     setWizStep(1); // Go to step 1 to review story + dialogue together
     toast(`${characters.length} character${characters.length > 1 ? "s" : ""} added! Story & dialogue ready. Review in step ①.`);
+  }
+
+  // Deep Reasoning Workflow Functions
+  async function startReasoningAnalysis() {
+    if (!reasoningInitialPrompt.trim()) {
+      toast("Please enter a story prompt first.", true);
+      return;
+    }
+    setReasoningWorkflow("analyzing");
+    setChatMessages(prev => [...prev, { role: "user", text: reasoningInitialPrompt }]);
+    try {
+      const r = await fetch("/api/analyze-prompt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: reasoningInitialPrompt })
+      });
+      const analysis = await jsonOrThrow(r);
+      setReasoningAnalysis(analysis);
+      const msg = `💭 **Story Analysis**\n\n**Structure:** ${analysis.reasoning?.storyStructure || "N/A"}\n\n**Character Needs:** ${analysis.reasoning?.characterNeeds || "N/A"}\n\n**Themes:** ${(analysis.reasoning?.themes || []).join(", ") || "N/A"}\n\n**Character Count:** ${analysis.reasoning?.suggestedCharacterCount || 2}-3 characters`;
+      setChatMessages(prev => [...prev, { role: "assistant", text: msg }]);
+      setReasoningWorkflow("questions");
+      dbg("ok", "reasoning analysis complete");
+    } catch (e) {
+      setChatMessages(prev => [...prev, { role: "assistant", text: `❌ Analysis failed: ${e.message.slice(0, 100)}` }]);
+      setReasoningWorkflow(null);
+    }
+  }
+
+  async function submitRefinements() {
+    if (!reasoningAnalysis || !reasoningInitialPrompt.trim()) return;
+    setReasoningWorkflow("generating");
+    setChatMessages(prev => [...prev, { role: "assistant", text: "✨ Generating synchronized Story + Dialogue..." }]);
+    try {
+      const r = await fetch("/api/generate-story-with-dialogue", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: reasoningInitialPrompt,
+          refinements: userRefinements
+        })
+      });
+      const result = await jsonOrThrow(r);
+      setGeneratedStoryIdea(result.storyIdea || "");
+      setGeneratedDialogueIdea(result.dialogueIdea || "");
+      setGeneratedCharacters(result.characters || []);
+      setGeneratedReasoning(result.reasoning || null);
+      const msg = `✅ **Story & Dialogue Generated!**\n\n**Story:** ${(result.storyIdea || "").slice(0, 200)}...\n\n**Dialogue:** ${(result.dialogueIdea || "").slice(0, 200)}...`;
+      setChatMessages(prev => [...prev, { role: "assistant", text: msg }]);
+      setReasoningWorkflow("results");
+      dbg("ok", "story and dialogue generated");
+    } catch (e) {
+      setChatMessages(prev => [...prev, { role: "assistant", text: `❌ Generation failed: ${e.message.slice(0, 100)}` }]);
+      setReasoningWorkflow("questions");
+    }
+  }
+
+  function applyGeneratedContent() {
+    if (!generatedStoryIdea && !generatedDialogueIdea) {
+      toast("No content to apply.", true);
+      return;
+    }
+    // Apply both story and dialogue to form
+    setScPrompt(generatedStoryIdea);
+    setScDialogPrompt(generatedDialogueIdea);
+    if (Array.isArray(generatedCharacters) && generatedCharacters.length > 0) {
+      setScCast(generatedCharacters.map((c, i) => ({
+        id: `char_${i}`,
+        name: c.name,
+        role: c.role,
+        description: `${c.personality}. Arc: ${c.arc}`
+      })));
+    }
+    setWizStep(1);
+    resetReasoningWorkflow();
+    toast("Story & dialogue applied! Review in step ①.", false);
+  }
+
+  function resetReasoningWorkflow() {
+    setReasoningWorkflow(null);
+    setReasoningInitialPrompt("");
+    setReasoningAnalysis(null);
+    setUserRefinements({});
+    setGeneratedStoryIdea("");
+    setGeneratedDialogueIdea("");
+    setGeneratedCharacters([]);
+    setGeneratedReasoning(null);
   }
 
 
@@ -1800,6 +1896,22 @@ function App() {
         <!-- AI Story/Dialog Chat -->
         <div class="card" style=${{background:"linear-gradient(135deg, var(--surface) 0%, var(--surface-2) 100%)", borderColor:"#6366f1", borderWidth:1, borderStyle:"solid"}}>
           <h3 style=${{display:"flex",alignItems:"center",gap:8}}>✨ AI Story Builder</h3>
+          
+          <!-- Workflow tabs -->
+          <div style=${{display:"flex",gap:8,marginBottom:12,borderBottom:"1px solid var(--border)",paddingBottom:8}}>
+            <button class="ghost small" 
+              onClick=${() => !reasoningWorkflow && (resetReasoningWorkflow(), setWorkflowStep("prompt"))}
+              style=${!reasoningWorkflow && workflowStep === "prompt" ? {background:"var(--accent)",color:"#fff"} : {}}>
+              📚 Story Skeleton
+            </button>
+            <button class="ghost small"
+              onClick=${() => !reasoningWorkflow && (resetReasoningWorkflow(), setReasoningWorkflow("init"))}
+              style=${reasoningWorkflow ? {background:"var(--accent)",color:"#fff"} : {}}>
+              💭 Deep Reasoning
+            </button>
+          </div>
+
+          <!-- Chat display -->
           <div style=${{display:"flex",flexDirection:"column",gap:8,maxHeight:"280px",overflowY:"auto",marginBottom:10,padding:"8px",background:"var(--surface-2)",borderRadius:"var(--radius-sm)"}}>
             ${chatMessages.map((msg, i) => html`
               <div key=${i} style=${{display:"flex",flexDirection:"column",gap:4,alignItems:msg.role==="user"?"flex-end":"flex-start"}}>
@@ -1808,15 +1920,18 @@ function App() {
                 </div>
               </div>
             `)}
-            ${chatLoading && html`
+            ${(chatLoading || reasoningWorkflow) && html`
               <div style=${{display:"flex",gap:4,alignItems:"center",color:"var(--muted)",fontSize:12}}>
-                <span>⏳ Thinking</span>
+                <span>⏳ ${reasoningWorkflow === "analyzing" ? "Analyzing" : reasoningWorkflow === "generating" ? "Generating" : "Thinking"}</span>
                 <span style=${{animation:"spinner 1s linear infinite"}}>⠋</span>
               </div>
             `}
           </div>
+
+          <!-- Input area -->
           <div style=${{display:"flex",gap:6,flexDirection:"column"}}>
-            ${workflowStep === "prompt" && html`
+            <!-- Story Skeleton Workflow -->
+            ${!reasoningWorkflow && workflowStep === "prompt" && html`
               <textarea rows="2" placeholder="e.g., 'A lonely robot finds friendship' or 'Two rivals discover a secret'" value=${chatInput}
                 onInput=${e => setChatInput(e.target.value)}
                 onKeyDown=${e => { if (e.key==="Enter" && !e.shiftKey && !chatLoading) { e.preventDefault(); generateSkeletonStory(); } }}
@@ -1825,7 +1940,7 @@ function App() {
                 ${chatLoading?"Generating...":"📚 Generate Skeleton Story"}
               </button>
             `}
-            ${workflowStep === "skeleton" && html`
+            ${!reasoningWorkflow && workflowStep === "skeleton" && html`
               <div style=${{fontSize:12}}>
                 <label style=${{display:"block",marginBottom:6,fontWeight:600,color:"var(--text)"}}>✏️ Enhance Your Story:</label>
                 <textarea rows="5" value=${editedStory}
@@ -1837,16 +1952,75 @@ function App() {
                 <button class="primary small" onClick=${submitEnhancedStory} disabled=${!editedStory.trim()||chatLoading}>
                   ${chatLoading?"Submitting...":"✅ Submit Enhanced Story"}
                 </button>
-                <button class="ghost small" onClick=${() => { setWorkflowStep("prompt"); setChatInput(""); }} title="Start over">Start Over</button>
+                <button class="ghost small" onClick=${() => { setWorkflowStep("prompt"); setChatInput(""); resetReasoningWorkflow(); }} title="Start over">Start Over</button>
               </div>
             `}
-            ${workflowStep === "characters" && html`
+            ${!reasoningWorkflow && workflowStep === "characters" && html`
               <button class="primary small" onClick=${generateCharacters} disabled=${!scPrompt.trim()||chatLoading} title="Generate characters from your enhanced story">
                 ${chatLoading?"Generating...":"👥 Generate Characters"}
               </button>
               ${lastCharactersData && html`
                 <button class="ghost small" onClick=${() => applyCharactersToForm(lastCharactersData.characters, lastCharactersData.dialogue)} title="Apply characters and dialogue to form">Apply Characters</button>
               `}
+            `}
+
+            <!-- Deep Reasoning Workflow -->
+            ${reasoningWorkflow === "init" && html`
+              <textarea rows="2" placeholder="e.g., 'A detective solves a cold case' or 'An astronaut discovers life on Mars'" 
+                value=${reasoningInitialPrompt}
+                onInput=${e => setReasoningInitialPrompt(e.target.value)}
+                onKeyDown=${e => { if (e.key==="Enter" && !e.shiftKey) { e.preventDefault(); startReasoningAnalysis(); } }}
+                style=${{fontSize:12,fontFamily:"inherit"}}></textarea>
+              <button class="primary small" onClick=${startReasoningAnalysis} disabled=${!reasoningInitialPrompt.trim()}>
+                💭 Analyze & Generate Questions
+              </button>
+            `}
+
+            ${reasoningWorkflow === "questions" && reasoningAnalysis && html`
+              <div style=${{display:"flex",flexDirection:"column",gap:10}}>
+                ${reasoningAnalysis.questions && reasoningAnalysis.questions.map((q, i) => html`
+                  <div key=${i}>
+                    <label style=${{display:"block",marginBottom:6,fontWeight:500,fontSize:13}}>${q.question}</label>
+                    <select value=${userRefinements[q.id] || q.suggested || ""}
+                      onChange=${e => setUserRefinements(prev => ({...prev, [q.id]: e.target.value}))}
+                      style=${{fontSize:12,width:"100%"}}>
+                      ${q.options && q.options.map(opt => html`<option key=${opt} value=${opt}>${opt}</option>`)}
+                    </select>
+                    ${q.suggested && html`<div class="muted small" style=${{marginTop:4}}>💡 Suggested: ${q.suggested}</div>`}
+                  </div>
+                `)}
+              </div>
+              <button class="primary small" onClick=${submitRefinements}>
+                ✨ Generate Story & Dialogue
+              </button>
+            `}
+
+            ${reasoningWorkflow === "results" && html`
+              <div style=${{display:"flex",flexDirection:"column",gap:12}}>
+                <div style=${{borderTop:"1px solid var(--border)",paddingTop:10}}>
+                  <label style=${{display:"block",marginBottom:6,fontWeight:600,fontSize:12,textTransform:"uppercase",color:"var(--muted)"}}>📖 Story Idea</label>
+                  <div style=${{fontSize:12,lineHeight:1.6,maxHeight:160,overflowY:"auto",padding:8,background:"var(--surface)",borderRadius:"var(--radius-sm)",border:"1px solid var(--border)",whiteSpace:"pre-wrap",wordWrap:"break-word"}}>
+                    ${generatedStoryIdea}
+                  </div>
+                </div>
+                <div>
+                  <label style=${{display:"block",marginBottom:6,fontWeight:600,fontSize:12,textTransform:"uppercase",color:"var(--muted)"}}>💬 Dialogue Idea</label>
+                  <div style=${{fontSize:12,lineHeight:1.6,maxHeight:160,overflowY:"auto",padding:8,background:"var(--surface)",borderRadius:"var(--radius-sm)",border:"1px solid var(--border)",whiteSpace:"pre-wrap",wordWrap:"break-word"}}>
+                    ${generatedDialogueIdea}
+                  </div>
+                </div>
+              </div>
+              <div style=${{display:"flex",gap:6,flexWrap:"wrap"}}>
+                <button class="primary small" onClick=${applyGeneratedContent}>
+                  ✅ Apply to Film Wizard
+                </button>
+                <button class="ghost small" onClick=${() => setReasoningWorkflow("questions")}>
+                  ← Refine Again
+                </button>
+                <button class="ghost small" onClick=${resetReasoningWorkflow}>
+                  Start Over
+                </button>
+              </div>
             `}
           </div>
         </div>
