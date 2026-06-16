@@ -496,6 +496,10 @@ function App() {
   const [scNarrationText, setScNarrationText] = useState(""); // editable script — the user's words win
   const [scNarrating, setScNarrating] = useState(false);      // script generation in flight
   const [scNarrAudio, setScNarrAudio] = useState(null);       // last voice preview { url }
+
+  // Background music
+  const [scBackgroundMusic, setScBackgroundMusic] = useState(""); // music mood: "none", "cinematic", "dramatic", "ambient", "uplifting", "suspenseful"
+  const [scMusicVolume, setScMusicVolume] = useState(0.5);    // music volume 0-1, mixed with narration
   // Portrait/cast image engine: "flux" = FLUX.1 Schnell (fast, sharp) · "comfy" = the
   // original Wan 1s-T2V still. Both run on the same A100; the toggle picks which renders
   // the cast references, and the two paths work independently.
@@ -1060,6 +1064,64 @@ function App() {
     } finally { setScNarrating(false); }
   }
 
+  // Generate narration for each clip (per-clip voiceover)
+  async function generateClipNarrations() {
+    if (!scStory || !scStory.clips || scStory.clips.length === 0) { 
+      toast("Build a storyboard first.", true); 
+      return; 
+    }
+    if (scNarrationMode === "off") {
+      toast("Enable narration in step 2 first (voiceover mode).", true);
+      return;
+    }
+    
+    setScNarrating(true);
+    try {
+      let updatedClips = [...scStory.clips];
+      let successCount = 0;
+      
+      for (let i = 0; i < scStory.clips.length; i++) {
+        const c = scStory.clips[i];
+        if (c.narration && c.narration.trim()) {
+          // Skip if narration already exists
+          continue;
+        }
+        
+        // Generate narration for this specific clip
+        try {
+          const r = await fetch("/api/narration-script", {
+            method: "POST", 
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              idea: scPrompt,
+              title: c.title || "",
+              logline: "",
+              actions: [c.action || c.title || ""],
+              totalSeconds: scClipSec,
+              prompt: scNarrationMode === "prompt" ? scNarrationPrompt : "",
+              voice
+            })
+          });
+          const j = await jsonOrThrow(r);
+          const clipNarration = (j.script || "").trim();
+          if (clipNarration) {
+            updatedClips[i] = { ...updatedClips[i], narration: clipNarration };
+            successCount++;
+          }
+        } catch (e) {
+          dbg("warn", `Clip ${i+1} narration failed: ${e.message.slice(0, 80)}`);
+        }
+      }
+      
+      setScStory({ ...scStory, clips: updatedClips });
+      toast(`✓ Generated narration for ${successCount}/${scStory.clips.length} clips.`, false);
+    } catch (e) {
+      toast("Narration generation failed: " + e.message.slice(0, 160), true);
+    } finally { 
+      setScNarrating(false); 
+    }
+  }
+
   // "Preview voice": synthesize the first clip's narration line and play it (no video).
   async function previewNarration() {
     const line = ((scStory?.clips || []).map(c => (c.narration || "").trim()).find(Boolean)) || "";
@@ -1359,7 +1421,9 @@ function App() {
         crossfade: crossfade,
         idea: scPrompt,
         story: scStory,
-        cast
+        cast,
+        backgroundMusic: scBackgroundMusic || "",
+        musicVolume: scMusicVolume || 0.5
       };
       const r = await fetch("/api/story-jobs", {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(spec)
@@ -1891,6 +1955,26 @@ function App() {
                       ${langVoices.map(v => html`<option value=${v.shortName} key=${"d" + v.shortName}>${v.localName || v.shortName} (${v.gender || "?"})</option>`)}
                     </select>
                   </div>
+                  <div>
+                    <label>Background music <span class="muted small">· ambient music mixed with your narration</span></label>
+                    <select value=${scBackgroundMusic} onChange=${e => setScBackgroundMusic(e.target.value)}>
+                      <option value="">None</option>
+                      <option value="cinematic">🎬 Cinematic</option>
+                      <option value="dramatic">🎭 Dramatic</option>
+                      <option value="ambient">🌌 Ambient</option>
+                      <option value="uplifting">🎪 Uplifting</option>
+                      <option value="suspenseful">🔪 Suspenseful</option>
+                    </select>
+                  </div>
+                  ${scBackgroundMusic && html`
+                    <div>
+                      <label>Music volume <span class="muted small">· balance between music and narration · 0% silent, 100% loud</span></label>
+                      <input type="range" min="0" max="100" value=${Math.round(scMusicVolume * 100)} 
+                        onChange=${e => setScMusicVolume(Number(e.target.value) / 100)}
+                        style=${{width:"100%"}} />
+                      <div class="muted small">${Math.round(scMusicVolume * 100)}%</div>
+                    </div>
+                  `}
                 </div>
               ` : html`<p class="muted small">The film will be silent. You can still type on-screen dialogue in step 3 — it just won't be spoken.</p>`}
             </div>
@@ -1910,6 +1994,7 @@ function App() {
               </div>
               ${scNarrationMode !== "off" && html`
                 <div class="btn-row" style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                  <button class="ghost" onClick=${generateClipNarrations} disabled=${scNarrating}>${scNarrating ? "Writing narration…" : "📝 Auto-fill clip narration"}</button>
                   <button class="ghost" onClick=${genDialogue} disabled=${scDialoging}>${scDialoging ? "Writing dialogue…" : "✍️ Regenerate dialogue"}</button>
                   <button class="ghost" onClick=${previewNarration}>🔊 Preview voice</button>
                   <button class="ghost" onClick=${buildStoryboard} disabled=${scBuilding}>${scBuilding ? "Rewriting…" : "↻ Rewrite story"}</button>

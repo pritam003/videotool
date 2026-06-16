@@ -795,6 +795,11 @@ app.MapPost("/api/mux-audio", async (MuxAudioRequest req, IHttpClientFactory hf,
         }
         else args = mode == "mix"
             ? $"-y -i \"{vIn}\" -i \"{aIn}\" -filter_complex \"[0:a][1:a]amix=inputs=2:duration=longest[a]\" -map 0:v -map \"[a]\" -c:v copy -c:a aac -b:a 192k -movflags +faststart \"{outPath}\""
+            : mode == "musicmix"
+            // Lay a (pre-attenuated) background-music bed UNDER the film's existing spoken
+            // audio. normalize=0 keeps narration at full volume; duration=first clamps the
+            // mix to the film's audio so over-long music is trimmed to the film.
+            ? $"-y -i \"{vIn}\" -i \"{aIn}\" -filter_complex \"[0:a][1:a]amix=inputs=2:duration=first:normalize=0[a]\" -map 0:v -map \"[a]\" -c:v copy -c:a aac -b:a 192k -movflags +faststart \"{outPath}\""
             : $"-y -i \"{vIn}\" -i \"{aIn}\" -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 192k -shortest -movflags +faststart \"{outPath}\"";
 
         var (ec, stderr) = await RunProcessAsync(ffmpeg, args, ct);
@@ -868,6 +873,64 @@ app.MapPost("/api/concat-audio", async (ConcatAudioRequest req, IHttpClientFacto
         var svc = new BlobServiceClient(new Uri($"https://{account}.blob.core.windows.net"), cred);
         var container = svc.GetBlobContainerClient(cfg["STORAGE_CONTAINER"] ?? "videos");
         var name = $"narration/{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}.wav";
+        using var ms = new MemoryStream(wav);
+        var url = await UploadAndSign(container, name, ms, "audio/wav", svc, account, ct);
+        return Results.Ok(new { url, blob = name, bytes = wav.Length });
+    }
+    finally
+    {
+        try { Directory.Delete(work, recursive: true); } catch { }
+    }
+});
+
+// Generate background music (ambient/cinematic/dramatic/uplifting/suspenseful) for a specified duration.
+// Uses ffmpeg to synthesize audio based on the mood. Returns a WAV URL.
+app.MapPost("/api/generate-background-music", async (GenerateBackgroundMusicRequest req,
+    IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
+{
+    var mood = (req?.Mood ?? "ambient").ToLowerInvariant();
+    var durationSec = Math.Clamp(req?.DurationSeconds ?? 30, 3, 300);
+    // The slider (0–1) sets how present the bed is. Cap well below the spoken track so
+    // music stays *under* narration; baked in here so the mux is a simple amix.
+    var bedVolume = Math.Clamp(req?.MusicVolume ?? 0.5, 0, 1) * 0.4;
+
+    var ffmpeg = LocateFfmpeg();
+    if (ffmpeg is null)
+        return Results.Problem("ffmpeg binary not found. Expected at ./bin/ffmpeg (bundled by CI).");
+
+    var work = Path.Combine(Path.GetTempPath(), $"music-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(work);
+    try
+    {
+        var outPath = Path.Combine(work, "out.wav");
+
+        // Generate different ambient soundscapes based on mood using ffmpeg filters
+        var freq = mood switch
+        {
+            "cinematic" => "f=110:t=sine,f=220:t=sine,f=330:t=sine",      // Low, rich tones
+            "dramatic" => "f=100:t=sine,f=160:t=sine,f=240:t=sine",       // Dramatic bass
+            "ambient" => "f=60:t=sine,f=90:t=sine,f=120:t=sine",          // Low ambient hum
+            "uplifting" => "f=200:t=sine,f=400:t=sine,f=600:t=sine",      // Higher tones
+            "suspenseful" => "f=55:t=sine,f=110:t=sine,f=165:t=sine",     // Deep suspenseful
+            _ => "f=120:t=sine"                                            // Default
+        };
+
+        var volStr = bedVolume.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
+        var fadeOut = Math.Max(0, durationSec - 1);
+        // Create layered sine waves with fade in/out at the slider-controlled bed volume
+        var args = $"-f lavfi -i \"sine={freq}:d={durationSec}\" " +
+                   $"-af \"afade=t=in:st=0:d=1,afade=t=out:st={fadeOut}:d=1,volume={volStr}\" " +
+                   $"-c:a pcm_s16le -y \"{outPath}\"";
+
+        var (ec, stderr) = await RunProcessAsync(ffmpeg, args, ct);
+        if (ec != 0 || !File.Exists(outPath))
+            return Results.Problem($"ffmpeg music generation failed (exit {ec}): {stderr.Substring(0, Math.Min(stderr.Length, 1500))}");
+
+        var wav = await File.ReadAllBytesAsync(outPath, ct);
+        var account = Cfg(cfg, "STORAGE_ACCOUNT");
+        var svc = new BlobServiceClient(new Uri($"https://{account}.blob.core.windows.net"), cred);
+        var container = svc.GetBlobContainerClient(cfg["STORAGE_CONTAINER"] ?? "videos");
+        var name = $"music/{DateTime.UtcNow:yyyyMMdd-HHmmss}-{mood}-{Guid.NewGuid():N}.wav";
         using var ms = new MemoryStream(wav);
         var url = await UploadAndSign(container, name, ms, "audio/wav", svc, account, ct);
         return Results.Ok(new { url, blob = name, bytes = wav.Length });
@@ -3231,6 +3294,7 @@ public record StoryboardRequest(string Prompt, int? TotalSeconds, int? ClipSecon
 public record NarrationScriptRequest(string? Idea, string? Title, string? Logline, string[]? Actions, int? TotalSeconds, string? Prompt, string? Voice);
 public record MuxAudioRequest(string VideoUrl, string AudioUrl, string? Mode);
 public record ConcatAudioRequest(string[]? AudioUrls, int? GapMs);
+public record GenerateBackgroundMusicRequest(string? Mood, int? DurationSeconds, double? MusicVolume);
 public record DialogueClip(int Index, string? Title, string? Action, string? Narration);
 public record DialogueRequest(string? Direction, string? Language, DialogueClip[]? Clips);
 

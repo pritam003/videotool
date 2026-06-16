@@ -58,6 +58,8 @@ public sealed record StorySpec
     public JsonNode? Story { get; init; }
     public string? Idea { get; init; }      // the user's original story idea, recorded on the film for the History view
     public List<CastMemberSpec> Cast { get; init; } = new();
+    public string? BackgroundMusic { get; init; }   // mood: "" | cinematic | dramatic | ambient | uplifting | suspenseful
+    public double MusicVolume { get; init; } = 0.5;  // 0–1 bed level for the background music
 }
 
 public sealed class StoryJob
@@ -323,6 +325,7 @@ public sealed class StoryRenderWorker : BackgroundService
         var finals = new List<string>();
         string? prevFrameName = null;
         JsonNode? prevClip = null;
+        var anyAudio = false;   // did any clip get a spoken track? decides how music is laid in
 
         for (int i = 0; i < N; i++)
         {
@@ -414,6 +417,7 @@ public sealed class StoryRenderWorker : BackgroundService
                         var mr = await PostJsonAsync("/api/mux-audio",
                             new { videoUrl = clipUrl, audioUrl, mode = "fit" }, ct);
                         clipUrl = mr.GetProperty("url").GetString()!;
+                        anyAudio = true;
                     }
                 }
                 catch (OperationCanceledException) { throw; }
@@ -450,6 +454,36 @@ public sealed class StoryRenderWorker : BackgroundService
         else if (finals.Count == 1)
         {
             job.ResultUrl = finals[0];
+        }
+
+        // ---- 4) BACKGROUND MUSIC: lay an ambient bed under the finished film. ----
+        // If clips carry spoken audio we mix the music UNDER it (musicmix, narration stays
+        // full); otherwise the music becomes the film's sole track (replace). Failures keep
+        // the film as-is, so music is always best-effort and never blocks delivery.
+        if (!string.IsNullOrWhiteSpace(spec.BackgroundMusic) && !string.IsNullOrWhiteSpace(job.ResultUrl))
+        {
+            try
+            {
+                job.Pct = 97; job.Label = "composing background music";
+                // Overshoot the duration (fit mode stretches clips past clipSec); the mux
+                // trims music to the film length, so a generous estimate is safe.
+                var estDuration = N * clipSec + N * 3 + 5;
+                var mg = await PostJsonAsync("/api/generate-background-music",
+                    new { mood = spec.BackgroundMusic, durationSeconds = estDuration, musicVolume = spec.MusicVolume }, ct);
+                var musicUrl = mg.GetProperty("url").GetString();
+                if (!string.IsNullOrWhiteSpace(musicUrl))
+                {
+                    job.Label = "mixing in background music";
+                    var mode = anyAudio ? "musicmix" : "replace";
+                    var mm = await PostJsonAsync("/api/mux-audio",
+                        new { videoUrl = job.ResultUrl, audioUrl = musicUrl, mode }, ct);
+                    var musicked = mm.GetProperty("url").GetString();
+                    if (!string.IsNullOrWhiteSpace(musicked)) job.ResultUrl = musicked;
+                    await _queue.PersistAsync(job);
+                }
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) { _log.LogWarning(ex, "background music failed; film kept without music"); }
         }
     }
 
