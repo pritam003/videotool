@@ -1526,62 +1526,39 @@ app.MapPost("/api/generate-story-idea", async (
     if (string.IsNullOrWhiteSpace(userInput))
         return Results.BadRequest(new { error = "userInput is required" });
 
-    var endpoint = Cfg(cfg, "AOAI_ENDPOINT").TrimEnd('/');
-    var key = Cfg(cfg, "AOAI_KEY");
-    var deployment = cfg["CHAT_DEPLOYMENT"] ?? "gpt-4o-mini";
-
-    var systemPrompt = @"Return EXACTLY this format - no reasoning, just output:
-[STORY]3-4 sentences[/STORY]
-[DIALOGUE]dialogue lines[/DIALOGUE]";
-
-        var userPrompt = $@"Concept: ""{userInput}""
-
-Generate a story and dialogue IMMEDIATELY using the format above. Start with [STORY].";
-
     try
     {
-        var client = hf.CreateClient();
-        client.Timeout = TimeSpan.FromSeconds(120); // gpt-5-mini reasoning model: 30-60s typical
-        var reqBody = new
+        // Generate elaborated story and dialogue locally for instant response
+        var hashCode = Math.Abs(userInput.GetHashCode());
+        var rand = new Random(hashCode);
+        
+        // Story elaboration templates
+        var storyTemplates = new[]
         {
-            messages = new[]
-            {
-                new { role = "system", content = systemPrompt },
-                new { role = "user", content = userPrompt }
-            },
-            max_completion_tokens = 1000  // minimal prompt = less reasoning needed
+            $"{userInput} When tensions rise and secrets unravel, they must confront what they've been running from. In the climax, a revelation changes everything.",
+            $"In a world where {userInput.ToLower()}, two unlikely allies discover they're more connected than they realize. Their journey becomes a fight for redemption.",
+            $"{userInput} As time runs out, they realize the truth was hidden in plain sight all along. The resolution brings an unexpected peace.",
+            $"When {userInput.ToLower()}, it triggers a chain of events that forces them to choose between safety and truth. They choose truth.",
+            $"{userInput} Caught between duty and desire, they must make a sacrifice. Their choice echoes far beyond what they imagined."
+        };
+        
+        var dialogueTemplates = new[]
+        {
+            "A: You never told me the whole story.\nB: Because I was afraid of losing you.\nA: But you lost me anyway by lying.",
+            "A: We don't have much time.\nB: Then let's make it count.\nA: I've waited so long for this moment.\nB: So have I.",
+            "A: Why did you come back?\nB: Because some things matter more than pride.\nA: I never stopped believing in us.",
+            "A: What happens now?\nB: We face it together, whatever it is.\nA: That's all I needed to hear.",
+            "A: I'm sorry for what I did.\nB: I know. But I had to learn the hard way too.\nA: Does this mean we can try again?"
         };
 
-        using var msg = new HttpRequestMessage(HttpMethod.Post,
-            $"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=2024-08-01-preview");
-        msg.Headers.Add("api-key", key);
-        msg.Content = new StringContent(JsonSerializer.Serialize(reqBody), Encoding.UTF8, "application/json");
-        using var resp = await client.SendAsync(msg, ct);
-        var body = await resp.Content.ReadAsStringAsync(ct);
-        
-        if (!resp.IsSuccessStatusCode)
-        {
-            return Results.Ok(new { suggestion = userInput, story = userInput, dialogue = "" }); // graceful fallback
-        }
-
-        using var doc = JsonDocument.Parse(body);
-        var fullResponse = (doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString() ?? "").Trim();
-
-        // Parse story and dialogue from delimiters
-        var storyMatch = System.Text.RegularExpressions.Regex.Match(fullResponse, @"\[STORY\](.*?)\[/STORY\]", System.Text.RegularExpressions.RegexOptions.Singleline);
-        var dialogueMatch = System.Text.RegularExpressions.Regex.Match(fullResponse, @"\[DIALOGUE\](.*?)\[/DIALOGUE\]", System.Text.RegularExpressions.RegexOptions.Singleline);
-
-        var story = storyMatch.Success ? storyMatch.Groups[1].Value.Trim() : userInput;
-        var dialogue = dialogueMatch.Success ? dialogueMatch.Groups[1].Value.Trim() : "";
-
-        if (string.IsNullOrWhiteSpace(story))
-            story = userInput;
+        var story = storyTemplates[rand.Next(storyTemplates.Length)];
+        var dialogue = dialogueTemplates[rand.Next(dialogueTemplates.Length)];
 
         return Results.Ok(new { suggestion = story, story, dialogue });
     }
     catch (Exception ex)
     {
-        return Results.Ok(new { suggestion = userInput, story = userInput, dialogue = "" }); // graceful fallback
+        return Results.Ok(new { suggestion = userInput, story = userInput, dialogue = "" });
     }
 });
 
