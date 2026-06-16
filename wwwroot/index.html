@@ -772,7 +772,14 @@ function App() {
       description: `${char.personality}. Motivation: ${char.motivation}`
     }));
     
+    // Enhance story with character context
+    const characterIntros = castList
+      .map(c => `${c.name} (${c.role}): ${c.description}`)
+      .join(" · ");
+    const enrichedStory = scStoryPrompt ? `${scStoryPrompt}\n\nCharacters: ${characterIntros}` : characterIntros;
+    
     setScCast(castList);
+    setScStoryPrompt(enrichedStory); // Update story with character context
     // Populate with actual dialogue if available, otherwise use character names
     setScDialogPrompt(dialogue && dialogue.trim() ? dialogue : castList.map(c => `${c.name} (${c.role})`).join(", "));
     setWizStep(1); // Go to step 1 to review story + dialogue together

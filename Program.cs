@@ -1748,35 +1748,38 @@ app.MapPost("/api/generate-characters", async (
 // Helper function to generate multi-character dialogue
 static string GenerateMultiCharacterDialogue(List<object> characters, Random rand)
 {
-    var dialogueLines = new List<string>();
     var charList = characters.Cast<dynamic>().ToList();
     
     if (charList.Count >= 2)
     {
-        var interactions = new Dictionary<(int, int), string[]>
-        {
-            { (0, 1), new[] {
-                $"{charList[0].name}: I need your help.\n{charList[1].name}: Tell me everything.",
-                $"{charList[0].name}: Why did you leave?\n{charList[1].name}: Because I had to protect you.",
-                $"{charList[0].name}: Do you trust me?\n{charList[1].name}: With my life."
-            }},
-            { (1, 0), new[] {
-                $"{charList[1].name}: What happened to you?\n{charList[0].name}: Something changed everything.",
-                $"{charList[1].name}: I never forgot you.\n{charList[0].name}: I know. I felt it.",
-                $"{charList[1].name}: Are you ready?\n{charList[0].name}: I was born ready."
-            }}
+        // Generate elaborate multi-exchange dialogue with emotional depth
+        var c1 = charList[0];
+        var c2 = charList[1];
+        
+        var elaborateDialogues = new[] {
+            $"{c1.name}: I need your help with this.\n{c2.name}: You know I'm here for you. What's going on?\n{c1.name}: It's complicated. I've been searching for answers for years.\n{c2.name}: Then we'll search together. That's what friends do.",
+            
+            $"{c1.name}: Why did you disappear back then?\n{c2.name}: Because I had to protect you. You have to understand that.\n{c1.name}: Protect me from what? I deserved to know the truth.\n{c2.name}: Maybe. But some truths are too dangerous to share.",
+            
+            $"{c1.name}: Do you trust me?\n{c2.name}: With my life. Always have, always will.\n{c1.name}: Even now? After everything that's happened?\n{c2.name}: Especially now. That's when trust matters most.",
+            
+            $"{c1.name}: I can't do this alone anymore.\n{c2.name}: Then don't. Tell me what you need.\n{c1.name}: I need to know I'm not losing my mind. Tell me you see it too.\n{c2.name}: I see it. You're not alone in this. Not anymore.",
+            
+            $"{c1.name}: What if we're too late?\n{c2.name}: We're not. Look at me—we still have time.\n{c1.name}: How can you be so sure?\n{c2.name}: Because I believe in us. That has to be enough."
         };
-
-        var key = (0, 1);
-        if (interactions.ContainsKey(key))
-        {
-            var interactionDialogues = interactions[key];
-            return interactionDialogues[rand.Next(interactionDialogues.Length)];
-        }
+        
+        return elaborateDialogues[rand.Next(elaborateDialogues.Length)];
     }
 
     if (charList.Count >= 1)
-        return $"{charList[0].name}: {charList[0].sampleDialogue}";
+    {
+        var c = charList[0];
+        var monologues = new[] {
+            $"{c.name}: {c.sampleDialogue}\n[Internal struggle weighs heavy] I need to figure out what comes next.",
+            $"{c.name}: Everything has changed. Nothing will ever be the same.\n{c.name}: But maybe that's not a bad thing. Maybe this is where it all begins.",
+        };
+        return monologues[rand.Next(monologues.Length)];
+    }
 
     return "Character dialogue pending...";
 }
