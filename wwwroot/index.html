@@ -1829,6 +1829,14 @@ function App() {
               </button>
             `}
 
+            ${(reasoningWorkflow === "analyzing" || reasoningWorkflow === "generating") && html`
+              <div style=${{display:"flex",flexDirection:"column",alignItems:"center",gap:6,padding:"24px 8px",textAlign:"center"}}>
+                <div style=${{fontSize:22}}>${reasoningWorkflow === "analyzing" ? "💭" : "✨"}</div>
+                <div style=${{fontSize:13,fontWeight:600}}>${reasoningWorkflow === "analyzing" ? "Analyzing your idea…" : "Writing your story & dialogue…"}</div>
+                <div class="muted small">The AI is thinking it through — this can take up to a minute. Please keep this tab open.</div>
+              </div>
+            `}
+
             ${reasoningWorkflow === "questions" && reasoningAnalysis && html`
               <div style=${{display:"flex",flexDirection:"column",gap:10}}>
                 ${reasoningAnalysis.questions && reasoningAnalysis.questions.map((q, i) => html`

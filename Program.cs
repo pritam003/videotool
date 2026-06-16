@@ -59,7 +59,6 @@ static bool IsPublicAuthPath(PathString p) =>
     p.StartsWithSegments("/api/generate-story-idea") ||
     p.StartsWithSegments("/api/generate-characters") ||
     p.StartsWithSegments("/api/analyze-prompt") ||
-    p.StartsWithSegments("/api/generate-story-with-dialogue") ||
     p.Equals("/sw.js", StringComparison.OrdinalIgnoreCase) ||
     p.Equals("/favicon.ico", StringComparison.OrdinalIgnoreCase) ||
     p.Equals("/api/push/vapid-public-key", StringComparison.OrdinalIgnoreCase);
@@ -1779,8 +1778,11 @@ app.MapPost("/api/analyze-prompt", (
 // ─────────────────────────────────────────────────────────────────────────────
 // Generate Story with Dialogue: Synchronized generation based on analysis
 // ─────────────────────────────────────────────────────────────────────────────
-app.MapPost("/api/generate-story-with-dialogue", (
-    [FromBody] JsonElement req) =>
+app.MapPost("/api/generate-story-with-dialogue", async (
+    [FromBody] JsonElement req,
+    IHttpClientFactory hf,
+    IConfiguration cfg,
+    CancellationToken ct) =>
 {
     var userPrompt = req.GetProperty("prompt").GetString() ?? "";
     if (string.IsNullOrWhiteSpace(userPrompt))
@@ -1789,131 +1791,149 @@ app.MapPost("/api/generate-story-with-dialogue", (
     // Free-text refinement direction (optional) — typed by the user to steer generation.
     var feedback = req.TryGetProperty("feedback", out var fb) ? (fb.GetString() ?? "").Trim() : "";
 
-    try
+    // Creative choices from the dropdowns (optional — only sent through when chosen).
+    var refinements = req.TryGetProperty("refinements", out var ref_elem) ? ref_elem : new JsonElement();
+    string Pick(string k) => refinements.ValueKind == JsonValueKind.Object
+        && refinements.TryGetProperty(k, out var v) && v.ValueKind == JsonValueKind.String
+        ? (v.GetString() ?? "").Trim() : "";
+    var tone = Pick("tone");
+    var complexity = Pick("characterComplexity");
+    var dialogueStyle = Pick("dialogueStyle");
+    var pacing = Pick("pacing");
+
+    var endpoint = Cfg(cfg, "AOAI_ENDPOINT").TrimEnd('/');
+    var key = Cfg(cfg, "AOAI_KEY");
+    var deployment = cfg["CHAT_DEPLOYMENT"] ?? "gpt-4o-mini";
+
+    var directionLine = string.IsNullOrWhiteSpace(feedback)
+        ? "No extra direction was given — choose fitting details yourself."
+        : $"Director's direction (OBEY THIS EXACTLY): {feedback}";
+    var choices = new List<string>();
+    if (!string.IsNullOrWhiteSpace(tone)) choices.Add($"tone: {tone}");
+    if (!string.IsNullOrWhiteSpace(complexity)) choices.Add($"character complexity: {complexity}");
+    if (!string.IsNullOrWhiteSpace(dialogueStyle)) choices.Add($"dialogue style: {dialogueStyle}");
+    if (!string.IsNullOrWhiteSpace(pacing)) choices.Add($"pacing: {pacing}");
+    var choiceLine = choices.Count > 0 ? "Creative choices — " + string.Join("; ", choices) + "." : "";
+
+    var sys = @"You are a creative short-film story developer. Expand the user's idea into a vivid, COHERENT concept: a story summary, a dialogue plan, and a small cast — all faithful to the user's idea and any direction they give.
+
+HARD RULES:
+- Ground EVERYTHING in the user's ACTUAL idea. If the idea is a cute dancing potato, the story, characters, tone and dialogue must all be about THAT. NEVER substitute an unrelated genre — do not turn it into a generic detective / crime / thriller unless the idea itself is one.
+- OBEY the user's direction precisely. If they ask for character names in a language (e.g. Hindi), the names MUST be in that language. If they ask for narration or dialogue in a language, write the sample dialogue lines in that language USING ITS NATIVE SCRIPT (Devanagari for Hindi, Bengali script for Bengali) — never romanized. Apply any requested setting, tone, twist or length.
+- storyIdea: 2-4 short natural-prose paragraphs (premise; who the characters are and what they want; the emotional arc from start to end). Do NOT use rigid headers like 'THEMES:', 'STORY STRUCTURE:' or 'CHARACTER ARCS:'.
+- dialogueIdea: each main character's speaking voice, plus 2-4 sample lines that fit THIS story (in the requested language and script), and how the conversation evolves. Lines must use subtext — never on-the-nose like 'I am sad'.
+- characters: 2-4 entries; each { name, role, personality, arc }. Names and content must match the idea and any language direction. 'arc' is a short transformation in a few words.
+- Keep it concise and usable as a film brief.
+Return ONE JSON object EXACTLY: { ""storyIdea"": ""..."", ""dialogueIdea"": ""..."", ""characters"": [ { ""name"": ""..."", ""role"": ""..."", ""personality"": ""..."", ""arc"": ""..."" } ], ""reasoning"": ""one short sentence"" } — no markdown, no extra keys.";
+
+    var user = $@"Idea: {userPrompt}
+{directionLine}
+{choiceLine}
+Write the JSON now.";
+
+    var client = hf.CreateClient();
+    client.Timeout = TimeSpan.FromSeconds(600); // gpt-5-mini reasoning can be slow
+
+    for (int attempt = 1; attempt <= 4; attempt++)
     {
-        // Fold the free-text feedback into the seed so each distinct refinement produces a
-        // visibly different variation (the generator is deterministic per seed).
-        var hashCode = Math.Abs((userPrompt + "||" + feedback).GetHashCode());
-        var rand = new Random(hashCode);
-
-        // Get user refinements if provided
-        var refinements = req.TryGetProperty("refinements", out var ref_elem) 
-            ? ref_elem 
-            : new JsonElement();
-
-        var tone = refinements.TryGetProperty("tone", out var t) ? t.GetString() : "Dramatic & tense";
-        var complexity = refinements.TryGetProperty("characterComplexity", out var c) ? c.GetString() : "Nuanced";
-        var dialogueStyle = refinements.TryGetProperty("dialogueStyle", out var d) ? d.GetString() : "Realistic";
-
-        // Select 2-3 characters
-        var characterArchetypes = new[]
+        try
         {
-            new { name = "Morgan", role = "The Detective", personality = "Determined, haunted by past, seeking redemption", arc = "Guilt → Confrontation → Growth" },
-            new { name = "Alex", role = "The Partner", personality = "Idealistic, optimistic, challenging", arc = "Naive → Mature → Experienced" },
-            new { name = "Jordan", role = "The Mentor", personality = "Wise, protective, experienced guide", arc = "Distant → Engaged → Connected" },
-            new { name = "Casey", role = "The Conflicted One", personality = "Torn between duty and desire", arc = "Confused → Committed → Resolved" },
-            new { name = "Riley", role = "The Companion", personality = "Loyal, supportive, perceptive", arc = "Supportive → Challenging → United" }
-        };
-
-        var selectedCharIndices = new HashSet<int>();
-        var characterCount = rand.Next(2, 4);
-        var selectedCharacters = new List<object>();
-
-        for (int i = 0; i < characterCount; i++)
-        {
-            int idx = rand.Next(characterArchetypes.Length);
-            while (selectedCharIndices.Contains(idx))
-                idx = rand.Next(characterArchetypes.Length);
-            selectedCharIndices.Add(idx);
-
-            var arch = characterArchetypes[idx];
-            selectedCharacters.Add(new
+            var payload = new
             {
-                name = arch.name,
-                role = arch.role,
-                personality = arch.personality,
-                arc = arch.arc
-            });
-        }
+                messages = new object[] {
+                    new { role = "system", content = sys },
+                    new { role = "user",   content = user }
+                },
+                max_completion_tokens = 8000,
+                response_format = new { type = "json_object" }
+            };
+            using var msg = new HttpRequestMessage(HttpMethod.Post,
+                $"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=2024-10-21");
+            msg.Headers.Add("api-key", key);
+            msg.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
 
-        // Generate Story Idea with character integration
-        var c1 = ((dynamic)selectedCharacters[0]);
-        var c2 = ((dynamic)selectedCharacters[selectedCharacters.Count > 1 ? 1 : 0]);
-        var c1ArcEnd = c1.arc.Contains("→") ? c1.arc.Split('→')[1].Trim() : "growth";
+            using var resp = await client.SendAsync(msg, ct);
+            var body = await resp.Content.ReadAsStringAsync(ct);
 
-        // When the user typed a free-text direction, weave it into the opening so the
-        // regenerated story visibly honors it (and it carries into the film prompt).
-        var storyOpener = string.IsNullOrWhiteSpace(feedback)
-            ? $"{userPrompt} unfolds as a deeply personal journey."
-            : $"{userPrompt} unfolds as a deeply personal journey, shaped by your direction: \"{feedback}\".";
-
-        var storyIdea = $@"{storyOpener}
-
-{c1.name} ({c1.role}) enters the story burdened by {c1.arc}. Their initial approach: {(rand.Next(2) == 0 ? "cautious and analytical" : "direct and impulsive")}. As events progress, {c1.name} must confront their deepest fears.
-
-{c2.name} ({c2.role}) serves as both mirror and catalyst, experiencing their own arc of {c2.arc}. Their perspective challenges {c1.name}'s assumptions and drives key turning points.
-
-STORY STRUCTURE:
-Setup: {userPrompt}. {c1.name} and {c2.name} meet with conflicting goals. First impressions create tension.
-Conflict: Complications mount. {c1.name}'s past becomes relevant. {c2.name} questions {c1.name}'s methods. Trust hangs in balance.
-Resolution: Truth emerges. {c1.name} achieves growth through {c1ArcEnd}. {c2.name} and {c1.name} forge deeper bond. Themes resolve.
-
-THEMES: redemption, truth, trust, transformation
-
-CHARACTER ARCS IN STORY:
-• {c1.name}: {c1.arc}
-• {c2.name}: {c2.arc}";
-
-        // Generate Dialogue Idea synchronized with story
-        var dialogueExchanges = new[] 
-        {
-            $"{c1.name}: I can't do this alone anymore.\n{c2.name}: Then stop running. Tell me the truth.\n{c1.name}: You don't understand what I've done.\n{c2.name}: Then help me understand. That's what partners do.",
-
-            $"{c1.name}: Why are you still here?\n{c2.name}: Because you're worth staying for.\n{c1.name}: Even after everything?\n{c2.name}: Especially after everything.",
-
-            $"{c1.name}: I made a mistake years ago.\n{c2.name}: We all have.\n{c1.name}: Not like this. Not something that hurt someone.\n{c2.name}: Then we fix it. Together.",
-
-            $"{c1.name}: The truth is complicated.\n{c2.name}: Good. I prefer complicated to lies.\n{c1.name}: This could destroy us both.\n{c2.name}: Or it could be what saves us.",
-
-            $"{c1.name}: I need to know you believe me.\n{c2.name}: I do. I always have.\n{c1.name}: How can you be so sure?\n{c2.name}: Because I know who you really are."
-        };
-
-        var dialogueIdea = $@"Dialogue in this story balances investigation/exposition with emotional vulnerability.
-
-{c1.name}'s Voice: Direct, sometimes guarded, gradually opens up. Speaks in short sentences. Asks probing questions. Phrases: 'I need facts', 'This is about trust now', 'I owe you the truth'
-
-{c2.name}'s Voice: More expressive and idealistic. Challenges {c1.name}'s assumptions. Longer, more flowing sentences. Phrases: 'There's more to this', 'You can trust me', 'We'll figure it out together'
-
-DIALOGUE PROGRESSION:
-Early: Professional, transactional. Tension from conflicting methods.
-Middle: Personal breakthroughs. Vulnerability begins. Emotional stakes rise.
-Late: Deep connection. Shared understanding. {c1.name} finally opens up.
-
-KEY DIALOGUE MOMENT:
-{dialogueExchanges[rand.Next(dialogueExchanges.Length)]}
-
-DIALOGUE TONE: Mix of investigation talk (facts, clues, theories) with emotional vulnerability (fears, hopes, regrets). As trust builds, exchanges become more personal and revealing.
-
-DELIVERY NOTES: Early dialogue should feel strained, later dialogue should feel natural and comfortable. Emotional beats aligned with story turning points.";
-
-        return Results.Ok(new
-        {
-            storyIdea,
-            dialogueIdea,
-            characters = selectedCharacters,
-            reasoning = new
+            if (!resp.IsSuccessStatusCode)
             {
-                finalAnalysis = $"Based on '{tone}' tone and {complexity} characters: generating synchronized story and dialogue.",
-                characterDecisions = $"Selected {selectedCharacters.Count} characters with contrasting personalities to create rich dynamics.",
-                storyApproach = "3-act structure emphasizing character growth and transformation through conflict.",
-                dialogueApproach = $"{dialogueStyle} dialogue that deepens as trust builds between characters."
+                var isTransient = (int)resp.StatusCode == 429 || (int)resp.StatusCode == 408 || (int)resp.StatusCode >= 500;
+                if (isTransient && attempt < 4) { await Task.Delay((int)Math.Pow(2, attempt - 1) * 1000, ct); continue; }
+                break; // fall through to the honest fallback below
             }
-        });
+
+            string raw;
+            try
+            {
+                using var doc = JsonDocument.Parse(body);
+                raw = doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString()?.Trim() ?? "";
+            }
+            catch { raw = ""; }
+
+            var js = raw.IndexOf('{'); var je = raw.LastIndexOf('}');
+            if (js >= 0 && je > js) raw = raw.Substring(js, je - js + 1);
+
+            if (string.IsNullOrWhiteSpace(raw))
+            {
+                if (attempt < 4) { await Task.Delay((int)Math.Pow(2, attempt - 1) * 1000, ct); continue; }
+                break;
+            }
+
+            try
+            {
+                var node = System.Text.Json.Nodes.JsonNode.Parse(raw);
+                var storyIdea = node?["storyIdea"]?.ToString() ?? "";
+                var dialogueIdea = node?["dialogueIdea"]?.ToString() ?? "";
+                var chars = new List<object>();
+                if (node?["characters"] is System.Text.Json.Nodes.JsonArray ca)
+                    foreach (var ch in ca)
+                    {
+                        if (ch is null) continue;
+                        chars.Add(new
+                        {
+                            name = ch["name"]?.ToString() ?? "",
+                            role = ch["role"]?.ToString() ?? "",
+                            personality = ch["personality"]?.ToString() ?? "",
+                            arc = ch["arc"]?.ToString() ?? ""
+                        });
+                    }
+                if (string.IsNullOrWhiteSpace(storyIdea))
+                {
+                    if (attempt < 4) { await Task.Delay((int)Math.Pow(2, attempt - 1) * 1000, ct); continue; }
+                    break;
+                }
+                return Results.Ok(new
+                {
+                    storyIdea,
+                    dialogueIdea,
+                    characters = chars,
+                    reasoning = new { finalAnalysis = node?["reasoning"]?.ToString() ?? "" }
+                });
+            }
+            catch
+            {
+                if (attempt < 4) { await Task.Delay((int)Math.Pow(2, attempt - 1) * 1000, ct); continue; }
+                break;
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception) when (attempt < 4)
+        {
+            await Task.Delay((int)Math.Pow(2, attempt - 1) * 1000, ct);
+            continue;
+        }
+        catch { break; }
     }
-    catch (Exception ex)
+
+    // Honest fallback — hand back the user's own idea (editable) instead of unrelated
+    // boilerplate, so a momentary AI hiccup never injects a wrong-genre detective story.
+    return Results.Ok(new
     {
-        return Results.Ok(new { error = ex.Message, storyIdea = "", dialogueIdea = "" });
-    }
+        storyIdea = string.IsNullOrWhiteSpace(feedback) ? userPrompt : $"{userPrompt}\n\nDirection: {feedback}",
+        dialogueIdea = "",
+        characters = Array.Empty<object>(),
+        reasoning = new { finalAnalysis = "The AI writer was momentarily unavailable — this is your idea as-is. Edit it directly, or press Regenerate to try again." }
+    });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
