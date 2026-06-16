@@ -2865,6 +2865,7 @@ DIALOGUE (words spoken on screen):
 
 BOTH MODES:
 - Keep every spoken line SHORT and speakable — natural, unhurried. HARD LIMIT per clip: narration + dialogue TOGETHER at most about {Math.Max(6, clipSeconds * 2)} words, spoken calmly within roughly {clipSeconds} seconds. Count the words; if over, cut ruthlessly.
+- SMOOTH & HUMAN: write each line as ONE complete, naturally-phrased sentence that flows off the tongue — NEVER a choppy comma-list of actions (e.g. for Hindi 'आलू उठा, नाचा, मुस्कुराया' is ROBOTIC and WRONG; write a real flowing sentence instead). Use natural connectors so it sounds like a person speaking, not a caption. In {language}, use ONLY pure {language} words in its native script — NEVER an English loanword written in that script (for Hindi: छपाक not 'स्पलैश', संगीत not 'म्यूज़िक', ताली not 'क्लैप'); only real proper names may stay.
 - EMOTION: give every clip a one-word `mood` (sad, hopeful, tender, lonely, warm, anxious, joyful, calm, bittersweet, serious, longing…); it drives how the line is PERFORMED and the background music. Let the mood evolve across the clips with the arc.
 - Keep title, style, action and motionPrompt in ENGLISH (the video model needs English). ONLY narration and dialog are written in {language}'s native script."
         : @"AUDIO:
@@ -3254,6 +3255,118 @@ Return the JSON now.";
     
     // If all retries exhausted, return empty dialogues
     return Results.Ok(new { dialogs = clips.Select(c => new { index = c.Index, dialog = "" }).ToList() });
+});
+
+// Smooth/polish pass: rewrite a storyboard's EXISTING narration + dialogue into ONE smooth,
+// flowing, natural-sounding spoken track — fixing robotic, choppy, machine-translated phrasing,
+// English loanwords, and clip-to-clip jumps. The picture is untouched; only the words change.
+app.MapPost("/api/smooth-narration", async (SmoothNarrationRequest req, IHttpClientFactory hf,
+    IConfiguration cfg, CancellationToken ct) =>
+{
+    var clips = (req?.Clips ?? Array.Empty<SmoothClip>()).Where(c => c is not null).ToArray();
+    if (clips.Length == 0)
+        return Results.BadRequest(new { error = "clips are required" });
+
+    var endpoint = Cfg(cfg, "AOAI_ENDPOINT").TrimEnd('/');
+    var key = Cfg(cfg, "AOAI_KEY");
+    var deployment = cfg["CHAT_DEPLOYMENT"] ?? "gpt-4o-mini";
+    var language = string.IsNullOrWhiteSpace(req?.Language) ? "English" : req!.Language!.Trim();
+    var clipSec = (int)Math.Round(Math.Clamp(req?.ClipSeconds ?? 5, 3, 8));
+    var castMap = (req?.Cast ?? Array.Empty<SmoothCastMember>())
+        .Where(c => c is not null && !string.IsNullOrWhiteSpace(c!.Id))
+        .GroupBy(c => c!.Id!).ToDictionary(g => g.Key, g => g.First()!.Name ?? g.Key);
+
+    var sys = $@"You are a master {language} screenwriter and voiceover poet polishing the spoken track of a short film told across {clips.Length} back-to-back clips.
+For each clip you get its English ACTION (what is visible) plus its CURRENT narration and dialogue in {language}. The current text sounds ROBOTIC, choppy and machine-translated. REWRITE it so it sounds like a real human {language} narrator and real people speaking.
+Rules:
+- Write ONLY in {language} using its NATIVE SCRIPT (Devanagari for Hindi/Marathi, Bengali script for Bengali, etc.) — NEVER romanized, and replace EVERY English loanword with a true {language} word (for Hindi: छपाक not 'स्पलैश', संगीत not 'म्यूज़िक', ताली not 'क्लैप'); only real proper names may stay.
+- SMOOTH & FLOWING: turn choppy comma-lists (e.g. 'आलू उठा, नाचा, मुस्कुराया') into complete, naturally phrased sentences that breathe and sound effortless to say aloud. Read clip 1 → {clips.Length} as ONE continuous voice with natural connectors (और, फिर, तभी, मगर, जैसे, इसलिए…); each line continues from the one before, never restarts or repeats.
+- NARRATION must voice the FEELING / meaning / what is about to happen — do NOT merely describe the visible action (the picture already shows it). DIALOGUE is what a character truly says, in subtext, natural and in-character (never 'मैं खुश हूँ').
+- Keep each clip ROUGHLY the same length as now (calm, speakable within ~{clipSec}s). Keep WHO speaks unchanged. If a field is empty, keep it empty.
+Return ONE JSON object exactly: {{ ""clips"": [ {{ ""index"": <n>, ""narration"": ""<{language} or empty>"", ""dialog"": ""<{language} or empty>"" }} ] }} — one entry for EVERY clip index given, no markdown.";
+
+    var clipLines = string.Join("\n", clips.Select(c =>
+    {
+        var spk = !string.IsNullOrWhiteSpace(c.Speaker) && castMap.TryGetValue(c.Speaker!, out var nm) ? nm : "";
+        return $"- clip {c.Index}: action = {(c.Action ?? "").Trim()}; narration = \"{(c.Narration ?? "").Trim()}\"; dialogue{(spk != "" ? $" ({spk})" : "")} = \"{(c.Dialog ?? "").Trim()}\"";
+    }));
+    var user = $@"Language: {language}. Rewrite EVERY clip's narration and dialogue so the whole film flows as one smooth, natural, human spoken track — fix the robotic phrasing and any English words:
+{clipLines}
+
+Return the JSON now.";
+
+    var client = hf.CreateClient();
+    client.Timeout = TimeSpan.FromSeconds(600);
+    string? result = null;
+    for (int attempt = 1; attempt <= 4 && result is null; attempt++)
+    {
+        try
+        {
+            var payload = new
+            {
+                messages = new object[] {
+                    new { role = "system", content = sys },
+                    new { role = "user",   content = user }
+                },
+                max_completion_tokens = 8000,
+                reasoning_effort = "low",
+                response_format = new { type = "json_object" }
+            };
+            using var msg = new HttpRequestMessage(HttpMethod.Post,
+                $"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=2024-10-21");
+            msg.Headers.Add("api-key", key);
+            msg.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+            using var resp = await client.SendAsync(msg, ct);
+            var body = await resp.Content.ReadAsStringAsync(ct);
+            if (!resp.IsSuccessStatusCode)
+            {
+                var isTransient = (int)resp.StatusCode == 429 || (int)resp.StatusCode == 408 || (int)resp.StatusCode >= 500;
+                if (isTransient && attempt < 4) { await Task.Delay((int)Math.Pow(2, attempt - 1) * 1000, ct); continue; }
+                return Results.Problem($"Smooth failed ({(int)resp.StatusCode}): {body}");
+            }
+
+            string raw;
+            try
+            {
+                using var doc = JsonDocument.Parse(body);
+                raw = doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString()?.Trim() ?? "";
+            }
+            catch { raw = ""; }
+            var js = raw.IndexOf('{'); var je = raw.LastIndexOf('}');
+            if (js >= 0 && je > js) raw = raw.Substring(js, je - js + 1);
+
+            var node = System.Text.Json.Nodes.JsonNode.Parse(raw);
+            var arr = node?["clips"] as System.Text.Json.Nodes.JsonArray;
+            if (arr is null || arr.Count == 0)
+            {
+                if (attempt < 4) { await Task.Delay((int)Math.Pow(2, attempt - 1) * 1000, ct); continue; }
+                return Results.Problem("Smooth returned no clips");
+            }
+            var outList = new List<object>();
+            foreach (var item in arr)
+            {
+                if (item is null) continue;
+                int.TryParse(item["index"]?.ToString(), out var idx);
+                outList.Add(new { index = idx, narration = item["narration"]?.ToString() ?? "", dialog = item["dialog"]?.ToString() ?? "" });
+            }
+            result = JsonSerializer.Serialize(new { clips = outList });
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            return Results.Problem("cancelled");
+        }
+        catch (Exception) when (attempt < 4)
+        {
+            await Task.Delay((int)Math.Pow(2, attempt - 1) * 1000, ct);
+        }
+        catch (Exception e)
+        {
+            return Results.Problem($"Smooth failed: {e.Message}");
+        }
+    }
+    return result is null
+        ? Results.Problem("Smooth failed after retries")
+        : Results.Content(result, "application/json");
 });
 
 // Audio prompter: write a spoken voiceover script for a finished Story Chain
@@ -4090,6 +4203,12 @@ public record FoleyRequest(string VideoUrl, string? Prompt, string? Size);
 public record ScoreRequest(string? Tags, string? Lyrics, int? DurationSeconds, double? MusicVolume);
 public record DialogueClip(int Index, string? Title, string? Action, string? Narration);
 public record DialogueRequest(string? Direction, string? Language, DialogueClip[]? Clips);
+
+// Smooth/polish pass: rewrite existing per-clip narration + dialogue into one flowing,
+// natural-sounding spoken track (fixes robotic/choppy machine phrasing, English loanwords).
+public record SmoothClip(int Index, string? Action, string? Narration, string? Dialog, string? Speaker);
+public record SmoothCastMember(string? Id, string? Name);
+public record SmoothNarrationRequest(string? Language, double? ClipSeconds, SmoothClip[]? Clips, SmoothCastMember[]? Cast);
 
 // In-memory store for PromptCraft jobs. Single-instance F1 deployment, so a
 // process-local concurrent dictionary is the simplest viable storage. Jobs

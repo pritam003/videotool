@@ -495,6 +495,7 @@ function App() {
   const [scNarrationPrompt, setScNarrationPrompt] = useState("");
   const [scNarrationText, setScNarrationText] = useState(""); // editable script — the user's words win
   const [scNarrating, setScNarrating] = useState(false);      // script generation in flight
+  const [scSmoothing, setScSmoothing] = useState(false);      // narration/dialogue smoothing pass in flight
   const [scNarrAudio, setScNarrAudio] = useState(null);       // last voice preview { url }
 
   // ── Audio Lab: hear the whole narration in every Indian voice BEFORE building a story ──
@@ -1090,6 +1091,37 @@ function App() {
       dbg("warn", "clipboard copy failed", e.message);
       toast("Copy failed — select & copy from the box manually.", true);
     }
+  }
+
+  // Rewrite EVERY clip's narration + dialogue into one smooth, flowing, natural-sounding
+  // track (fixes robotic/choppy machine phrasing, English loanwords, clip-to-clip jumps).
+  // The picture is untouched — only the spoken words are polished.
+  async function smoothNarration() {
+    if (!scStory || !Array.isArray(scStory.clips) || !scStory.clips.length) { toast("Generate a storyboard first.", true); return; }
+    setScSmoothing(true);
+    try {
+      const r = await fetch("/api/smooth-narration", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          language: scNarrationMode !== "off" ? voiceLanguage(voice) : "English",
+          clipSeconds: scClipSec,
+          cast: scCast.map(c => ({ id: c.id, name: c.name })),
+          clips: scStory.clips.map(c => ({ index: c.index, action: c.action || "", narration: c.narration || "", dialog: c.dialog || "", speaker: c.speaker || "" }))
+        })
+      });
+      const j = await jsonOrThrow(r);
+      const nmap = {}, dmap = {};
+      (j.clips || []).forEach(x => { nmap[x.index] = x.narration || ""; dmap[x.index] = x.dialog || ""; });
+      setScStory(s => s ? { ...s, clips: s.clips.map(c => ({ ...c,
+        narration: (c.index in nmap ? nmap[c.index] : c.narration),
+        dialog: (c.index in dmap ? dmap[c.index] : c.dialog) })) } : s);
+      setScNarrAudio(null); // stale preview no longer matches the new words
+      dbg("ok", `narration smoothed for ${Object.keys(nmap).length} clips`);
+      toast("✨ Narration & dialogue smoothed — give it a listen.");
+    } catch (e) {
+      dbg("warn", "smooth failed", e.message);
+      toast("Smooth failed: " + e.message.slice(0, 160), true);
+    } finally { setScSmoothing(false); }
   }
 
   // Generate (or rewrite) the spoken dialogue for every clip from the current story +
@@ -2632,6 +2664,7 @@ function App() {
               ${scNarrationMode !== "off" && html`
                 <div class="btn-row" style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
                   <button class="ghost" onClick=${generateClipNarrations} disabled=${scNarrating}>${scNarrating ? "Writing narration…" : "📝 Auto-fill clip narration"}</button>
+                  <button class="ghost" onClick=${smoothNarration} disabled=${scSmoothing}>${scSmoothing ? "Smoothing…" : "✨ Smooth narration"}</button>
                   <button class="ghost" onClick=${genDialogue} disabled=${scDialoging}>${scDialoging ? "Writing dialogue…" : "✍️ Regenerate dialogue"}</button>
                   <button class="ghost" onClick=${previewNarration}>🔊 Preview voice</button>
                   <button class="ghost" onClick=${buildStoryboard} disabled=${scBuilding}>${scBuilding ? "Rewriting…" : "↻ Rewrite story"}</button>
