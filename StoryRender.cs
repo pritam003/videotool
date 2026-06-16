@@ -340,26 +340,64 @@ public sealed class StoryRenderWorker : BackgroundService
             string startImage;
             if (i == 0 || prevFrameName is null)
             {
-                var seed = await ClipStartImageAsync(clip, story, cast, engine, size, ct);
+                var (seed, renderedStill) = await ClipStartImageAsync(clip, story, cast, engine, size, ct);
                 if (seed is null) throw new InvalidOperationException($"{label}: no character reference available");
                 startImage = seed;
+                // A fresh multi-character establishing still re-loads the 17 GB FLUX checkpoint
+                // into VRAM; evict it before the much larger Wan2.2 I2V loads or the A100 OOMs.
+                if (renderedStill)
+                {
+                    job.Label = $"{label}: freeing GPU memory";
+                    try
+                    {
+                        await PostJsonAsync("/api/gpu-free", new { }, ct);
+                        await Task.Delay(TimeSpan.FromSeconds(5), ct);
+                    }
+                    catch (OperationCanceledException) { throw; }
+                    catch (Exception ex) { _log.LogWarning(ex, "gpu-free before I2V failed (continuing)"); }
+                }
             }
             else startImage = prevFrameName;
 
             var thePrompt = BuildClipPrompt(clip, story, prevClip, narrating, cast);
-            var gpuId = await SubmitI2VAsync(startImage, thePrompt, clipSec, size, ct);
-            job.CurrentGpuJobId = gpuId;
-            await PollClipAsync(gpuId, ct, (st, elapsed) =>
+            // Render the clip with a single retry: a transient GPU OOM (e.g. residual VRAM from
+            // a FLUX still) makes ComfyUI unload ALL models, so a second attempt loads only the
+            // Wan I2V models and fits. Free the GPU first so the retry starts from a clean slate.
+            string clipUrl;
+            for (int attempt = 1; ; attempt++)
             {
-                var frac = Math.Min(0.98, elapsed / (clipSec * 16000.0));
-                job.Pct = basePct + spanPct * frac;
-                job.Label = $"{label}: {st} ({elapsed / 1000}s)";
-            });
-            job.CurrentGpuJobId = null;
+                try
+                {
+                    var gpuId = await SubmitI2VAsync(startImage, thePrompt, clipSec, size, ct);
+                    job.CurrentGpuJobId = gpuId;
+                    await PollClipAsync(gpuId, ct, (st, elapsed) =>
+                    {
+                        var frac = Math.Min(0.98, elapsed / (clipSec * 16000.0));
+                        job.Pct = basePct + spanPct * frac;
+                        job.Label = $"{label}: {st} ({elapsed / 1000}s)";
+                    });
+                    job.CurrentGpuJobId = null;
 
-            job.Label = $"{label}: finalizing";
-            var fin = await PostJsonAsync("/api/jobs/" + gpuId + "/finalize", new { }, ct);
-            var clipUrl = fin.GetProperty("url").GetString()!;
+                    job.Label = $"{label}: finalizing";
+                    var fin = await PostJsonAsync("/api/jobs/" + gpuId + "/finalize", new { }, ct);
+                    clipUrl = fin.GetProperty("url").GetString()!;
+                    break;
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex) when (attempt < 2)
+                {
+                    job.CurrentGpuJobId = null;
+                    _log.LogWarning(ex, "{Label} render failed (attempt {Attempt}); freeing GPU and retrying", label, attempt);
+                    job.Label = $"{label}: recovering GPU memory, retrying";
+                    try
+                    {
+                        await PostJsonAsync("/api/gpu-free", new { }, ct);
+                        await Task.Delay(TimeSpan.FromSeconds(5), ct);
+                    }
+                    catch (OperationCanceledException) { throw; }
+                    catch (Exception fx) { _log.LogWarning(fx, "gpu-free during retry failed (continuing)"); }
+                }
+            }
 
             // Extract THIS clip's last frame (from the silent render) to seed the next.
             if (i < N - 1)
@@ -563,14 +601,14 @@ public sealed class StoryRenderWorker : BackgroundService
         return $"{idn}{where}{cont}{baseLine}{acting}".Trim();
     }
 
-    private async Task<string?> ClipStartImageAsync(JsonNode clip, JsonNode story,
+    private async Task<(string? name, bool renderedStill)> ClipStartImageAsync(JsonNode clip, JsonNode story,
         Dictionary<string, CastWork> cast, string engine, string size, CancellationToken ct)
     {
         var charIds = (clip["characters"] as JsonArray)?.Select(x => S(x, "")).Where(s => s.Length > 0).ToList() ?? new();
         var present = charIds.Where(id => cast.TryGetValue(id, out var c) && !string.IsNullOrWhiteSpace(c.RefName)).ToList();
         if (present.Count == 0)
-            return cast.Values.FirstOrDefault(c => !string.IsNullOrWhiteSpace(c.RefName))?.RefName;
-        if (present.Count == 1) return cast[present[0]].RefName;
+            return (cast.Values.FirstOrDefault(c => !string.IsNullOrWhiteSpace(c.RefName))?.RefName, false);
+        if (present.Count == 1) return (cast[present[0]].RefName, false);
 
         var locById = new Dictionary<string, (string name, string desc)>();
         if (story["locations"] is JsonArray sl)
@@ -589,7 +627,9 @@ public sealed class StoryRenderWorker : BackgroundService
         var style = S(story["style"], "");
         var prompt = $"Cinematic establishing wide shot showing multiple characters together in the same frame. {who}. Setting: {where}. {action}. All characters fully visible and in-frame, photorealistic, consistent lighting, physically plausible composition. {style}. No on-screen text, captions, or watermarks.";
         var (name, _) = await RenderPortraitAsync(prompt, engine, size, ct);
-        return name;
+        // renderedStill is only "true" for FLUX — a ComfyUI/Wan still reuses the same model
+        // family as the I2V step, so it never needs a VRAM eviction before the clip render.
+        return (name, engine == "flux");
     }
 
     // ---- portrait + still rendering (self-HTTP) ---------------------------
