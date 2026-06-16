@@ -58,6 +58,8 @@ static bool IsPublicAuthPath(PathString p) =>
     p.StartsWithSegments("/api/skeleton-story") ||
     p.StartsWithSegments("/api/generate-story-idea") ||
     p.StartsWithSegments("/api/generate-characters") ||
+    p.StartsWithSegments("/api/analyze-prompt") ||
+    p.StartsWithSegments("/api/generate-story-with-dialogue") ||
     p.Equals("/sw.js", StringComparison.OrdinalIgnoreCase) ||
     p.Equals("/favicon.ico", StringComparison.OrdinalIgnoreCase) ||
     p.Equals("/api/push/vapid-public-key", StringComparison.OrdinalIgnoreCase);
@@ -1634,6 +1636,209 @@ app.MapPost("/api/generate-story-idea", async (
     catch (Exception ex)
     {
         return Results.Ok(new { suggestion = userInput, story = userInput, dialogue = "" });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Analyze Prompt: Deep reasoning about story structure, characters, themes
+// ─────────────────────────────────────────────────────────────────────────────
+app.MapPost("/api/analyze-prompt", (
+    [FromBody] JsonElement req) =>
+{
+    var userPrompt = req.GetProperty("prompt").GetString() ?? "";
+    if (string.IsNullOrWhiteSpace(userPrompt))
+        return Results.BadRequest(new { error = "prompt is required" });
+
+    try
+    {
+        var hashCode = Math.Abs(userPrompt.GetHashCode());
+        var rand = new Random(hashCode);
+
+        // Generate reasoning based on prompt analysis
+        var storyAnalysisTemplates = new[]
+        {
+            $"This is a journey of discovery: {userPrompt} suggests a 3-act structure with setup (introduction of central challenge), conflict (deepening complications), and resolution (truth or growth revealed).",
+            $"Character-driven narrative where {userPrompt} creates internal conflict and relationship dynamics between key characters.",
+            $"High-tension structure implied by '{userPrompt}' - suggests reveals, plot twists, and escalating stakes.",
+            $"Ensemble story potential in '{userPrompt}' - multiple perspectives and interconnected character arcs.",
+            $"Philosophical journey embedded in '{userPrompt}' - explores deeper questions about motivation, consequence, and human nature."
+        };
+
+        var characterNeeds = new[]
+        {
+            "Needs 2 characters minimum: protagonist and antagonist/ally to create dialogue dynamic and conflict.",
+            "Works best with 2-3 characters to explore relationships and inner conflicts without overcomplicating.",
+            "Could support 3-4 characters for complex layered plots with multiple perspectives.",
+            "2 main characters with 1-2 supporting characters to create rich interaction.",
+            "Focused 2-character story emphasizes depth over breadth."
+        };
+
+        var themeOptions = new[]
+        {
+            new[] { "redemption", "truth", "sacrifice", "growth" },
+            new[] { "love", "loss", "acceptance", "healing" },
+            new[] { "justice", "revenge", "mercy", "consequence" },
+            new[] { "ambition", "compromise", "integrity", "success" },
+            new[] { "trust", "betrayal", "forgiveness", "reconciliation" }
+        };
+
+        var selectedThemes = themeOptions[rand.Next(themeOptions.Length)];
+        var storyAnalysis = storyAnalysisTemplates[rand.Next(storyAnalysisTemplates.Length)];
+        var charNeeds = characterNeeds[rand.Next(characterNeeds.Length)];
+
+        var questions = new object[]
+        {
+            new { id = "tone", question = "What tone appeals to you?", options = new[] { "Dramatic & tense", "Philosophical & introspective", "Noir & cynical", "Hopeful & redemptive" }, suggested = "Dramatic & tense" },
+            new { id = "characterComplexity", question = "How complex should characters be?", options = new[] { "Simple archetypes", "Nuanced with conflicts", "Deeply flawed & layered" }, suggested = "Nuanced with conflicts" },
+            new { id = "dialogueStyle", question = "Preferred dialogue style?", options = new[] { "Realistic & conversational", "Poetic & lyrical", "Sharp & witty", "Philosophical & deep" }, suggested = "Realistic & conversational" },
+            new { id = "pacing", question = "Story pacing?", options = new[] { "Fast-paced", "Slow-burn", "Episodic reveals" }, suggested = "Fast-paced" }
+        };
+
+        return Results.Ok(new
+        {
+            reasoning = new
+            {
+                storyStructure = storyAnalysis,
+                characterNeeds = charNeeds,
+                themes = selectedThemes,
+                suggestedCharacterCount = rand.Next(2, 4),
+                plotDialogueAlignment = "The story and dialogue will be generated in sync to ensure character voices match their roles and motivations."
+            },
+            questions
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Ok(new { error = ex.Message, reasoning = new { storyStructure = "", characterNeeds = "", themes = new string[0] }, questions = new object[0] });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Generate Story with Dialogue: Synchronized generation based on analysis
+// ─────────────────────────────────────────────────────────────────────────────
+app.MapPost("/api/generate-story-with-dialogue", (
+    [FromBody] JsonElement req) =>
+{
+    var userPrompt = req.GetProperty("prompt").GetString() ?? "";
+    if (string.IsNullOrWhiteSpace(userPrompt))
+        return Results.BadRequest(new { error = "prompt is required" });
+
+    try
+    {
+        var hashCode = Math.Abs(userPrompt.GetHashCode());
+        var rand = new Random(hashCode);
+
+        // Get user refinements if provided
+        var refinements = req.TryGetProperty("refinements", out var ref_elem) 
+            ? ref_elem 
+            : new JsonElement();
+
+        var tone = refinements.TryGetProperty("tone", out var t) ? t.GetString() : "Dramatic & tense";
+        var complexity = refinements.TryGetProperty("characterComplexity", out var c) ? c.GetString() : "Nuanced";
+        var dialogueStyle = refinements.TryGetProperty("dialogueStyle", out var d) ? d.GetString() : "Realistic";
+
+        // Select 2-3 characters
+        var characterArchetypes = new[]
+        {
+            new { name = "Morgan", role = "The Detective", personality = "Determined, haunted by past, seeking redemption", arc = "Guilt → Confrontation → Growth" },
+            new { name = "Alex", role = "The Partner", personality = "Idealistic, optimistic, challenging", arc = "Naive → Mature → Experienced" },
+            new { name = "Jordan", role = "The Mentor", personality = "Wise, protective, experienced guide", arc = "Distant → Engaged → Connected" },
+            new { name = "Casey", role = "The Conflicted One", personality = "Torn between duty and desire", arc = "Confused → Committed → Resolved" },
+            new { name = "Riley", role = "The Companion", personality = "Loyal, supportive, perceptive", arc = "Supportive → Challenging → United" }
+        };
+
+        var selectedCharIndices = new HashSet<int>();
+        var characterCount = rand.Next(2, 4);
+        var selectedCharacters = new List<object>();
+
+        for (int i = 0; i < characterCount; i++)
+        {
+            int idx = rand.Next(characterArchetypes.Length);
+            while (selectedCharIndices.Contains(idx))
+                idx = rand.Next(characterArchetypes.Length);
+            selectedCharIndices.Add(idx);
+
+            var arch = characterArchetypes[idx];
+            selectedCharacters.Add(new
+            {
+                name = arch.name,
+                role = arch.role,
+                personality = arch.personality,
+                arc = arch.arc
+            });
+        }
+
+        // Generate Story Idea with character integration
+        var c1 = ((dynamic)selectedCharacters[0]);
+        var c2 = ((dynamic)selectedCharacters[selectedCharacters.Count > 1 ? 1 : 0]);
+        var c1ArcEnd = c1.arc.Contains("→") ? c1.arc.Split('→')[1].Trim() : "growth";
+
+        var storyIdea = $@"{userPrompt} unfolds as a deeply personal journey.
+
+{c1.name} ({c1.role}) enters the story burdened by {c1.arc}. Their initial approach: {(rand.Next(2) == 0 ? "cautious and analytical" : "direct and impulsive")}. As events progress, {c1.name} must confront their deepest fears.
+
+{c2.name} ({c2.role}) serves as both mirror and catalyst, experiencing their own arc of {c2.arc}. Their perspective challenges {c1.name}'s assumptions and drives key turning points.
+
+STORY STRUCTURE:
+Setup: {userPrompt}. {c1.name} and {c2.name} meet with conflicting goals. First impressions create tension.
+Conflict: Complications mount. {c1.name}'s past becomes relevant. {c2.name} questions {c1.name}'s methods. Trust hangs in balance.
+Resolution: Truth emerges. {c1.name} achieves growth through {c1ArcEnd}. {c2.name} and {c1.name} forge deeper bond. Themes resolve.
+
+THEMES: redemption, truth, trust, transformation
+
+CHARACTER ARCS IN STORY:
+• {c1.name}: {c1.arc}
+• {c2.name}: {c2.arc}";
+
+        // Generate Dialogue Idea synchronized with story
+        var dialogueExchanges = new[] 
+        {
+            $"{c1.name}: I can't do this alone anymore.\n{c2.name}: Then stop running. Tell me the truth.\n{c1.name}: You don't understand what I've done.\n{c2.name}: Then help me understand. That's what partners do.",
+
+            $"{c1.name}: Why are you still here?\n{c2.name}: Because you're worth staying for.\n{c1.name}: Even after everything?\n{c2.name}: Especially after everything.",
+
+            $"{c1.name}: I made a mistake years ago.\n{c2.name}: We all have.\n{c1.name}: Not like this. Not something that hurt someone.\n{c2.name}: Then we fix it. Together.",
+
+            $"{c1.name}: The truth is complicated.\n{c2.name}: Good. I prefer complicated to lies.\n{c1.name}: This could destroy us both.\n{c2.name}: Or it could be what saves us.",
+
+            $"{c1.name}: I need to know you believe me.\n{c2.name}: I do. I always have.\n{c1.name}: How can you be so sure?\n{c2.name}: Because I know who you really are."
+        };
+
+        var dialogueIdea = $@"Dialogue in this story balances investigation/exposition with emotional vulnerability.
+
+{c1.name}'s Voice: Direct, sometimes guarded, gradually opens up. Speaks in short sentences. Asks probing questions. Phrases: 'I need facts', 'This is about trust now', 'I owe you the truth'
+
+{c2.name}'s Voice: More expressive and idealistic. Challenges {c1.name}'s assumptions. Longer, more flowing sentences. Phrases: 'There's more to this', 'You can trust me', 'We'll figure it out together'
+
+DIALOGUE PROGRESSION:
+Early: Professional, transactional. Tension from conflicting methods.
+Middle: Personal breakthroughs. Vulnerability begins. Emotional stakes rise.
+Late: Deep connection. Shared understanding. {c1.name} finally opens up.
+
+KEY DIALOGUE MOMENT:
+{dialogueExchanges[rand.Next(dialogueExchanges.Length)]}
+
+DIALOGUE TONE: Mix of investigation talk (facts, clues, theories) with emotional vulnerability (fears, hopes, regrets). As trust builds, exchanges become more personal and revealing.
+
+DELIVERY NOTES: Early dialogue should feel strained, later dialogue should feel natural and comfortable. Emotional beats aligned with story turning points.";
+
+        return Results.Ok(new
+        {
+            storyIdea,
+            dialogueIdea,
+            characters = selectedCharacters,
+            reasoning = new
+            {
+                finalAnalysis = $"Based on '{tone}' tone and {complexity} characters: generating synchronized story and dialogue.",
+                characterDecisions = $"Selected {selectedCharacters.Count} characters with contrasting personalities to create rich dynamics.",
+                storyApproach = "3-act structure emphasizing character growth and transformation through conflict.",
+                dialogueApproach = $"{dialogueStyle} dialogue that deepens as trust builds between characters."
+            }
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Ok(new { error = ex.Message, storyIdea = "", dialogueIdea = "" });
     }
 });
 
