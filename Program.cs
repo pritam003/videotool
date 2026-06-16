@@ -1855,6 +1855,7 @@ Write the JSON now.";
                     new { role = "user",   content = user }
                 },
                 max_completion_tokens = 16000,
+                reasoning_effort = "low",
                 response_format = new { type = "json_object" }
             };
             using var msg = new HttpRequestMessage(HttpMethod.Post,
@@ -2439,6 +2440,7 @@ Return the JSON now.";
                     new { role = "user",   content = user }
                 },
                 max_completion_tokens = 4000,
+                reasoning_effort = "low",
                 response_format = new { type = "json_object" }
             };
             

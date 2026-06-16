@@ -1732,15 +1732,19 @@ function App() {
 
   const recentLines = dbgLines.slice(-200);
 
-  // Poll the server-side render queue. Poll briskly (3s) ONLY while a film is actually
-  // rendering — that keeps progress live and the F1 app warm mid-render — and back off to
-  // a slow 20s heartbeat when the queue is idle, so the page isn't constantly refetching.
+  // Poll the server-side render queue. Poll briskly (3s) ONLY when the queue is actually
+  // on screen (History page) AND a film is rendering — that keeps progress live and the F1
+  // app warm mid-render. Everywhere else fall back to a slow heartbeat so the whole app
+  // isn't re-rendering every few seconds (which made composing feel laggy).
   const anyJobActive = jobs.some(j => j.status === "queued" || j.status === "running");
+  const pollMs = page === "history"
+    ? (anyJobActive ? 3000 : 15000)
+    : (anyJobActive ? 15000 : 60000);
   useEffect(() => {
     refreshJobs();
-    const iv = setInterval(refreshJobs, anyJobActive ? 3000 : 20000);
+    const iv = setInterval(refreshJobs, pollMs);
     return () => clearInterval(iv);
-  }, [anyJobActive]);
+  }, [pollMs]);
   // Advance to the story-review step automatically once a storyboard is generated.
   useEffect(() => { if (scStory && wizStep === 2) setWizStep(3); }, [scStory]);
 
