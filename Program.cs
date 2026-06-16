@@ -558,6 +558,39 @@ app.MapPost("/api/gpu-free", async (WanClient wan, CancellationToken ct) =>
     }
 });
 
+// 2c. Pre-warm the GPU. The wan22 GPU is scale-to-zero, so the FIRST render after it idles
+//     pays a cold start: container spin-up (~45s) + a multi-minute model load before the cast
+//     portraits can render ("casting is taking long"). The UI calls this the moment a
+//     storyboard is generated; we fire a tiny throwaway 1s render in the BACKGROUND, which
+//     wakes the container and loads the cast (T2V) models while the user is still reviewing /
+//     setting up cast / submitting — so by submit time the GPU is hot and casting is quick.
+//     Fire-and-forget: returns immediately; failures are harmless (render just starts cold).
+app.MapPost("/api/gpu-warm", (WanClient wan) =>
+{
+    _ = Task.Run(async () =>
+    {
+        for (int attempt = 0; attempt < 24; attempt++)
+        {
+            try
+            {
+                // A 1s 256x256 render loads the (size-independent) T2V model weights. We never
+                // poll or finalize it — submitting + running it is all we need to warm the GPU.
+                await wan.SubmitAsync("a plain gray test pattern, warmup", 1, 256, 256, CancellationToken.None);
+                return;
+            }
+            catch (Exception ex) when (IsWarmingError(ex))
+            {
+                await Task.Delay(10000); // container still spinning up — wait and retry
+            }
+            catch
+            {
+                return; // any other failure: give up quietly, the real render will warm it
+            }
+        }
+    });
+    return Results.Ok(new { warming = true });
+});
+
 // 3a. List previously finalized videos (mp4 blobs in the container) with fresh SAS URLs.
 app.MapGet("/api/videos", async (IConfiguration cfg, TokenCredential cred, CancellationToken ct,
     int? limit) =>

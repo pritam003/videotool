@@ -929,6 +929,10 @@ function App() {
   // Step 1: turn the idea into a story spread over N=ceil(total/5) clips.
   async function buildStoryboard() {
     if (!scPrompt.trim()) { toast("Enter a story idea first.", true); return; }
+    // Pre-warm the scale-to-zero GPU NOW (fire-and-forget): it wakes the container and loads
+    // the cast models while the user reviews the story, sets up cast and submits — so the
+    // render starts casting on a hot GPU instead of waiting out the cold start.
+    fetch("/api/gpu-warm", { method: "POST" }).catch(() => {});
     const narrating = scNarrationMode !== "off";
     setScBuilding(true); setScStory(null); setScProgress([]); setScCast([]);
     try {
