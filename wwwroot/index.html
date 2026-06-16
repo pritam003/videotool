@@ -657,7 +657,6 @@ function App() {
       return;
     }
     setReasoningWorkflow("analyzing");
-    setChatMessages(prev => [...prev, { role: "user", text: reasoningInitialPrompt }]);
     try {
       const r = await fetch("/api/analyze-prompt", {
         method: "POST",
@@ -666,12 +665,10 @@ function App() {
       });
       const analysis = await jsonOrThrow(r);
       setReasoningAnalysis(analysis);
-      const msg = `💭 **Story Analysis**\n\n**Structure:** ${analysis.reasoning?.storyStructure || "N/A"}\n\n**Character Needs:** ${analysis.reasoning?.characterNeeds || "N/A"}\n\n**Themes:** ${(analysis.reasoning?.themes || []).join(", ") || "N/A"}\n\n**Character Count:** ${analysis.reasoning?.suggestedCharacterCount || 2}-3 characters`;
-      setChatMessages(prev => [...prev, { role: "assistant", text: msg }]);
       setReasoningWorkflow("questions");
       dbg("ok", "reasoning analysis complete");
     } catch (e) {
-      setChatMessages(prev => [...prev, { role: "assistant", text: `❌ Analysis failed: ${e.message.slice(0, 100)}` }]);
+      toast(`❌ Analysis failed: ${e.message.slice(0, 100)}`, true);
       setReasoningWorkflow(null);
     }
   }
@@ -679,7 +676,6 @@ function App() {
   async function submitRefinements() {
     if (!reasoningAnalysis || !reasoningInitialPrompt.trim()) return;
     setReasoningWorkflow("generating");
-    setChatMessages(prev => [...prev, { role: "assistant", text: "✨ Generating synchronized Story + Dialogue..." }]);
     try {
       const r = await fetch("/api/generate-story-with-dialogue", {
         method: "POST",
@@ -694,12 +690,10 @@ function App() {
       setGeneratedDialogueIdea(result.dialogueIdea || "");
       setGeneratedCharacters(result.characters || []);
       setGeneratedReasoning(result.reasoning || null);
-      const msg = `✅ **Story & Dialogue Generated!**\n\n**Story:** ${(result.storyIdea || "").slice(0, 200)}...\n\n**Dialogue:** ${(result.dialogueIdea || "").slice(0, 200)}...`;
-      setChatMessages(prev => [...prev, { role: "assistant", text: msg }]);
       setReasoningWorkflow("results");
       dbg("ok", "story and dialogue generated");
     } catch (e) {
-      setChatMessages(prev => [...prev, { role: "assistant", text: `❌ Generation failed: ${e.message.slice(0, 100)}` }]);
+      toast(`❌ Generation failed: ${e.message.slice(0, 100)}`, true);
       setReasoningWorkflow("questions");
     }
   }
