@@ -2793,6 +2793,7 @@ function App() {
               
               <div class="muted small" style=${{marginBottom:8,fontWeight:600}}>Per-clip narration & dialogue:</div>
               <div style=${{display:"flex",flexDirection:"column",gap:8}}>
+                ${(scStory?.clips||[]).map((clip,i) => {
                   const ca = scClipAudio.find(c=>c.index===i) || {index:i,url:null,dur:0,busy:false,error:null};
                   const clipSec = scClipSec;
                   const nLine = (clip.narration||"").trim();
