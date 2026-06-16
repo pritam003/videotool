@@ -13,8 +13,10 @@
 #         STORAGE_NAME=wan22stor22165 bash wan22/download-foley.sh      # HunyuanVideo-Foley (SFX)
 #         STORAGE_NAME=wan22stor22165 bash wan22/download-acestep.sh    # ACE-Step (music score)
 #    3) Turn the feature on for the app:
+#         # music (ACE-Step) only needs the checkpoint + WAN_AUDIO_ENABLED (works on :latest already);
+#         # FOLEY needs this :audio image AND its own flag:
 #         az webapp config appsettings set -g rg-videotool -n videotool-pritam003-23209 \
-#           --settings WAN_AUDIO_ENABLED=1
+#           --settings WAN_AUDIO_ENABLED=1 WAN_FOLEY_ENABLED=1
 #    4) Point wan22 at the audio image with a fresh revision:
 #         az containerapp update -g rg-videotool -n wan22 \
 #           --image wan22acr23247.azurecr.io/wan22-comfyui:audio \

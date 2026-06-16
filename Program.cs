@@ -1115,8 +1115,11 @@ app.MapPost("/api/generate-soundscape", async (SoundscapeRequest req,
 app.MapPost("/api/foley", async (FoleyRequest req, WanClient wan, IHttpClientFactory hf,
     IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
 {
-    var enabled = string.Equals(cfg["WAN_AUDIO_ENABLED"], "1", StringComparison.Ordinal)
-               || string.Equals(cfg["WAN_AUDIO_ENABLED"], "true", StringComparison.OrdinalIgnoreCase);
+    // Foley has its OWN flag (separate from music) because it needs a custom ComfyUI node that
+    // only exists in the :audio GPU image. Until WAN_FOLEY_ENABLED is set we return 501 BEFORE any
+    // GPU work, so the render worker skips straight to the procedural soundscape (no wasted upload).
+    var enabled = string.Equals(cfg["WAN_FOLEY_ENABLED"], "1", StringComparison.Ordinal)
+               || string.Equals(cfg["WAN_FOLEY_ENABLED"], "true", StringComparison.OrdinalIgnoreCase);
     if (!enabled)
         return Results.StatusCode(501); // not activated — caller uses the procedural soundscape
     if (string.IsNullOrWhiteSpace(req?.VideoUrl))
