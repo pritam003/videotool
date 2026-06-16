@@ -1844,7 +1844,7 @@ Write the JSON now.";
                     new { role = "system", content = sys },
                     new { role = "user",   content = user }
                 },
-                max_completion_tokens = 8000,
+                max_completion_tokens = 16000,
                 response_format = new { type = "json_object" }
             };
             using var msg = new HttpRequestMessage(HttpMethod.Post,
@@ -1901,6 +1901,14 @@ Write the JSON now.";
                 {
                     if (attempt < 4) { await Task.Delay((int)Math.Pow(2, attempt - 1) * 1000, ct); continue; }
                     break;
+                }
+                // gpt-5-mini sometimes truncates the JSON AFTER the story but BEFORE the
+                // dialogue when it runs low on tokens — retry so the dialogue isn't lost.
+                // On the final attempt, keep whatever we have (story is present).
+                if (string.IsNullOrWhiteSpace(dialogueIdea) && attempt < 4)
+                {
+                    await Task.Delay((int)Math.Pow(2, attempt - 1) * 1000, ct);
+                    continue;
                 }
                 return Results.Ok(new
                 {
@@ -2420,7 +2428,7 @@ Return the JSON now.";
                     new { role = "system", content = sys },
                     new { role = "user",   content = user }
                 },
-                max_completion_tokens = 2000,
+                max_completion_tokens = 4000,
                 response_format = new { type = "json_object" }
             };
             
