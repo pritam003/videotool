@@ -514,6 +514,12 @@ function App() {
   // server and reports back here, so the wizard is freed the moment you submit.
   const [jobs, setJobs] = useState([]);
 
+  // GPU (wan22 A100) control: the render backend scales to zero when idle. Status is read via
+  // ARM (management plane) so polling it NEVER keeps the GPU warm. start/stop/refresh below.
+  const [gpuState, setGpuState] = useState("unknown"); // unknown|stopped|idle|ready|starting|stopping
+  const [gpuReplicas, setGpuReplicas] = useState(0);
+  const gpuActionAtRef = useRef(0); // last start/stop click — keeps a stale read from clobbering a transition
+
   const [running, setRunning] = useState(false);
 
   // Identity: who is signed in (when AUTH_REQUIRED=1 on the server).
@@ -1386,6 +1392,42 @@ function App() {
     refreshJobs();
   }
 
+  // ----- GPU start / stop / status (wan22 A100 render backend) -----
+  async function refreshGpu() {
+    try {
+      const r = await fetch("/api/gpu/status");
+      if (!r.ok) return;
+      const s = await r.json();
+      // While a start/stop we just kicked off is settling, hold the transition label until the
+      // server actually reaches the target state (or 7 min passes) so the badge doesn't flicker.
+      const stale = Date.now() - gpuActionAtRef.current > 7 * 60 * 1000;
+      setGpuState(prev => {
+        if (!stale && prev === "starting" && s.state !== "ready") return "starting";
+        if (!stale && prev === "stopping" && s.state !== "stopped") return "stopping";
+        return s.state || "unknown";
+      });
+      setGpuReplicas(s.replicas || 0);
+    } catch { /* transient — keep last state */ }
+  }
+  async function startGpu() {
+    gpuActionAtRef.current = Date.now();
+    setGpuState("starting");
+    try {
+      const r = await fetch("/api/gpu/start", { method: "POST" });
+      if (!r.ok) { toast("Couldn't start the GPU"); await refreshGpu(); return; }
+      toast("Starting the GPU… (~1–2 min)");
+    } catch { toast("Couldn't start the GPU"); await refreshGpu(); }
+  }
+  async function stopGpu() {
+    gpuActionAtRef.current = Date.now();
+    setGpuState("stopping");
+    try {
+      const r = await fetch("/api/gpu/stop", { method: "POST" });
+      if (!r.ok) { toast("Couldn't stop the GPU"); await refreshGpu(); return; }
+      toast("Stopping the GPU — A100 billing off");
+    } catch { toast("Couldn't stop the GPU"); await refreshGpu(); }
+  }
+
   function resetWizard() {
     setWizStep(1);
     setScStory(null); setScCast([]); setScProgress([]);
@@ -1750,6 +1792,15 @@ function App() {
     const iv = setInterval(refreshJobs, pollMs);
     return () => clearInterval(iv);
   }, [pollMs]);
+  // Poll GPU status (ARM read — does NOT wake the GPU): 8s during a start/stop transition,
+  // 30s otherwise. Cheap management-plane call that keeps the header badge honest.
+  const gpuTransitioning = gpuState === "starting" || gpuState === "stopping";
+  const gpuPollMs = gpuTransitioning ? 8000 : 30000;
+  useEffect(() => {
+    refreshGpu();
+    const iv = setInterval(refreshGpu, gpuPollMs);
+    return () => clearInterval(iv);
+  }, [gpuPollMs]);
   // Surface the background render in the main Preview: once the newest film finishes, load it
   // into the Preview ONCE (stable src — it won't reload on every poll's re-signed SAS URL).
   const shownJobRef = useRef(null);
@@ -1764,6 +1815,12 @@ function App() {
   // Advance to the story-review step automatically once a storyboard is generated.
   useEffect(() => { if (scStory && wizStep === 2) setWizStep(3); }, [scStory]);
 
+  // GPU badge display: a render in flight means the GPU is busy; otherwise reflect the polled state.
+  const gpuBusy = (jobs || []).some(j => j.status === "running");
+  const gpuDot = { ready:"#22c55e", idle:"#eab308", starting:"#eab308", stopping:"#f97316", stopped:"#9ca3af", unknown:"#9ca3af" }[gpuState] || "#9ca3af";
+  const gpuLabel = (gpuBusy && (gpuState === "ready" || gpuState === "idle")) ? "busy"
+    : ({ ready:"ready", idle:"idle", starting:"starting…", stopping:"stopping…", stopped:"stopped", unknown:"—" }[gpuState] || gpuState);
+
   return html`
     <header class="app">
       <span class="dot"></span>
@@ -1776,6 +1833,18 @@ function App() {
           style=${page==="history" ? {background:"var(--accent)",color:"#fff",borderColor:"var(--accent)"} : {}}>History</button>
       </div>
       <div class="spacer"></div>
+      <div style=${{display:"flex",alignItems:"center",gap:6,marginRight:4}}>
+        <button class="ghost small" onClick=${refreshGpu}
+          title=${`Render GPU (A100) — ${gpuLabel}. Read live from Azure; click to refresh.`}
+          style=${{display:"inline-flex",alignItems:"center",gap:6}}>
+          <span style=${{width:8,height:8,borderRadius:"999px",background:gpuDot,display:"inline-block",flex:"0 0 auto"}}></span>
+          GPU ${gpuLabel}
+        </button>
+        ${(gpuState === "stopped" || gpuState === "unknown")
+          ? html`<button class="ghost small" onClick=${startGpu} disabled=${gpuState === "starting"} title="Start the render GPU">Start</button>`
+          : html`<button class="ghost small" onClick=${stopGpu} disabled=${gpuState === "stopping" || gpuBusy}
+              title=${gpuBusy ? "A render is using the GPU — cancel it first" : "Stop the GPU to cut A100 billing now"}>Stop</button>`}
+      </div>
       <button class="ghost" onClick=${() => setTheme(theme === "light" ? "dark" : "light")} title="Toggle theme">
         ${theme === "light" ? "☾" : "☀"}
       </button>

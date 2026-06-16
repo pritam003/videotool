@@ -26,6 +26,10 @@ builder.Services.AddSingleton<SoraJobWatcherRegistry>();
 // Wan2.2 (ComfyUI) client. Replaces the AOAI Sora-2 video path; the rest of the
 // app (frontend, push watcher, blob upload, stitch) keeps working unchanged.
 builder.Services.AddSingleton<WanClient>();
+// Start/stop/status for the scale-to-zero Wan2.2 GPU container app, via ARM using
+// the App Service managed identity. Lets the UI wake the GPU, force-stop it to cut
+// A100 billing on demand, and read its true running state.
+builder.Services.AddSingleton<GpuControl>();
 // Durable server-side story render pipeline: an in-process queue + a single
 // background worker that renders a whole film (cast → clip chain → narrate →
 // mux → stitch) by reusing the app's own endpoints over localhost, so the UI is
@@ -589,6 +593,51 @@ app.MapPost("/api/gpu-warm", (WanClient wan) =>
         }
     });
     return Results.Ok(new { warming = true });
+});
+
+// 2d. GPU start / stop / status (management plane via the App Service managed identity).
+//     The wan22 GPU is a scale-to-zero Container App; these let the UI wake it, FORCE-STOP it
+//     (cutting A100 billing immediately instead of waiting out the idle cooldown), and read its
+//     true running state without sending data-plane traffic that would itself keep it warm.
+app.MapGet("/api/gpu/status", async (GpuControl gpu, CancellationToken ct) =>
+    Results.Ok(await gpu.GetStatusAsync(ct)));
+
+app.MapPost("/api/gpu/start", async (GpuControl gpu, WanClient wan, CancellationToken ct) =>
+{
+    try
+    {
+        await gpu.StartAsync(ct);
+        // ARM start brings it to Running (min replicas = 0), so also fire a tiny warmup render in
+        // the background: that spins up a replica and preloads the T2V models so "Start" actually
+        // lands on a hot GPU. The warmup retries through the cold start; failures are harmless.
+        _ = Task.Run(async () =>
+        {
+            for (int attempt = 0; attempt < 30; attempt++)
+            {
+                try { await wan.SubmitAsync("a plain gray test pattern, warmup", 1, 256, 256, CancellationToken.None); return; }
+                catch (Exception ex) when (IsWarmingError(ex)) { await Task.Delay(10000); }
+                catch { return; }
+            }
+        });
+        return Results.Ok(new { ok = true, starting = true });
+    }
+    catch (Exception ex) when (!ct.IsCancellationRequested)
+    {
+        return Results.Problem($"gpu start failed: {ex.Message}");
+    }
+});
+
+app.MapPost("/api/gpu/stop", async (GpuControl gpu, CancellationToken ct) =>
+{
+    try
+    {
+        await gpu.StopAsync(ct);
+        return Results.Ok(new { ok = true, stopped = true });
+    }
+    catch (Exception ex) when (!ct.IsCancellationRequested)
+    {
+        return Results.Problem($"gpu stop failed: {ex.Message}");
+    }
 });
 
 // 3a. List previously finalized videos (mp4 blobs in the container) with fresh SAS URLs.
