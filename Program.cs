@@ -1208,6 +1208,104 @@ app.MapPost("/api/foley", async (FoleyRequest req, WanClient wan, IHttpClientFac
     }
 });
 
+// DOWNLOAD REFERENCE VIDEO — download a video from a URL (including YouTube / other sites that
+// yt-dlp supports) so the user can paste a YouTube link as the driving video for Wan-Animate
+// instead of uploading a file. Uses the bundled yt-dlp binary for YouTube/social URLs and falls
+// back to a plain HTTP download for direct video links. Returns { url } pointing to a blob.
+// Body: { url: string, seconds?: number }  (seconds caps the downloaded clip length, default 15)
+app.MapPost("/api/download-reference-video", async (
+    [FromBody] JsonElement req, IHttpClientFactory hf, IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
+{
+    if (!req.TryGetProperty("url", out var urlProp))
+        return Results.BadRequest(new { error = "url is required" });
+    var srcUrl = urlProp.GetString() ?? "";
+    if (string.IsNullOrWhiteSpace(srcUrl))
+        return Results.BadRequest(new { error = "url is required" });
+
+    var seconds = req.TryGetProperty("seconds", out var sp) ? Math.Clamp(sp.GetInt32(), 5, 60) : 15;
+
+    // Locate the bundled yt-dlp binary (next to ffmpeg in bin/).
+    static string? LocateYtDlp()
+    {
+        var dir = Path.GetDirectoryName(System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName) ?? ".";
+        var candidates = new[]
+        {
+            Path.Combine(dir, "bin", "yt-dlp"),
+            Path.Combine(AppContext.BaseDirectory, "bin", "yt-dlp"),
+        };
+        return candidates.FirstOrDefault(File.Exists);
+    }
+
+    var work = Path.Combine(Path.GetTempPath(), $"refvid-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(work);
+    try
+    {
+        var outMp4 = Path.Combine(work, "ref.mp4");
+        var ytDlp = LocateYtDlp();
+        var ffmpeg = LocateFfmpeg();
+
+        // Determine whether this is a YouTube / social URL (needs yt-dlp) or a plain HTTP video.
+        bool IsYouTube(string u) => u.Contains("youtube.com/", StringComparison.OrdinalIgnoreCase)
+            || u.Contains("youtu.be/", StringComparison.OrdinalIgnoreCase)
+            || u.Contains("instagram.com/", StringComparison.OrdinalIgnoreCase)
+            || u.Contains("twitter.com/", StringComparison.OrdinalIgnoreCase)
+            || u.Contains("x.com/", StringComparison.OrdinalIgnoreCase);
+
+        if (IsYouTube(srcUrl))
+        {
+            if (ytDlp is null)
+                return Results.Problem("yt-dlp is not bundled on this server. Re-deploy to pick up the latest CI build which includes it.");
+            if (ffmpeg is null)
+                return Results.Problem("ffmpeg binary not found.");
+
+            // yt-dlp: best video ≤720p, re-mux to mp4, trim to the requested seconds.
+            // --no-playlist prevents accidentally downloading an entire playlist.
+            // -S ext:mp4 prefers native mp4 to avoid heavy transcode.
+            var ytArgs = $"--no-playlist --no-warnings -S \"ext:mp4,res:720\" " +
+                         $"--download-sections \"*0-{seconds}\" --force-keyframes-at-cuts " +
+                         $"-o \"{outMp4}\" \"{System.Security.SecurityElement.Escape(srcUrl)}\"";
+            var (ec, stderr) = await RunProcessAsync(ytDlp, ytArgs, ct);
+            if (ec != 0 || !File.Exists(outMp4))
+                return Results.Problem($"yt-dlp download failed (exit {ec}): {stderr[..Math.Min(stderr.Length, 600)]}");
+        }
+        else
+        {
+            // Plain URL — just download it directly.
+            var http = hf.CreateClient();
+            http.Timeout = TimeSpan.FromMinutes(3);
+            using var resp = await http.GetAsync(srcUrl, HttpCompletionOption.ResponseHeadersRead, ct);
+            resp.EnsureSuccessStatusCode();
+            await using var fs = File.Create(outMp4);
+            await using var stream = await resp.Content.ReadAsStreamAsync(ct);
+            await stream.CopyToAsync(fs, ct);
+            if (seconds < 60 && ffmpeg is not null)
+            {
+                // Trim to requested length using ffmpeg.
+                var trimOut = outMp4 + ".trim.mp4";
+                await RunProcessAsync(ffmpeg!, $"-y -i \"{outMp4}\" -t {seconds} -c copy \"{trimOut}\"", ct);
+                if (File.Exists(trimOut)) { File.Delete(outMp4); File.Move(trimOut, outMp4); }
+            }
+        }
+
+        if (!File.Exists(outMp4) || new FileInfo(outMp4).Length == 0)
+            return Results.Problem("Downloaded file is empty or missing.");
+
+        var mp4 = await File.ReadAllBytesAsync(outMp4, ct);
+        var account = Cfg(cfg, "STORAGE_ACCOUNT");
+        var svc = new BlobServiceClient(new Uri($"https://{account}.blob.core.windows.net"), cred);
+        var container = svc.GetBlobContainerClient(cfg["STORAGE_CONTAINER"] ?? "videos");
+        var blobName = $"reference-video/{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}.mp4";
+        using var ms = new MemoryStream(mp4);
+        var url = await UploadAndSign(container, blobName, ms, "video/mp4", svc, account, ct);
+        return Results.Ok(new { url, blob = blobName, bytes = mp4.Length, seconds });
+    }
+    catch (Exception ex) when (!ct.IsCancellationRequested)
+    {
+        return Results.Problem($"download failed: {ex.Message}");
+    }
+    finally { try { Directory.Delete(work, recursive: true); } catch { } }
+});
+
 // WAN-ANIMATE — drive a character IMAGE with a sample/driving VIDEO so the character replicates its
 // motion + expression (character animation). GATED behind WAN_ANIMATE_ENABLED + the Animate weights on
 // the share + a ComfyUI with the WanAnimateToVideo node. A render takes minutes on the A100, so this is a
@@ -1225,22 +1323,42 @@ app.MapPost("/api/animate-submit", async (HttpRequest http, WanClient wan, IConf
     var form = await http.ReadFormAsync(ct);
     var imageFile = form.Files["image"];
     var videoFile = form.Files["video"];
+    var videoUrl  = form["videoUrl"].ToString(); // blob URL from /api/download-reference-video
     if (imageFile is null || imageFile.Length == 0)
         return Results.BadRequest(new { error = "image file is required" });
-    if (videoFile is null || videoFile.Length == 0)
-        return Results.BadRequest(new { error = "video file is required" });
+    if (videoFile is null && string.IsNullOrWhiteSpace(videoUrl))
+        return Results.BadRequest(new { error = "either a video file or videoUrl is required" });
     var (W, H) = ParseSize(form["size"].ToString());
     var seconds = int.TryParse(form["seconds"].ToString(), out var s) ? Math.Clamp(s, 1, 60) : 5;
     var prompt = form["prompt"].ToString();
-    var imgExt = string.IsNullOrEmpty(Path.GetExtension(imageFile.FileName)) ? ".png" : Path.GetExtension(imageFile.FileName);
-    var vidExt = string.IsNullOrEmpty(Path.GetExtension(videoFile.FileName)) ? ".mp4" : Path.GetExtension(videoFile.FileName);
+    var imgExt = string.IsNullOrEmpty(Path.GetExtension(imageFile!.FileName)) ? ".png" : Path.GetExtension(imageFile.FileName);
     try
     {
+        Stream vidStream;
+        string vidFilename;
+        IDisposable? vidDispose = null;
+        if (videoFile is not null && videoFile.Length > 0)
+        {
+            vidStream = videoFile.OpenReadStream();
+            vidFilename = $"animate-{Guid.NewGuid():N}{(string.IsNullOrEmpty(Path.GetExtension(videoFile.FileName)) ? ".mp4" : Path.GetExtension(videoFile.FileName))}";
+        }
+        else
+        {
+            // Video came from /api/download-reference-video — download from blob URL.
+            var hc = http.HttpContext.RequestServices.GetRequiredService<IHttpClientFactory>().CreateClient();
+            hc.Timeout = TimeSpan.FromMinutes(3);
+            var resp = await hc.GetAsync(videoUrl!, HttpCompletionOption.ResponseHeadersRead, ct);
+            resp.EnsureSuccessStatusCode();
+            vidStream = await resp.Content.ReadAsStreamAsync(ct);
+            vidDispose = resp;
+            vidFilename = $"animate-{Guid.NewGuid():N}.mp4";
+        }
         await using var imgStream = imageFile.OpenReadStream();
-        await using var vidStream = videoFile.OpenReadStream();
+        await using var _ = vidStream;
+        vidDispose?.Dispose();
         var id = await wan.SubmitAnimateAsync(
             imgStream, $"animate-{Guid.NewGuid():N}{imgExt}",
-            vidStream, $"animate-{Guid.NewGuid():N}{vidExt}",
+            vidStream, vidFilename,
             prompt, seconds, W, H, ct);
         return Results.Ok(new { id });
     }
@@ -2174,7 +2292,9 @@ app.MapPost("/api/generate-story-idea", async (
 app.MapPost("/api/analyze-prompt", (
     [FromBody] JsonElement req) =>
 {
-    var userPrompt = req.GetProperty("prompt").GetString() ?? "";
+    if (!req.TryGetProperty("prompt", out var promptProp))
+        return Results.BadRequest(new { error = "prompt is required" });
+    var userPrompt = promptProp.GetString() ?? "";
     if (string.IsNullOrWhiteSpace(userPrompt))
         return Results.BadRequest(new { error = "prompt is required" });
 

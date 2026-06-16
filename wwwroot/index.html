@@ -527,6 +527,8 @@ function App() {
   const [anImagePreview, setAnImagePreview] = useState(null); // object URL
   const [anVideo, setAnVideo] = useState(null);              // sample/driving video File
   const [anVideoPreview, setAnVideoPreview] = useState(null); // object URL
+  const [anYoutubeUrl, setAnYoutubeUrl] = useState("");        // YouTube / social URL alternative
+  const [anDownloadBusy, setAnDownloadBusy] = useState(false);// downloading reference video
   const [anPrompt, setAnPrompt] = useState("");
   const [anSeconds, setAnSeconds] = useState(5);
   const [anBusy, setAnBusy] = useState(false);
@@ -1293,11 +1295,28 @@ function App() {
     if (anVideoPreview) { try { URL.revokeObjectURL(anVideoPreview); } catch {} }
     setAnVideo(file || null);
     setAnVideoPreview(file ? URL.createObjectURL(file) : null);
+    if (file) setAnYoutubeUrl(""); // file upload clears the URL input
+  }
+  async function downloadReferenceVideo() {
+    if (!anYoutubeUrl.trim()) return;
+    setAnDownloadBusy(true);
+    try {
+      const r = await fetch("/api/download-reference-video", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: anYoutubeUrl.trim(), seconds: anSeconds })
+      });
+      const j = await jsonOrThrow(r);
+      // Store the blob URL as a special "File-like" marker — we'll send videoUrl to animate-submit.
+      setAnVideo({ _blobUrl: j.url, name: "reference.mp4" });
+      setAnVideoPreview(j.url);
+      toast("✓ Reference video downloaded (" + (j.bytes/1024/1024).toFixed(1) + " MB)");
+    } catch (e) { toast("❌ Download failed: " + e.message.slice(0, 160), true); }
+    finally { setAnDownloadBusy(false); }
   }
   function cancelAnimate() { anCancelRef.current = true; setAnBusy(false); setAnStatus(""); }
   async function submitAnimate() {
     if (!anImage) { toast("Add a character image first.", true); return; }
-    if (!anVideo) { toast("Add a sample / driving video first.", true); return; }
+    if (!anVideo) { toast("Add a sample / driving video (or paste a YouTube URL) first.", true); return; }
     const sleep = (ms) => new Promise(r => setTimeout(r, ms));
     setAnBusy(true); setAnError(""); setAnResult(null); anCancelRef.current = false;
     setAnStatus("Waking the GPU…");
@@ -1306,7 +1325,12 @@ function App() {
       try { await fetch("/api/gpu/start", { method: "POST" }); } catch {}
       const fd = new FormData();
       fd.append("image", anImage);
-      fd.append("video", anVideo);
+      // anVideo is either a real File (upload) or { _blobUrl } (downloaded from URL)
+      if (anVideo._blobUrl) {
+        fd.append("videoUrl", anVideo._blobUrl); // server downloads from blob
+      } else {
+        fd.append("video", anVideo);
+      }
       fd.append("prompt", anPrompt || "");
       fd.append("size", scSize);
       fd.append("seconds", String(anSeconds));
@@ -2213,7 +2237,17 @@ function App() {
             <div style=${{border:"1px solid var(--border)",borderRadius:10,padding:12,background:"var(--surface-2)"}}>
               <label>② Sample / driving video</label>
               <input type="file" accept="video/*" onChange=${e => pickAnVideo(e.target.files && e.target.files[0])} style=${{display:"block",marginTop:6,fontSize:12}} />
-              ${anVideoPreview ? html`<video src=${anVideoPreview} controls muted style=${{marginTop:8,width:"100%",maxHeight:220,objectFit:"contain",borderRadius:8,background:"#0a0a0c"}}></video>` : html`<div class="muted small" style=${{marginTop:8}}>The motion/performance to copy. Keep it short (first ${anSeconds}s are used).</div>`}
+              <div style=${{display:"flex",gap:6,alignItems:"center",marginTop:8,flexWrap:"wrap"}}>
+                <input type="url" value=${anYoutubeUrl}
+                  onInput=${e => { setAnYoutubeUrl(e.target.value); setAnVideo(null); setAnVideoPreview(null); }}
+                  placeholder="— or paste a YouTube / social video URL —"
+                  style=${{fontSize:12,flex:"1 1 200px",fontFamily:"inherit"}} />
+                <button class="ghost small" onClick=${downloadReferenceVideo}
+                  disabled=${anDownloadBusy || !anYoutubeUrl.trim()}>
+                  ${anDownloadBusy ? "Downloading…" : "⬇ Download"}
+                </button>
+              </div>
+              ${anVideoPreview ? html`<video src=${anVideoPreview} controls muted style=${{marginTop:8,width:"100%",maxHeight:220,objectFit:"contain",borderRadius:8,background:"#0a0a0c"}}></video>` : html`<div class="muted small" style=${{marginTop:8}}>Upload a short clip, or paste a YouTube URL and click ⬇ Download. The motion/performance from this video will be replicated on your character.</div>`}
             </div>
           </div>
 
