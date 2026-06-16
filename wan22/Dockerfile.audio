@@ -34,6 +34,13 @@ FROM wan22acr23247.azurecr.io/wan22-comfyui:latest
 # with `--build-arg FOLEY_NODE_REPO=<your fork>` if you prefer a different/pinned node.
 ARG FOLEY_NODE_REPO=https://github.com/if-ai/ComfyUI_HunyuanVideoFoley.git
 
+# The foley node pins PyAV (av) which compiles from source — it needs pkg-config + the ffmpeg
+# dev headers, or pip fails with "pkg-config is required for building PyAV".
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        pkg-config libavformat-dev libavcodec-dev libavdevice-dev libavutil-dev \
+        libavfilter-dev libswscale-dev libswresample-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /opt/ComfyUI
 RUN git clone --depth 1 ${FOLEY_NODE_REPO} custom_nodes/ComfyUI_HunyuanVideoFoley \
  && if [ -f custom_nodes/ComfyUI_HunyuanVideoFoley/requirements.txt ]; then \

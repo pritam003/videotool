@@ -36,6 +36,6 @@
   },
   "59": {
     "class_type": "SaveAudioMP3",
-    "inputs": { "audio": ["49", 0], "filename_prefix": "ace_score" }
+    "inputs": { "audio": ["49", 0], "filename_prefix": "ace_score", "quality": "V0" }
   }
 }
