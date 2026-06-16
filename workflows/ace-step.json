@@ -1,0 +1,41 @@
+{
+  "14": {
+    "class_type": "CheckpointLoaderSimple",
+    "inputs": { "ckpt_name": "ace_step_v1_3.5b.safetensors" }
+  },
+  "17": {
+    "class_type": "TextEncodeAceStepAudio",
+    "inputs": { "clip": ["14", 1], "tags": __TAGS__, "lyrics": __LYRICS__, "lyrics_strength": 0.99 }
+  },
+  "18": {
+    "class_type": "ConditioningZeroOut",
+    "inputs": { "conditioning": ["17", 0] }
+  },
+  "40": {
+    "class_type": "EmptyAceStepLatentAudio",
+    "inputs": { "seconds": __SECONDS__, "batch_size": 1 }
+  },
+  "52": {
+    "class_type": "KSampler",
+    "inputs": {
+      "seed": __SEED__,
+      "steps": 50,
+      "cfg": 5,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1.0,
+      "model": ["14", 0],
+      "positive": ["17", 0],
+      "negative": ["18", 0],
+      "latent_image": ["40", 0]
+    }
+  },
+  "49": {
+    "class_type": "VAEDecodeAudio",
+    "inputs": { "samples": ["52", 0], "vae": ["14", 2] }
+  },
+  "59": {
+    "class_type": "SaveAudioMP3",
+    "inputs": { "audio": ["49", 0], "filename_prefix": "ace_score" }
+  }
+}

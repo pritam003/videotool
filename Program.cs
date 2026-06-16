@@ -858,30 +858,46 @@ app.MapPost("/api/mux-audio", async (MuxAudioRequest req, IHttpClientFactory hf,
         string args;
         if (mode == "fit")
         {
-            // Keep the spoken line in sync with the SHOT. The Wan clip only has ~clipSec of
-            // real motion, but narration+dialogue can run longer. Instead of freezing the last
-            // frame for several seconds while the voice keeps talking (the old behaviour — a
-            // 5s shot stretched to 9s), gently speed the voice up so it lands inside the clip's
-            // own motion, and only freeze a tiny residual if it still overruns after a natural
-            // speed cap. This removes the long frozen-frame tail and keeps picture+voice aligned.
+            // Keep the spoken line in sync with the SHOT without the two artefacts that read as
+            // "dubbed/pasted": a sped-up "chipmunk" voice and a frozen-frame tail. Instead keep the
+            // VOICE at natural speed and gently SLOW the picture (setpts) so the motion keeps flowing
+            // for the whole line and both end together. Only when a line is far too long for the shot
+            // do we cap the slow-mo and nudge the voice a little (≤1.2×). No frozen frames, no chipmunk.
             var ci = System.Globalization.CultureInfo.InvariantCulture;
             var vDur = await ProbeDurationAsync(ffmpeg, vIn, ct);
             var aDur = await ProbeDurationAsync(ffmpeg, aIn, ct);
-            const double leadIn = 0.25, tail = 0.35, maxTempo = 1.5;
+            const double leadIn = 0.25, tail = 0.35, maxTempo = 1.2, maxStretch = 1.5;
             string F(double x) => x.ToString("0.###", ci);
 
-            // Ideal window for the voice = the clip minus a small lead-in/tail.
-            var window = Math.Max(0.5, vDur - leadIn - tail);
-            // Speed the voice up only when it overruns the window; cap so it stays intelligible.
-            var tempo = (aDur > window) ? Math.Min(maxTempo, aDur / window) : 1.0;
-            var effAudio = aDur / tempo;                        // spoken length after the speed-up
-            var target = Math.Max(vDur, leadIn + effAudio + tail);
-            var ext = Math.Max(0.0, target - vDur);             // residual freeze (small or zero)
+            var aWindow = Math.Max(0.5, vDur - leadIn - tail);
+            double tempo = 1.0, target;
+            if (aDur <= aWindow)
+            {
+                // The line already fits the shot — natural voice, no stretch.
+                target = vDur;
+            }
+            else
+            {
+                // Line longer than the shot: stretch the video to the natural spoken length.
+                target = leadIn + aDur + tail;
+                if (target > vDur * maxStretch)
+                {
+                    // Would be too much slow-mo — cap the stretch and speed the voice a little.
+                    var capped = vDur * maxStretch;
+                    var aWin2 = Math.Max(0.5, capped - leadIn - tail);
+                    tempo = Math.Min(maxTempo, aDur / aWin2);
+                    var effA = aDur / tempo;
+                    target = Math.Max(capped, leadIn + effA + tail);
+                }
+            }
+            var videoStretch = target / vDur;                   // ≥ 1.0; video exactly fills the target
             var leadMs = (int)Math.Round(leadIn * 1000);
             var atempo = tempo > 1.001 ? $"atempo={F(tempo)}," : "";
+            // setpts slows the picture to fill `target` (no freeze); apad covers any short audio gap;
+            // -r 24 resamples the stretched video so the slow-mo plays smoothly instead of choppy.
             args = $"-y -i \"{vIn}\" -i \"{aIn}\" -filter_complex "
-                 + $"\"[0:v]tpad=stop_mode=clone:stop_duration={F(ext)}[v];[1:a]{atempo}adelay=delays={leadMs}:all=1,apad[a]\" "
-                 + $"-map \"[v]\" -map \"[a]\" -t {F(target)} -c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p "
+                 + $"\"[0:v]setpts={F(videoStretch)}*PTS[v];[1:a]{atempo}adelay=delays={leadMs}:all=1,apad[a]\" "
+                 + $"-map \"[v]\" -map \"[a]\" -t {F(target)} -r 24 -c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p "
                  + $"-c:a aac -b:a 192k -movflags +faststart \"{outPath}\"";
         }
         else args = mode == "mix"
@@ -1132,6 +1148,70 @@ app.MapPost("/api/foley", async (FoleyRequest req, WanClient wan, IHttpClientFac
     catch (Exception ex) when (!ct.IsCancellationRequested)
     {
         return Results.Problem($"foley failed: {ex.Message}");
+    }
+});
+
+// LLM-DIRECTED MUSIC SCORE (ACE-Step text-to-music). The free/open upgrade over the synthesized
+// sine-tone bed: a real instrumental score composed from a tags brief (genre/mood/tempo) the LLM
+// writes for the film. GATED behind WAN_AUDIO_ENABLED + the audio GPU image (ace_step checkpoint on
+// the share). Returns 501 until activated, so the render worker falls back to /api/generate-background-music.
+// The result is pre-attenuated to a bed level so it sits UNDER the voice when mixed (musicmix).
+app.MapPost("/api/generate-score", async (ScoreRequest req, WanClient wan,
+    IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
+{
+    var enabled = string.Equals(cfg["WAN_AUDIO_ENABLED"], "1", StringComparison.Ordinal)
+               || string.Equals(cfg["WAN_AUDIO_ENABLED"], "true", StringComparison.OrdinalIgnoreCase);
+    if (!enabled)
+        return Results.StatusCode(501); // not activated — caller uses the procedural music bed
+
+    var tags = (req?.Tags ?? "").Trim();
+    if (tags.Length == 0) tags = "cinematic instrumental, emotional, ambient, soft, film score";
+    var seconds = Math.Clamp(req?.DurationSeconds ?? 30, 5, 240);
+    var bedVol = Math.Clamp(req?.MusicVolume ?? 0.5, 0, 1) * 0.4; // keep well under the spoken track
+    try
+    {
+        var (music, ctype) = await wan.GenerateMusicAsync(tags, req?.Lyrics ?? "", seconds, ct);
+
+        // Pre-attenuate to a bed level so musicmix (normalize=0) keeps narration on top.
+        var outBytes = music;
+        var outCtype = ctype;
+        var ext = ctype.Contains("wav", StringComparison.OrdinalIgnoreCase) ? "wav" : "mp3";
+        var ffmpeg = LocateFfmpeg();
+        if (ffmpeg is not null)
+        {
+            var work = Path.Combine(Path.GetTempPath(), $"score-{Guid.NewGuid():N}");
+            Directory.CreateDirectory(work);
+            try
+            {
+                var inPath = Path.Combine(work, "in." + ext);
+                await File.WriteAllBytesAsync(inPath, music, ct);
+                var outPath = Path.Combine(work, "out.wav");
+                var vol = bedVol.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
+                var (ec, _) = await RunProcessAsync(ffmpeg, $"-y -i \"{inPath}\" -af \"volume={vol}\" -c:a pcm_s16le \"{outPath}\"", ct);
+                if (ec == 0 && File.Exists(outPath))
+                {
+                    outBytes = await File.ReadAllBytesAsync(outPath, ct);
+                    outCtype = "audio/wav"; ext = "wav";
+                }
+            }
+            finally { try { Directory.Delete(work, recursive: true); } catch { } }
+        }
+
+        var account = Cfg(cfg, "STORAGE_ACCOUNT");
+        var svc = new BlobServiceClient(new Uri($"https://{account}.blob.core.windows.net"), cred);
+        var container = svc.GetBlobContainerClient(cfg["STORAGE_CONTAINER"] ?? "videos");
+        var name = $"score/{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}.{ext}";
+        using var ms = new MemoryStream(outBytes);
+        var url = await UploadAndSign(container, name, ms, outCtype, svc, account, ct);
+        return Results.Ok(new { url, blob = name, bytes = outBytes.Length });
+    }
+    catch (Exception ex) when (IsWarmingError(ex))
+    {
+        return Results.Json(new { warming = true }, statusCode: 503);
+    }
+    catch (Exception ex) when (!ct.IsCancellationRequested)
+    {
+        return Results.Problem($"score failed: {ex.Message}");
     }
 });
 
@@ -2415,6 +2495,7 @@ Return ONE JSON object, no markdown, exactly this shape:
   ""logline"": ""<one sentence describing the whole arc>"",
   ""style"": ""<film stock + grade + lens + lighting, identical across all clips>"",
   ""setting"": ""<where the story takes place and how/if it travels>"",
+  ""musicTheme"": ""<comma-separated INSTRUMENTAL score brief for this film: genre + overall mood + 2-3 instruments + tempo, e.g. 'cinematic orchestral, tender and hopeful, piano, warm strings, soft percussion, 80 bpm'. Match the story's emotion. No lyrics, no vocals.>"",
   ""clipSeconds"": {clipSeconds},
   ""clipCount"": {clipCount},
   ""cast"": [
@@ -2494,6 +2575,7 @@ Cast the characters and locations this idea needs (support multiple characters),
             logline = clean,
             style = "photoreal cinematic look, natural color grade, consistent lensing and lighting",
             setting = "one continuous environment with smooth spatial continuity",
+            musicTheme = "cinematic instrumental, gentle and emotional, piano, soft strings, ambient pads, 75 bpm",
             clipSeconds,
             clipCount,
             cast = new[] { new { id = "hero", name = "Lead", description = "the main subject defined by the reference image; consistent face, hair and wardrobe throughout" } },
@@ -2544,8 +2626,20 @@ Produce the {clipCount}-clip storyboard ({clipSeconds}s per clip, {clipCount * c
 
     System.Text.Json.Nodes.JsonNode? story = null;
     bool soften = false;
+    // Hard overall budget so this SYNCHRONOUS endpoint always returns before the App Service
+    // ~230s inbound-request limit (which otherwise surfaces to the browser as a 504 GatewayTimeout).
+    // reasoning_effort=low makes a single call ~20-50s so attempt 1 normally succeeds well inside
+    // this; if AOAI is slow/overloaded we return the fallback storyboard rather than hang into a 504.
+    var deadline = DateTime.UtcNow.AddSeconds(200);
     for (int attempt = 1; attempt <= 3 && story is null; attempt++)
     {
+        var remaining = deadline - DateTime.UtcNow;
+        if (remaining <= TimeSpan.FromSeconds(12)) break; // out of budget → return the fallback below
+        var attemptTimeout = remaining < TimeSpan.FromSeconds(85) ? remaining : TimeSpan.FromSeconds(85);
+        using var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        attemptCts.CancelAfter(attemptTimeout);
+        var act = attemptCts.Token;
+
         string body;
         try
         {
@@ -2559,11 +2653,12 @@ Produce the {clipCount}-clip storyboard ({clipSeconds}s per clip, {clipCount * c
                     new { role = "user",   content = soften ? softUser : user }
                 },
                 max_completion_tokens = 12000,
+                reasoning_effort = "low",
                 response_format = new { type = "json_object" }
             };
             msg.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
-            using var resp = await client.SendAsync(msg, ct);
-            body = await resp.Content.ReadAsStringAsync(ct);
+            using var resp = await client.SendAsync(msg, act);
+            body = await resp.Content.ReadAsStringAsync(act);
             if (!resp.IsSuccessStatusCode)
             {
                 if (((int)resp.StatusCode == 429 || (int)resp.StatusCode >= 500) && attempt < 3) continue;
@@ -2579,8 +2674,14 @@ Produce the {clipCount}-clip storyboard ({clipSeconds}s per clip, {clipCount * c
                 return Results.Problem($"Storyboard failed ({(int)resp.StatusCode}): {body}");
             }
         }
-        catch (Exception) when (attempt < 3 && !ct.IsCancellationRequested)
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
+            throw; // genuine client abort — stop
+        }
+        catch (Exception)
+        {
+            // transient error or a per-attempt timeout — retry while budget/attempts remain;
+            // otherwise fall through to the fallback storyboard below (never a 500/504).
             continue;
         }
 
@@ -3581,6 +3682,10 @@ public record SoundscapeRequest(string? Mood, string? Location, string? Action, 
 // Only runs when WAN_AUDIO_ENABLED is set AND the audio-enabled GPU image is deployed; otherwise
 // returns 501 and the worker falls back to the procedural soundscape above.
 public record FoleyRequest(string VideoUrl, string? Prompt, string? Size);
+// LLM-directed musical SCORE generated with ACE-Step (text-to-music) on the GPU. Tags is a
+// comma-separated style/genre/mood/tempo brief; Lyrics empty for an instrumental bed. Gated behind
+// WAN_AUDIO_ENABLED + the audio GPU image; the worker falls back to the procedural music bed otherwise.
+public record ScoreRequest(string? Tags, string? Lyrics, int? DurationSeconds, double? MusicVolume);
 public record DialogueClip(int Index, string? Title, string? Action, string? Narration);
 public record DialogueRequest(string? Direction, string? Language, DialogueClip[]? Clips);
 

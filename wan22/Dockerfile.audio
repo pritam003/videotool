@@ -9,8 +9,9 @@
 #  ACTIVATE (all from your machine, no local Docker needed — ACR builds in the cloud):
 #    1) Build the audio image to a NON-latest tag:
 #         az acr build -r wan22acr23247 -t wan22-comfyui:audio -f wan22/Dockerfile.audio wan22
-#    2) Stage the foley weights to the model share (one-time, ~10 min):
-#         STORAGE_NAME=wan22stor22165 bash wan22/download-foley.sh
+#    2) Stage the weights to the model share (one-time, ~10 min each):
+#         STORAGE_NAME=wan22stor22165 bash wan22/download-foley.sh      # HunyuanVideo-Foley (SFX)
+#         STORAGE_NAME=wan22stor22165 bash wan22/download-acestep.sh    # ACE-Step (music score)
 #    3) Turn the feature on for the app:
 #         az webapp config appsettings set -g rg-videotool -n videotool-pritam003-23209 \
 #           --settings WAN_AUDIO_ENABLED=1
@@ -21,9 +22,10 @@
 #       (deactivate any other active revision so only the audio pod warms up)
 #    ROLL BACK anytime: re-run the update with ...:latest and unset WAN_AUDIO_ENABLED.
 #
-#  NOTE: custom-node class names + the expected weights path can vary by node version.
-#  After step 1, open ComfyUI once and confirm the node ids in workflows/hunyuan-foley.json
-#  match the installed node (and that the weights landed where the node looks for them).
+#  NOTE: ACE-Step (music) uses ComfyUI's NATIVE nodes — no custom node, just the checkpoint from
+#  download-acestep.sh. Only HunyuanVideo-Foley needs the custom node added below. After step 1,
+#  open ComfyUI once and confirm the node ids in workflows/hunyuan-foley.json + workflows/ace-step.json
+#  match the installed nodes (and that the weights landed where the nodes look for them).
 # =============================================================================
 
 FROM wan22acr23247.azurecr.io/wan22-comfyui:latest

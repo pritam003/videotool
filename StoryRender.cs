@@ -558,24 +558,59 @@ public sealed class StoryRenderWorker : BackgroundService
             job.ResultUrl = finals[0];
         }
 
-        // ---- 4) BACKGROUND MUSIC: lay an ambient bed under the finished film. ----
-        // If clips carry spoken audio we mix the music UNDER it (musicmix, narration stays
-        // full); otherwise the music becomes the film's sole track (replace). Failures keep
-        // the film as-is, so music is always best-effort and never blocks delivery.
+        // ---- 4) MUSIC SCORE: lay a score under the finished film. ----
+        // Prefer a real ACE-Step score (free/open, GPU) directed by the film's LLM-written
+        // musicTheme; fall back to the procedural sine bed when the audio GPU image isn't activated
+        // (501) or on any error. If clips carry spoken audio we mix the music UNDER it (musicmix,
+        // narration stays full); otherwise the music becomes the film's sole track (replace).
         if (!string.IsNullOrWhiteSpace(spec.BackgroundMusic) && !string.IsNullOrWhiteSpace(job.ResultUrl))
         {
             try
             {
-                job.Pct = 97; job.Label = "composing background music";
+                job.Pct = 97; job.Label = "composing the score";
                 // Overshoot the duration (fit mode stretches clips past clipSec); the mux
                 // trims music to the film length, so a generous estimate is safe.
                 var estDuration = N * clipSec + N * 3 + 5;
-                var mg = await PostJsonAsync("/api/generate-background-music",
-                    new { mood = spec.BackgroundMusic, durationSeconds = estDuration, musicVolume = spec.MusicVolume }, ct);
-                var musicUrl = mg.GetProperty("url").GetString();
+
+                // Build the ACE-Step brief from the LLM's per-film musicTheme, else from the mood.
+                string MusicTags()
+                {
+                    var theme = S(story["musicTheme"], "").Trim();
+                    if (theme.Length > 0) return theme;
+                    return (spec.BackgroundMusic ?? "").ToLowerInvariant() switch
+                    {
+                        "cinematic" => "cinematic orchestral film score, epic and emotional, strings, brass, piano, 90 bpm",
+                        "dramatic" => "dramatic tense film score, dark strings, low brass, percussion, 100 bpm",
+                        "ambient" => "ambient instrumental, calm and atmospheric, soft synth pads, piano, slow",
+                        "uplifting" => "uplifting instrumental, bright and hopeful, piano, strings, light percussion, 110 bpm",
+                        "suspenseful" => "suspenseful instrumental, eerie and tense, low drones, sparse piano, 70 bpm",
+                        _ => "cinematic instrumental, gentle and emotional, piano, soft strings, 80 bpm"
+                    };
+                }
+
+                string? musicUrl = null;
+                try
+                {
+                    var (code, body) = await PostJsonRawAsync("/api/generate-score",
+                        new { tags = MusicTags(), lyrics = "", durationSeconds = estDuration, musicVolume = spec.MusicVolume }, ct);
+                    if (code >= 200 && code < 300)
+                        musicUrl = JsonDocument.Parse(body).RootElement.GetProperty("url").GetString();
+                    else
+                        _log.LogInformation("ACE-Step score unavailable ({Code}); using procedural music", code);
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex) { _log.LogInformation(ex, "ACE-Step score failed; using procedural music"); }
+
+                if (string.IsNullOrWhiteSpace(musicUrl))
+                {
+                    var mg = await PostJsonAsync("/api/generate-background-music",
+                        new { mood = spec.BackgroundMusic, durationSeconds = estDuration, musicVolume = spec.MusicVolume }, ct);
+                    musicUrl = mg.GetProperty("url").GetString();
+                }
+
                 if (!string.IsNullOrWhiteSpace(musicUrl))
                 {
-                    job.Label = "mixing in background music";
+                    job.Label = "mixing in the score";
                     var mode = anyAudio ? "musicmix" : "replace";
                     var mm = await PostJsonAsync("/api/mux-audio",
                         new { videoUrl = job.ResultUrl, audioUrl = musicUrl, mode }, ct);
@@ -585,7 +620,7 @@ public sealed class StoryRenderWorker : BackgroundService
                 }
             }
             catch (OperationCanceledException) { throw; }
-            catch (Exception ex) { _log.LogWarning(ex, "background music failed; film kept without music"); }
+            catch (Exception ex) { _log.LogWarning(ex, "score failed; film kept without music"); }
         }
     }
 

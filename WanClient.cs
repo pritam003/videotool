@@ -20,6 +20,7 @@ public sealed class WanClient
     private readonly Lazy<string> _i2vWorkflowJson;
     private readonly Lazy<string> _fluxWorkflowJson;
     private readonly Lazy<string> _foleyWorkflowJson;
+    private readonly Lazy<string> _aceWorkflowJson;
     private readonly ILogger<WanClient> _log;
 
     public WanClient(IHttpClientFactory hf, IConfiguration cfg, IHostEnvironment env, ILogger<WanClient> log)
@@ -50,6 +51,12 @@ public sealed class WanClient
         var foleyWorkflowPath = cfg["WAN_FOLEY_WORKFLOW_PATH"]
             ?? Path.Combine(env.ContentRootPath, "workflows", "hunyuan-foley.json");
         _foleyWorkflowJson = new Lazy<string>(() => File.ReadAllText(foleyWorkflowPath));
+        // ACE-Step text-to-music workflow (ComfyUI native ACE-Step nodes). Used by the gated
+        // /api/generate-score endpoint to compose an LLM-directed instrumental score for a film.
+        // Needs ace_step_v1_3.5b.safetensors staged to the checkpoints share + a recent ComfyUI.
+        var aceWorkflowPath = cfg["WAN_ACE_WORKFLOW_PATH"]
+            ?? Path.Combine(env.ContentRootPath, "workflows", "ace-step.json");
+        _aceWorkflowJson = new Lazy<string>(() => File.ReadAllText(aceWorkflowPath));
     }
 
     /// <summary>
@@ -465,6 +472,71 @@ public sealed class WanClient
             await Task.Delay(1500, ct);
         }
         throw new TimeoutException("HunyuanVideo-Foley timed out.");
+    }
+
+    /// <summary>
+    /// Generate an instrumental music score with ACE-Step (text-to-music) on the GPU.
+    /// <paramref name="tags"/> is a comma-separated style/genre/mood/tempo brief (ACE-Step's prompt
+    /// format, e.g. "cinematic, emotional strings, piano, hopeful, 90 bpm"); <paramref name="lyrics"/>
+    /// is empty for an instrumental bed. Runs the ACE-Step workflow, polls /history, and returns the
+    /// produced audio bytes + content type. Requires ace_step_v1_3.5b.safetensors on the checkpoints
+    /// share + a recent ComfyUI (native ACE-Step nodes). Throws if absent so the caller can fall back.
+    /// </summary>
+    public async Task<(byte[] audio, string contentType)> GenerateMusicAsync(
+        string tags, string lyrics, int seconds, CancellationToken ct)
+    {
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
+        var sec = Math.Clamp(seconds, 5, 240);
+        var seed = Random.Shared.NextInt64() & 0x7FFFFFFFFFFFFFFFL;
+        var workflow = _aceWorkflowJson.Value
+            .Replace("__TAGS__", JsonSerializer.Serialize(tags ?? string.Empty))
+            .Replace("__LYRICS__", JsonSerializer.Serialize(lyrics ?? string.Empty))
+            .Replace("__SECONDS__", sec.ToString(inv))
+            .Replace("__SEED__", seed.ToString(inv));
+        var promptId = await PostGraphAsync(workflow, ct);
+
+        var http = _hf.CreateClient();
+        http.Timeout = TimeSpan.FromSeconds(30);
+        if (!string.IsNullOrEmpty(_authKey)) http.DefaultRequestHeaders.Add("X-Wan-Auth", _authKey);
+
+        // ACE-Step renders minutes of music in seconds on an A100, but the first call also loads the
+        // 3.5B checkpoint into VRAM — allow generous headroom before giving up.
+        var deadline = DateTime.UtcNow.AddMinutes(6);
+        while (DateTime.UtcNow < deadline)
+        {
+            ct.ThrowIfCancellationRequested();
+            using var hResp = await http.GetAsync($"{_baseUrl}/history/{Uri.EscapeDataString(promptId)}", ct);
+            if (hResp.IsSuccessStatusCode)
+            {
+                using var hist = JsonDocument.Parse(await hResp.Content.ReadAsStringAsync(ct));
+                if (hist.RootElement.TryGetProperty(promptId, out var entry))
+                {
+                    if (entry.TryGetProperty("status", out var st) &&
+                        st.TryGetProperty("status_str", out var ss) &&
+                        string.Equals(ss.GetString(), "error", StringComparison.OrdinalIgnoreCase))
+                        throw new InvalidOperationException("ACE-Step music generation failed in ComfyUI (check the checkpoint is on the share).");
+                    if (entry.TryGetProperty("outputs", out var outs))
+                    {
+                        foreach (var node in outs.EnumerateObject())
+                        {
+                            if (node.Value.TryGetProperty("audio", out var arr) && arr.GetArrayLength() > 0)
+                            {
+                                var fn = arr[0].GetProperty("filename").GetString()
+                                    ?? throw new InvalidOperationException("ACE-Step output had no filename");
+                                string? sf = arr[0].TryGetProperty("subfolder", out var s) ? s.GetString() : null;
+                                using var dl = await DownloadAsync(fn, sf, ct);
+                                dl.EnsureSuccessStatusCode();
+                                var bytes = await dl.Content.ReadAsByteArrayAsync(ct);
+                                var ctype = dl.Content.Headers.ContentType?.ToString() ?? "audio/mpeg";
+                                return (bytes, ctype);
+                            }
+                        }
+                    }
+                }
+            }
+            await Task.Delay(1500, ct);
+        }
+        throw new TimeoutException("ACE-Step music generation timed out.");
     }
 
     /// <summary>
