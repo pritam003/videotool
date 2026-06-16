@@ -331,7 +331,11 @@ public sealed class StoryRenderWorker : BackgroundService
         var finals = new List<string>();
         string? prevFrameName = null;
         JsonNode? prevClip = null;
-        var anyAudio = false;   // did any clip get a spoken track? decides how music is laid in
+        // Every spoken line, collected across all clips IN STORY ORDER, for ONE continuous
+        // voiceover built AFTER the stitch. Per-clip muxing made the voice restart choppily at
+        // each cut and bolted a separate ambient bed onto every shot; the whole-film soundtrack
+        // (one flowing voice + one background) is assembled once at the end instead.
+        var voiceSegments = new List<(string Text, string Voice, string Style)>();
 
         for (int i = 0; i < N; i++)
         {
@@ -417,113 +421,26 @@ public sealed class StoryRenderWorker : BackgroundService
                 catch { prevFrameName = null; }
             }
 
-            // Per-clip audio: a NARRATOR voiceover carries the story where dialogue can't, plus
-            // the character's spoken line at key beats — whichever the storyboard provides for
-            // this clip. Narration first, then dialogue; fit the shot to the audio so nothing cuts.
-            var clipHasVoice = false;
+            // Collect this clip's spoken lines (narrator voiceover + the speaking character's
+            // dialogue) for the ONE continuous voiceover assembled after the stitch. The clip
+            // itself stays SILENT here — its mood drives the per-line emotional delivery.
             if (narrating)
             {
-                try
+                var nLine = S(clip["narration"], "").Trim();
+                var dLine = S(clip["dialog"], "").Trim();
+                var style = MoodToStyle(S(clip["mood"], ""));
+                if (nLine.Length > 0)
+                    voiceSegments.Add((nLine, spec.NarratorVoice, style));
+                if (dLine.Length > 0)
                 {
-                    var nLine = S(clip["narration"], "").Trim();
-                    var dLine = S(clip["dialog"], "").Trim();
                     var speakerId = S(clip["speaker"], "");
                     if (string.IsNullOrEmpty(speakerId) && clip["characters"] is JsonArray cs && cs.Count == 1)
                         speakerId = S(cs[0], "");
                     var dVoice = (!string.IsNullOrEmpty(speakerId) && cast.TryGetValue(speakerId, out var sw) && !string.IsNullOrWhiteSpace(sw.Voice))
                         ? sw.Voice!
                         : (!string.IsNullOrWhiteSpace(spec.DialogVoice) ? spec.DialogVoice! : spec.NarratorVoice);
-                    var style = MoodToStyle(S(clip["mood"], ""));
-
-                    var tracks = new List<string>();
-                    if (nLine.Length > 0)
-                    {
-                        job.Label = $"{label}: narrating";
-                        var nr = await PostJsonAsync("/api/narrate", new { text = nLine, voice = spec.NarratorVoice, style }, ct);
-                        tracks.Add(nr.GetProperty("url").GetString()!);
-                    }
-                    if (dLine.Length > 0)
-                    {
-                        job.Label = $"{label}: dialogue";
-                        var dr = await PostJsonAsync("/api/narrate", new { text = dLine, voice = dVoice, style }, ct);
-                        tracks.Add(dr.GetProperty("url").GetString()!);
-                    }
-                    if (tracks.Count > 0)
-                    {
-                        var audioUrl = tracks[0];
-                        if (tracks.Count > 1)
-                        {
-                            var cr = await PostJsonAsync("/api/concat-audio",
-                                new { audioUrls = tracks.ToArray(), gapMs = 350 }, ct);
-                            audioUrl = cr.GetProperty("url").GetString()!;
-                        }
-                        // 'fit' holds the shot to the spoken audio (lead-in + tail) instead of
-                        // truncating it at the fixed clip length — keeps audio in sync.
-                        var mr = await PostJsonAsync("/api/mux-audio",
-                            new { videoUrl = clipUrl, audioUrl, mode = "fit" }, ct);
-                        clipUrl = mr.GetProperty("url").GetString()!;
-                        anyAudio = true;
-                        clipHasVoice = true;
-                    }
+                    voiceSegments.Add((dLine, dVoice, style));
                 }
-                catch (OperationCanceledException) { throw; }
-                catch (Exception ex) { _log.LogWarning(ex, "{Label} audio failed; clip kept silent", label); }
-            }
-
-            // Per-clip AMBIENT SOUNDSCAPE: give the shot a sense of place (wind/rain/crowd/room/
-            // waves/city…) drawn from its mood + location + action, laid UNDER the voice with
-            // sidechain ducking so dialogue stays crisp. This is the always-available FREE bed;
-            // when NeuralFoley is on AND the GPU audio image is live, prefer real synced foley and
-            // fall back to the procedural bed on any failure. Best-effort — never blocks the film.
-            if (spec.Soundscape)
-            {
-                try
-                {
-                    job.Label = $"{label}: ambient sound";
-                    string? bedUrl = null;
-
-                    if (spec.NeuralFoley)
-                    {
-                        try
-                        {
-                            var (code, body) = await PostJsonRawAsync("/api/foley",
-                                new { videoUrl = clipUrl, prompt = S(clip["action"], ""), size }, ct);
-                            if (code >= 200 && code < 300)
-                                bedUrl = JsonDocument.Parse(body).RootElement.GetProperty("url").GetString();
-                            else
-                                _log.LogInformation("{Label} neural foley unavailable ({Code}); using procedural soundscape", label, code);
-                        }
-                        catch (OperationCanceledException) { throw; }
-                        catch (Exception fx) { _log.LogInformation(fx, "{Label} neural foley failed; using procedural soundscape", label); }
-                    }
-
-                    if (string.IsNullOrWhiteSpace(bedUrl))
-                    {
-                        var locText = ResolveLocationText(clip, story);
-                        var sg = await PostJsonAsync("/api/generate-soundscape", new
-                        {
-                            mood = S(clip["mood"], ""),
-                            location = locText,
-                            action = S(clip["action"], ""),
-                            durationSeconds = clipSec + 5,
-                            volume = spec.SoundscapeVolume
-                        }, ct);
-                        bedUrl = sg.GetProperty("url").GetString();
-                    }
-
-                    if (!string.IsNullOrWhiteSpace(bedUrl))
-                    {
-                        // Duck the bed under the voice when the clip already has a spoken track;
-                        // otherwise the bed simply becomes the clip's sound (trimmed to the shot).
-                        var mode = clipHasVoice ? "duckmix" : "replace";
-                        var mm = await PostJsonAsync("/api/mux-audio",
-                            new { videoUrl = clipUrl, audioUrl = bedUrl, mode }, ct);
-                        var withBed = mm.GetProperty("url").GetString();
-                        if (!string.IsNullOrWhiteSpace(withBed)) { clipUrl = withBed!; anyAudio = true; }
-                    }
-                }
-                catch (OperationCanceledException) { throw; }
-                catch (Exception ex) { _log.LogWarning(ex, "{Label} soundscape failed; clip kept as-is", label); }
             }
 
             finals.Add(clipUrl);
@@ -532,17 +449,17 @@ public sealed class StoryRenderWorker : BackgroundService
             prevClip = clip;
         }
 
-        // ---- 3) STITCH into the final film (hard cuts when narrated). ----
+        // ---- 3) STITCH the SILENT clips into one continuous film. The whole-film soundtrack
+        //         (voiceover + background) is laid on next, so the clips carry no audio yet. ----
         if (finals.Count >= 2)
         {
-            job.Pct = 95; job.Label = $"stitching {finals.Count} clips into the film";
-            var cf = narrating ? 0 : spec.Crossfade;
+            job.Pct = 92; job.Label = $"stitching {finals.Count} clips into the film";
             try
             {
                 var logline = "";
                 try { logline = spec.Story?["logline"]?.GetValue<string>() ?? ""; } catch { }
                 var r = await PostJsonAsync("/api/stitch",
-                    new { urls = finals.ToArray(), crossfade = cf, reencode = narrating,
+                    new { urls = finals.ToArray(), crossfade = 0, reencode = false,
                           title = job.Title, idea = spec.Idea ?? "", logline }, ct);
                 job.ResultUrl = r.GetProperty("url").GetString();
             }
@@ -558,19 +475,53 @@ public sealed class StoryRenderWorker : BackgroundService
             job.ResultUrl = finals[0];
         }
 
-        // ---- 4) MUSIC SCORE: lay a score under the finished film. ----
-        // Prefer a real ACE-Step score (free/open, GPU) directed by the film's LLM-written
-        // musicTheme; fall back to the procedural sine bed when the audio GPU image isn't activated
-        // (501) or on any error. If clips carry spoken audio we mix the music UNDER it (musicmix,
-        // narration stays full); otherwise the music becomes the film's sole track (replace).
-        if (!string.IsNullOrWhiteSpace(spec.BackgroundMusic) && !string.IsNullOrWhiteSpace(job.ResultUrl))
+        // ---- 4) CONTINUOUS VOICEOVER: synth every spoken line in story order, join them into one
+        //         flowing track, and lay it over the WHOLE film. 'fit' paces the picture to the
+        //         voice (gentle slow-mo only if the lines run long) so they end together — no
+        //         per-clip freezes or chipmunk speed-ups, and the voice never restarts at a cut. ----
+        var anyVoice = false;
+        if (narrating && voiceSegments.Count > 0 && !string.IsNullOrWhiteSpace(job.ResultUrl))
         {
             try
             {
-                job.Pct = 97; job.Label = "composing the score";
-                // Overshoot the duration (fit mode stretches clips past clipSec); the mux
-                // trims music to the film length, so a generous estimate is safe.
-                var estDuration = N * clipSec + N * 3 + 5;
+                job.Pct = 94; job.Label = "recording the voiceover";
+                var urls = new List<string>();
+                foreach (var seg in voiceSegments)
+                {
+                    var nr = await PostJsonAsync("/api/narrate",
+                        new { text = seg.Text, voice = seg.Voice, style = seg.Style }, ct);
+                    urls.Add(nr.GetProperty("url").GetString()!);
+                }
+                var voiceUrl = urls[0];
+                if (urls.Count > 1)
+                {
+                    var cr = await PostJsonAsync("/api/concat-audio",
+                        new { audioUrls = urls.ToArray(), gapMs = 320 }, ct);
+                    voiceUrl = cr.GetProperty("url").GetString()!;
+                }
+                job.Label = "laying the voiceover over the film";
+                var mr = await PostJsonAsync("/api/mux-audio",
+                    new { videoUrl = job.ResultUrl, audioUrl = voiceUrl, mode = "fit" }, ct);
+                var withVoice = mr.GetProperty("url").GetString();
+                if (!string.IsNullOrWhiteSpace(withVoice)) { job.ResultUrl = withVoice; anyVoice = true; }
+                await _queue.PersistAsync(job);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) { _log.LogWarning(ex, "voiceover failed; film kept silent"); }
+        }
+
+        // ---- 5) BACKGROUND: ONE continuous bed under the whole film — a real ACE-Step score when a
+        //         music mood is chosen (procedural fallback), else a single ambient soundscape from
+        //         the opening scene. Mixed UNDER the voice (musicmix) so narration stays on top. ----
+        if (!string.IsNullOrWhiteSpace(job.ResultUrl) &&
+            (!string.IsNullOrWhiteSpace(spec.BackgroundMusic) || spec.Soundscape))
+        {
+            try
+            {
+                job.Pct = 97; job.Label = "composing the background";
+                // Overshoot the duration (fit may stretch the film past clipCount*clipSec); the
+                // mux trims the bed to the film, so a generous estimate is safe.
+                var estDuration = N * clipSec + N * 4 + 6;
 
                 // Build the ACE-Step brief from the LLM's per-film musicTheme, else from the mood.
                 string MusicTags()
@@ -588,39 +539,50 @@ public sealed class StoryRenderWorker : BackgroundService
                     };
                 }
 
-                string? musicUrl = null;
-                try
+                string? bgUrl = null;
+                if (!string.IsNullOrWhiteSpace(spec.BackgroundMusic))
                 {
-                    var (code, body) = await PostJsonRawAsync("/api/generate-score",
-                        new { tags = MusicTags(), lyrics = "", durationSeconds = estDuration, musicVolume = spec.MusicVolume }, ct);
-                    if (code >= 200 && code < 300)
-                        musicUrl = JsonDocument.Parse(body).RootElement.GetProperty("url").GetString();
-                    else
-                        _log.LogInformation("ACE-Step score unavailable ({Code}); using procedural music", code);
-                }
-                catch (OperationCanceledException) { throw; }
-                catch (Exception ex) { _log.LogInformation(ex, "ACE-Step score failed; using procedural music"); }
+                    try
+                    {
+                        var (code, body) = await PostJsonRawAsync("/api/generate-score",
+                            new { tags = MusicTags(), lyrics = "", durationSeconds = estDuration, musicVolume = spec.MusicVolume }, ct);
+                        if (code >= 200 && code < 300)
+                            bgUrl = JsonDocument.Parse(body).RootElement.GetProperty("url").GetString();
+                        else
+                            _log.LogInformation("ACE-Step score unavailable ({Code}); using procedural music", code);
+                    }
+                    catch (OperationCanceledException) { throw; }
+                    catch (Exception ex) { _log.LogInformation(ex, "ACE-Step score failed; using procedural music"); }
 
-                if (string.IsNullOrWhiteSpace(musicUrl))
+                    if (string.IsNullOrWhiteSpace(bgUrl))
+                    {
+                        var mg = await PostJsonAsync("/api/generate-background-music",
+                            new { mood = spec.BackgroundMusic, durationSeconds = estDuration, musicVolume = spec.MusicVolume }, ct);
+                        bgUrl = mg.GetProperty("url").GetString();
+                    }
+                }
+                else // Soundscape on, no music mood → one continuous ambient bed for the whole film.
                 {
-                    var mg = await PostJsonAsync("/api/generate-background-music",
-                        new { mood = spec.BackgroundMusic, durationSeconds = estDuration, musicVolume = spec.MusicVolume }, ct);
-                    musicUrl = mg.GetProperty("url").GetString();
+                    var c0 = clips[0]!;
+                    var sg = await PostJsonAsync("/api/generate-soundscape",
+                        new { mood = S(c0["mood"], ""), location = ResolveLocationText(c0, story),
+                              action = S(c0["action"], ""), durationSeconds = estDuration, volume = spec.SoundscapeVolume }, ct);
+                    bgUrl = sg.GetProperty("url").GetString();
                 }
 
-                if (!string.IsNullOrWhiteSpace(musicUrl))
+                if (!string.IsNullOrWhiteSpace(bgUrl))
                 {
-                    job.Label = "mixing in the score";
-                    var mode = anyAudio ? "musicmix" : "replace";
+                    job.Label = "mixing the background";
+                    var mode = anyVoice ? "musicmix" : "replace";
                     var mm = await PostJsonAsync("/api/mux-audio",
-                        new { videoUrl = job.ResultUrl, audioUrl = musicUrl, mode }, ct);
-                    var musicked = mm.GetProperty("url").GetString();
-                    if (!string.IsNullOrWhiteSpace(musicked)) job.ResultUrl = musicked;
+                        new { videoUrl = job.ResultUrl, audioUrl = bgUrl, mode }, ct);
+                    var withBg = mm.GetProperty("url").GetString();
+                    if (!string.IsNullOrWhiteSpace(withBg)) job.ResultUrl = withBg;
                     await _queue.PersistAsync(job);
                 }
             }
             catch (OperationCanceledException) { throw; }
-            catch (Exception ex) { _log.LogWarning(ex, "score failed; film kept without music"); }
+            catch (Exception ex) { _log.LogWarning(ex, "background failed; film kept as-is"); }
         }
     }
 

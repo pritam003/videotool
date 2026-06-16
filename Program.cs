@@ -1592,11 +1592,20 @@ app.MapPost("/api/narrate", async (NarrateRequest req, IHttpClientFactory hf,
     // Optional emotional delivery: wrap the line in <mstts:express-as style> (+ a gentle
     // prosody rate). Azure ignores an unsupported style/voice gracefully (neutral fallback),
     // so this is safe for non-English voices too.
+    // EXCEPTION: the newer high-fidelity Hindi voices (…:MAI-Voice-2) REQUIRE an express-as
+    // wrapper — they 400 if synthesized bare — so give them a warm default style when the caller
+    // passed none. ("softvoice" specifically errors on them, so never fall back to it.)
+    var style = req.Style;
+    var needsExpressAs = voice.Contains(":MAI-Voice", StringComparison.OrdinalIgnoreCase);
+    if (needsExpressAs && string.IsNullOrWhiteSpace(style))
+        style = "hopeful";
+    if (needsExpressAs && string.Equals(style, "softvoice", StringComparison.OrdinalIgnoreCase))
+        style = "calm";
     var inner = System.Security.SecurityElement.Escape(text);
     if (!string.IsNullOrWhiteSpace(req.Rate))
         inner = $"<prosody rate='{System.Security.SecurityElement.Escape(req.Rate!)}'>{inner}</prosody>";
-    if (!string.IsNullOrWhiteSpace(req.Style))
-        inner = $"<mstts:express-as style='{System.Security.SecurityElement.Escape(req.Style!)}'>{inner}</mstts:express-as>";
+    if (!string.IsNullOrWhiteSpace(style))
+        inner = $"<mstts:express-as style='{System.Security.SecurityElement.Escape(style!)}'>{inner}</mstts:express-as>";
     var ssml = $@"<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xmlns:mstts='https://www.w3.org/2001/mstts' xml:lang='{lang}'>
 <voice name='{voice}'>{inner}</voice>
 </speak>";

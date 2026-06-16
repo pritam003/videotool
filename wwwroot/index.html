@@ -828,10 +828,19 @@ function App() {
   }, [voices, curLoc]);
   // Switch the whole film to a language: default the narrator to a natural voice in that
   // locale and clear per-character voices so they get re-picked in the new language.
+  // Rank Azure voices by naturalness so we default to the best ones: the newest high-fidelity
+  // voices (…:MAI-Voice-2 for Hindi etc.) > DragonHD > Multilingual > older standard voices.
+  function voiceRank(v) {
+    const sn = (v && v.shortName) || "";
+    if (/:MAI-Voice/i.test(sn)) return 0;
+    if (/DragonHD/i.test(sn)) return 1;
+    if (/Multilingual/i.test(sn)) return 2;
+    return 3;
+  }
   function pickLanguage(loc) {
-    const inLoc = voices.filter(v => v.locale === loc);
-    const pref = inLoc.find(v => /Multilingual/i.test(v.shortName) && v.gender === "Female")
-      || inLoc.find(v => v.gender === "Female") || inLoc[0];
+    const inLoc = voices.filter(v => v.locale === loc).slice().sort((a, b) => voiceRank(a) - voiceRank(b));
+    // gender is normalized to lowercase on load; prefer the best-ranked female narrator, else best.
+    const pref = inLoc.find(v => v.gender === "female") || inLoc[0];
     if (pref) setVoice(pref.shortName);
     setScDialogVoice("");
     voiceSuggestStoryRef.current = null;
@@ -1331,6 +1340,7 @@ function App() {
     let pool = voices.filter(v => v.locale === loc);
     if (pool.length < 2) pool = voices.filter(v => (v.locale || "").startsWith(lang2 + "-"));
     if (pool.length < 2) pool = voices.slice();
+    pool = pool.slice().sort((a, b) => voiceRank(a) - voiceRank(b)); // prefer the most natural voices for every character
     const used = new Set();
     if (voice) used.add(voice); // keep character voices distinct from the narrator's
     return list.map(c => {
@@ -1355,10 +1365,12 @@ function App() {
       { label: "Classic studio", voices: ["en-US-JennyNeural", "en-US-GuyNeural", "en-US-AriaNeural", "en-US-DavisNeural"] },
     ],
     "en-IN": [
+      { label: "Indian English (HD)", voices: ["en-IN-Aarti:DragonHDLatestNeural", "en-IN-Arjun:DragonHDLatestNeural", "en-IN-Meera:DragonHDLatestNeural", "en-IN-Neerja:DragonHDLatestNeural"] },
       { label: "Indian English", voices: ["en-IN-NeerjaNeural", "en-IN-PrabhatNeural", "en-IN-AnanyaNeural", "en-IN-AaravNeural"] },
     ],
     "hi-IN": [
-      { label: "Hindi ensemble", voices: ["hi-IN-SwaraNeural", "hi-IN-MadhurNeural", "hi-IN-AnanyaNeural", "hi-IN-AaravNeural"] },
+      { label: "Hindi natural (HD)", voices: ["hi-IN-Kavya:MAI-Voice-2", "hi-IN-Dhruv:MAI-Voice-2", "hi-IN-Priya:MAI-Voice-2", "hi-IN-Arjun:MAI-Voice-2"] },
+      { label: "Hindi classic", voices: ["hi-IN-SwaraNeural", "hi-IN-MadhurNeural", "hi-IN-AnanyaNeural", "hi-IN-AaravNeural"] },
     ],
     "bn-IN": [
       { label: "Bengali pair", voices: ["bn-IN-TanishaaNeural", "bn-IN-BashkarNeural"] },
