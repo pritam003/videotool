@@ -503,7 +503,7 @@ function App() {
   // Portrait/cast image engine: "flux" = FLUX.1 Schnell (fast, sharp) · "comfy" = the
   // original Wan 1s-T2V still. Both run on the same A100; the toggle picks which renders
   // the cast references, and the two paths work independently.
-  const [scImageEngine, setScImageEngine] = useState("flux");
+  const [scImageEngine, setScImageEngine] = useState("comfy");
 
   // One-step-at-a-time wizard: 1 idea · 2 language+voiceover · 3 story · 4 voices · 5 cast · 6 render.
   const [wizStep, setWizStep] = useState(1);
@@ -1732,19 +1732,26 @@ function App() {
 
   const recentLines = dbgLines.slice(-200);
 
-  // Poll the server-side render queue. Poll briskly (3s) ONLY when the queue is actually
-  // on screen (History page) AND a film is rendering — that keeps progress live and the F1
-  // app warm mid-render. Everywhere else fall back to a slow heartbeat so the whole app
-  // isn't re-rendering every few seconds (which made composing feel laggy).
+  // Poll the server-side render queue: 5s while a film is rendering (live progress in the
+  // Preview + queue), a slow 30s heartbeat when idle so the app isn't constantly re-rendering.
   const anyJobActive = jobs.some(j => j.status === "queued" || j.status === "running");
-  const pollMs = page === "history"
-    ? (anyJobActive ? 3000 : 15000)
-    : (anyJobActive ? 15000 : 60000);
+  const pollMs = anyJobActive ? 5000 : 30000;
   useEffect(() => {
     refreshJobs();
     const iv = setInterval(refreshJobs, pollMs);
     return () => clearInterval(iv);
   }, [pollMs]);
+  // Surface the background render in the main Preview: once the newest film finishes, load it
+  // into the Preview ONCE (stable src — it won't reload on every poll's re-signed SAS URL).
+  const shownJobRef = useRef(null);
+  useEffect(() => {
+    const done = (jobs || []).find(j => j.status === "succeeded" && j.resultUrl);
+    if (done && shownJobRef.current !== done.id) {
+      shownJobRef.current = done.id;
+      setStitched(null);
+      setOuts([{ url: done.resultUrl, name: done.title || "film", seconds: scClipSec, size: done.size || scSize }]);
+    }
+  }, [jobs]);
   // Advance to the story-review step automatically once a storyboard is generated.
   useEffect(() => { if (scStory && wizStep === 2) setWizStep(3); }, [scStory]);
 
@@ -2226,6 +2233,17 @@ function App() {
           <h3>Preview</h3>
           <div class="preview">
             ${(() => {
+              // While the newest film is still rendering, show its live progress right here in
+              // the main screen; once it (or any film) has finished, show the video.
+              const newest = (jobs && jobs.length) ? jobs[0] : null;
+              if (newest && (newest.status === "running" || newest.status === "queued")) {
+                return html`<div class="empty" style=${{textAlign:"center",padding:"0 16px",width:"100%"}}>
+                  <div style=${{fontSize:30,marginBottom:8}}>🎬</div>
+                  <div style=${{fontWeight:600,marginBottom:4,fontSize:14}}>Rendering “${newest.title || "your film"}”…</div>
+                  <div class="muted small">${newest.label || newest.status}${newest.pct ? " · " + Math.round(newest.pct) + "%" : ""}</div>
+                  <div class="progress" style=${{marginTop:10,maxWidth:260,marginLeft:"auto",marginRight:"auto"}}><div style=${{width:(newest.pct||0)+"%"}}></div></div>
+                </div>`;
+              }
               const headline = stitched?.url || (outs.length > 0 ? outs[outs.length-1].url : null);
               if (!headline) return html`<div class="empty">Your video will appear here.</div>`;
               return html`<video src=${headline} controls autoplay loop></video>`;
