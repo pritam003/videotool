@@ -2169,21 +2169,29 @@ app.MapPost("/api/storyboard", async (StoryboardRequest req, IHttpClientFactory 
         ? "No dialogue direction was given — invent natural, in-character lines yourself where a character actually speaks, ALWAYS in subtext (never on-the-nose). Place dialogue only at the beats that need a spoken moment; leave dialog empty on the clips the narrator carries."
         : $@"DIALOGUE DIRECTION from the user: ""{dialogDirection}"". Treat this as the underlying MOOD / situation to convey through SUBTEXT and behaviour — do NOT quote it back as a spoken line (e.g. if the note is 'he is sad', NEVER write ""I'm sad""; instead let a line like 'Nobody stopped tonight.' earn that feeling). Every spoken line in {language}, in sync with its clip.";
     var narrationRule = narrate
-        ? $@"AUDIO — FIRST decide which kind of film this premise is, then use its mode:
+        ? $@"AUDIO — the spoken track must be ONE CONTINUOUS STORY told across all {clipCount} clips, NOT {clipCount} separate captions. CONTINUATION is the single most important thing here:
 
-• CONVERSATION films — two or a few people talking something through (an interview, an argument, a reunion, a negotiation, a confession, a lesson, breaking news, strangers meeting, a heart-to-heart): DIALOGUE carries the ENTIRE film. Give MOST clips a spoken line and ALTERNATE speakers turn by turn like a real back-and-forth. Use NO narration — leave every clip's `narration` an EMPTY STRING (at most you MAY put ONE short scene-setting hook on clip 1; clips 2+ stay empty).
+CONTINUATION (do this above all else):
+- Write every spoken line so that, read in order clip 1 → 2 → 3 → … → last with NO pause between them, they sound like ONE voice telling ONE story in a single breath: each clip picks up EXACTLY where the previous line left off and pushes it forward with real momentum and natural connectors ('and then…', 'but…', 'so…', 'that's when…', 'until…', 'turns out…'). It must NEVER reset, re-introduce, or restate something already said.
+- Clip 1 opens with a HOOK that grabs in the first second — a question, a bold claim, a 'you won't believe what just happened', a sharp line of feeling — NOT a description of the shot.
+- Each clip ENDS on a small forward pull (a hint, a turn, an unanswered beat) and the NEXT clip pays it off — so the viewer cannot look away. The story keeps escalating.
+- The FINAL clip lands a PAYOFF the whole thing was building toward — a punchline, a twist, or an emotional button. Never a flat or repeated ending.
+- TEST before you answer: if the clips could be shuffled into a different order and still 'work', it is WRONG — each line MUST depend on the one before it.
 
-• STORY films — a journey, a montage, a myth, an emotional arc, mostly one character, or visual storytelling where people don't really converse: a NARRATOR (storyteller voiceover) carries it. Give MOST clips a narration line and let characters speak only SPARSELY, at the key emotional beats.
+Then pick the delivery mode for that one continuous story:
+
+• CONVERSATION films — two or a few people talking something through (an interview, an argument, a reunion, a negotiation, a confession, a lesson, breaking news, strangers meeting, a heart-to-heart): DIALOGUE carries the ENTIRE film. Give MOST clips a spoken line and ALTERNATE speakers turn by turn like a real back-and-forth that BUILDS — each reply reacting to the last line, never a fresh topic. Use NO narration — leave every clip's `narration` an EMPTY STRING (at most you MAY put ONE short scene-setting hook on clip 1; clips 2+ stay empty).
+
+• STORY / VLOG films — a journey, a montage, a myth, an emotional arc, a 'day in the life', mostly one character, or someone telling the viewer what happened: a single NARRATOR / the character's own voice carries it as ONE flowing monologue. Give MOST clips a line and let any other characters speak only SPARSELY, at the key beats.
 
 If the premise is two named people meeting or talking it out, it is a CONVERSATION — let them TALK, don't narrate over them. Write ALL spoken text in {language} USING ITS NATIVE SCRIPT (Devanagari for Hindi, Bengali script for Bengali, etc.) — NEVER romanized/transliterated, never English; only real proper names may stay as-is.
 
-NARRATOR (story-film voiceover) — when the film is narrated:
-- Open with a short emotional HOOK that frames the story — a line of feeling or theme, NOT a description of the shot.
-- Read end to end the narration is ONE continuous, flowing storyteller voice — each line following the last, carrying the MEANING of what happens, building to a close.
-- Voice what the camera CANNOT show: inner feeling, what the moment MEANS, a memory, the theme. NEVER just describe the visible action ('he plays the guitar', 'he walks away' are BAD).
+NARRATOR / VLOG voice — when the film is narrated:
+- Clip 1 is the HOOK (above). Every line after CONTINUES the same telling — it reads as one unbroken story, each line following directly from the last and raising the stakes toward the payoff.
+- Voice what the camera CANNOT show: inner feeling, what the moment MEANS, the next turn, the theme. NEVER just describe the visible action ('he plays the guitar', 'he walks away' are BAD).
 
 DIALOGUE (words spoken on screen):
-- The EXACT words a character speaks in THIS clip — spoken words only, NO name prefix, NO quotation marks; empty string when no one speaks the beat.
+- The EXACT words a character speaks in THIS clip — spoken words only, NO name prefix, NO quotation marks; empty string when no one speaks the beat. Each line REACTS to the previous spoken line so the exchange flows in order.
 - NEVER on-the-nose: a character must NEVER state their own emotion or action ('I'm sad', 'I look up and play' are BAD). Imply feeling through specific, in-character words ('Nobody stopped tonight.').
 - For every clip that HAS dialogue, set `speaker` to the cast id (from `cast`) of who says it.
 - {dialogGuidance}
