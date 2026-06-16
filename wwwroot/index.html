@@ -653,6 +653,7 @@ function App() {
   const [generatedDialogueIdea, setGeneratedDialogueIdea] = useState("");
   const [generatedCharacters, setGeneratedCharacters] = useState([]);
   const [generatedReasoning, setGeneratedReasoning] = useState(null);
+  const [refineFeedback, setRefineFeedback] = useState(""); // free-text direction to steer a regenerate
 
   // Deep Reasoning Workflow Functions
   async function startReasoningAnalysis() {
@@ -686,7 +687,8 @@ function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           prompt: reasoningInitialPrompt,
-          refinements: userRefinements
+          refinements: userRefinements,
+          feedback: refineFeedback
         })
       });
       const result = await jsonOrThrow(r);
@@ -732,6 +734,7 @@ function App() {
     setGeneratedDialogueIdea("");
     setGeneratedCharacters([]);
     setGeneratedReasoning(null);
+    setRefineFeedback("");
   }
 
 
@@ -1839,6 +1842,13 @@ function App() {
                     ${q.suggested && html`<div class="muted small" style=${{marginTop:4}}>💡 Suggested: ${q.suggested}</div>`}
                   </div>
                 `)}
+                <div>
+                  <label style=${{display:"block",marginBottom:6,fontWeight:500,fontSize:13}}>✏️ Anything else? <span class="muted small">· optional — your own direction in plain words</span></label>
+                  <textarea rows="2" value=${refineFeedback}
+                    onInput=${e => setRefineFeedback(e.target.value)}
+                    placeholder="e.g. 'set it in Mumbai during monsoon', 'make the ending hopeful', 'add a surprising betrayal'"
+                    style=${{fontSize:12,fontFamily:"inherit"}}></textarea>
+                </div>
               </div>
               <button class="primary small" onClick=${submitRefinements}>
                 ✨ Generate Story & Dialogue
@@ -1848,24 +1858,35 @@ function App() {
             ${reasoningWorkflow === "results" && html`
               <div style=${{display:"flex",flexDirection:"column",gap:12}}>
                 <div style=${{borderTop:"1px solid var(--border)",paddingTop:10}}>
-                  <label style=${{display:"block",marginBottom:6,fontWeight:600,fontSize:12,textTransform:"uppercase",color:"var(--muted)"}}>📖 Story Idea</label>
-                  <div style=${{fontSize:12,lineHeight:1.6,maxHeight:160,overflowY:"auto",padding:8,background:"var(--surface)",borderRadius:"var(--radius-sm)",border:"1px solid var(--border)",whiteSpace:"pre-wrap",wordWrap:"break-word"}}>
-                    ${generatedStoryIdea}
-                  </div>
+                  <label style=${{display:"block",marginBottom:6,fontWeight:600,fontSize:12,textTransform:"uppercase",color:"var(--muted)"}}>📖 Story Idea <span style=${{textTransform:"none",fontWeight:400}}>· edit freely</span></label>
+                  <textarea rows="6" value=${generatedStoryIdea}
+                    onInput=${e => setGeneratedStoryIdea(e.target.value)}
+                    style=${{fontSize:12,lineHeight:1.6,width:"100%",fontFamily:"inherit"}}></textarea>
                 </div>
                 <div>
-                  <label style=${{display:"block",marginBottom:6,fontWeight:600,fontSize:12,textTransform:"uppercase",color:"var(--muted)"}}>💬 Dialogue Idea</label>
-                  <div style=${{fontSize:12,lineHeight:1.6,maxHeight:160,overflowY:"auto",padding:8,background:"var(--surface)",borderRadius:"var(--radius-sm)",border:"1px solid var(--border)",whiteSpace:"pre-wrap",wordWrap:"break-word"}}>
-                    ${generatedDialogueIdea}
-                  </div>
+                  <label style=${{display:"block",marginBottom:6,fontWeight:600,fontSize:12,textTransform:"uppercase",color:"var(--muted)"}}>💬 Dialogue Idea <span style=${{textTransform:"none",fontWeight:400}}>· edit freely</span></label>
+                  <textarea rows="6" value=${generatedDialogueIdea}
+                    onInput=${e => setGeneratedDialogueIdea(e.target.value)}
+                    style=${{fontSize:12,lineHeight:1.6,width:"100%",fontFamily:"inherit"}}></textarea>
+                </div>
+                <div style=${{borderTop:"1px dashed var(--border)",paddingTop:10}}>
+                  <label style=${{display:"block",marginBottom:6,fontWeight:600,fontSize:12}}>✏️ Refine with your own words</label>
+                  <textarea rows="2" value=${refineFeedback}
+                    onInput=${e => setRefineFeedback(e.target.value)}
+                    placeholder="e.g. 'make it more suspenseful', 'add a twist ending', 'set it on a beach at night', 'fewer characters'"
+                    style=${{fontSize:12,fontFamily:"inherit"}}></textarea>
+                  <button class="primary small" style=${{marginTop:6}}
+                    onClick=${submitRefinements} disabled=${!refineFeedback.trim()}>
+                    🔄 Regenerate with these changes
+                  </button>
                 </div>
               </div>
-              <div style=${{display:"flex",gap:6,flexWrap:"wrap"}}>
+              <div style=${{display:"flex",gap:6,flexWrap:"wrap",marginTop:8}}>
                 <button class="primary small" onClick=${applyGeneratedContent}>
                   ✅ Apply to Film Wizard
                 </button>
                 <button class="ghost small" onClick=${() => setReasoningWorkflow("questions")}>
-                  ← Refine Again
+                  ⚙️ Adjust options
                 </button>
                 <button class="ghost small" onClick=${resetReasoningWorkflow}>
                   Start Over

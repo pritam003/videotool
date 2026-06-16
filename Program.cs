@@ -1786,9 +1786,14 @@ app.MapPost("/api/generate-story-with-dialogue", (
     if (string.IsNullOrWhiteSpace(userPrompt))
         return Results.BadRequest(new { error = "prompt is required" });
 
+    // Free-text refinement direction (optional) — typed by the user to steer generation.
+    var feedback = req.TryGetProperty("feedback", out var fb) ? (fb.GetString() ?? "").Trim() : "";
+
     try
     {
-        var hashCode = Math.Abs(userPrompt.GetHashCode());
+        // Fold the free-text feedback into the seed so each distinct refinement produces a
+        // visibly different variation (the generator is deterministic per seed).
+        var hashCode = Math.Abs((userPrompt + "||" + feedback).GetHashCode());
         var rand = new Random(hashCode);
 
         // Get user refinements if provided
@@ -1836,7 +1841,13 @@ app.MapPost("/api/generate-story-with-dialogue", (
         var c2 = ((dynamic)selectedCharacters[selectedCharacters.Count > 1 ? 1 : 0]);
         var c1ArcEnd = c1.arc.Contains("→") ? c1.arc.Split('→')[1].Trim() : "growth";
 
-        var storyIdea = $@"{userPrompt} unfolds as a deeply personal journey.
+        // When the user typed a free-text direction, weave it into the opening so the
+        // regenerated story visibly honors it (and it carries into the film prompt).
+        var storyOpener = string.IsNullOrWhiteSpace(feedback)
+            ? $"{userPrompt} unfolds as a deeply personal journey."
+            : $"{userPrompt} unfolds as a deeply personal journey, shaped by your direction: \"{feedback}\".";
+
+        var storyIdea = $@"{storyOpener}
 
 {c1.name} ({c1.role}) enters the story burdened by {c1.arc}. Their initial approach: {(rand.Next(2) == 0 ? "cautious and analytical" : "direct and impulsive")}. As events progress, {c1.name} must confront their deepest fears.
 
