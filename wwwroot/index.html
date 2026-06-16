@@ -641,11 +641,57 @@ function App() {
   const [, force] = useState(0);
 
   // Chat state for AI story/dialog generation
-  const [chatMessages, setChatMessages] = useState([{ role: "assistant", text: "💬 Hi! Describe your story idea, and I'll help you write a compelling narrative and dialogues. Examples: 'A lonely robot finds friendship', 'Two rivals discover a secret', 'A chef's worst day turns magical'." }]);
+  const [chatMessages, setChatMessages] = useState([{ role: "assistant", text: "💬 Hi! Give me a simple story idea (e.g., 'A lonely robot finds friendship'), and I'll create a skeleton story you can enhance. Examples: 'Two rivals discover a secret', 'A chef's worst day turns magical'." }]);
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
-  const [lastStoryDialogData, setLastStoryDialogData] = useState(null); // store story + dialogue for "Apply" button
-  const [lastCharactersData, setLastCharactersData] = useState(null); // store characters for "Apply Characters" button
+  const [lastStoryDialogData, setLastStoryDialogData] = useState(null);
+  const [lastCharactersData, setLastCharactersData] = useState(null);
+  const [skeletonData, setSkeletonData] = useState(null); // store skeleton story for editing
+  const [editedStory, setEditedStory] = useState(""); // user-edited story
+  const [workflowStep, setWorkflowStep] = useState("prompt"); // "prompt", "skeleton", "edit", "characters"
+
+  async function generateSkeletonStory() {
+    if (!chatInput.trim() || chatLoading) return;
+    const userPrompt = chatInput.trim();
+    setChatInput("");
+    setChatMessages(prev => [...prev, { role: "user", text: userPrompt }]);
+    setChatLoading(true);
+    try {
+      const r = await fetch("/api/skeleton-story", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: userPrompt })
+      });
+      const j = await jsonOrThrow(r);
+      
+      let assistantMsg = `📚 Story Skeleton:\n\n**${j.skeleton.title}**\n\n`;
+      assistantMsg += `**Setup:** ${j.skeleton.setup}\n\n`;
+      assistantMsg += `**Conflict:** ${j.skeleton.conflict}\n\n`;
+      assistantMsg += `**Resolution:** ${j.skeleton.resolution}\n\n`;
+      assistantMsg += `**Themes:** ${j.skeleton.themes.join(", ")}\n\n`;
+      assistantMsg += `ℹ️ ${j.instructions}\n\n**You can edit the story above and click "Enhance Story"**`;
+      
+      setChatMessages(prev => [...prev, { role: "assistant", text: assistantMsg }]);
+      setSkeletonData(j);
+      setEditedStory(j.editableStory);
+      setWorkflowStep("skeleton");
+      dbg("ok", "skeleton story generated");
+    } catch (e) {
+      setChatMessages(prev => [...prev, { role: "assistant", text: `❌ Error: ${e.message.slice(0, 100)}` }]);
+    } finally { setChatLoading(false); }
+  }
+
+  async function submitEnhancedStory() {
+    if (!editedStory.trim()) return;
+    setChatMessages(prev => [...prev, { role: "user", text: `📝 Enhanced Story:\n${editedStory}` }]);
+    
+    // Create character data from enhanced story
+    const enhancedText = `${editedStory}. Based on this enhanced story, here are the characters and their dialogue:`;
+    setLastStoryDialogData({ story: editedStory, dialogue: "" });
+    setWorkflowStep("characters");
+    setScPrompt(editedStory.trim());
+    toast("Story enhanced! You can now generate characters or proceed to step ①.");
+    dbg("ok", "story enhanced and ready");
+  }
 
   async function sendChatMessage() {
     if (!chatInput.trim() || chatLoading) return;
@@ -662,7 +708,6 @@ function App() {
       const story = j.story || j.suggestion || "";
       const dialogue = j.dialogue || "";
       
-      // Format message: show story + dialogue
       let assistantMsg = "";
       if (story) assistantMsg += `📖 Story:\n${story}`;
       if (dialogue) assistantMsg += `\n\n💬 Dialogue:\n${dialogue}`;
@@ -1763,24 +1808,38 @@ function App() {
             `}
           </div>
           <div style=${{display:"flex",gap:6,flexDirection:"column"}}>
-            <textarea rows="2" placeholder="e.g., 'A lonely robot finds friendship' or 'Two rivals discover a secret'" value=${chatInput}
-              onInput=${e => setChatInput(e.target.value)}
-              onKeyDown=${e => { if (e.key==="Enter" && !e.shiftKey && !chatLoading) { e.preventDefault(); sendChatMessage(); } }}
-              style=${{fontSize:12,fontFamily:"inherit"}}></textarea>
-            <div style=${{display:"flex",gap:6,flexWrap:"wrap"}}>
-              <button class="primary small" onClick=${sendChatMessage} disabled=${!chatInput.trim()||chatLoading}>
-                ${chatLoading?"Generating...":"Get Story Idea"}
+            ${workflowStep === "prompt" && html`
+              <textarea rows="2" placeholder="e.g., 'A lonely robot finds friendship' or 'Two rivals discover a secret'" value=${chatInput}
+                onInput=${e => setChatInput(e.target.value)}
+                onKeyDown=${e => { if (e.key==="Enter" && !e.shiftKey && !chatLoading) { e.preventDefault(); generateSkeletonStory(); } }}
+                style=${{fontSize:12,fontFamily:"inherit"}}></textarea>
+              <button class="primary small" onClick=${generateSkeletonStory} disabled=${!chatInput.trim()||chatLoading}>
+                ${chatLoading?"Generating...":"📚 Generate Skeleton Story"}
               </button>
-              <button class="primary small" onClick=${generateCharacters} disabled=${!scPrompt.trim()||chatLoading} title="Generate characters from your story idea">
-                ${chatLoading?"Generating...":"Generate Characters"}
+            `}
+            ${workflowStep === "skeleton" && html`
+              <div style=${{fontSize:12}}>
+                <label style=${{display:"block",marginBottom:6,fontWeight:600,color:"var(--text)"}}>✏️ Enhance Your Story:</label>
+                <textarea rows="5" value=${editedStory}
+                  onInput=${e => setEditedStory(e.target.value)}
+                  placeholder="Edit and enhance the skeleton story here..."
+                  style=${{fontSize:12,fontFamily:"inherit",padding:8,background:"var(--surface)",border:"1px solid var(--border)",borderRadius:"var(--radius-sm)",color:"var(--text)"}}></textarea>
+              </div>
+              <div style=${{display:"flex",gap:6,flexWrap:"wrap"}}>
+                <button class="primary small" onClick=${submitEnhancedStory} disabled=${!editedStory.trim()||chatLoading}>
+                  ${chatLoading?"Submitting...":"✅ Submit Enhanced Story"}
+                </button>
+                <button class="ghost small" onClick=${() => { setWorkflowStep("prompt"); setChatInput(""); }} title="Start over">Start Over</button>
+              </div>
+            `}
+            ${workflowStep === "characters" && html`
+              <button class="primary small" onClick=${generateCharacters} disabled=${!scPrompt.trim()||chatLoading} title="Generate characters from your enhanced story">
+                ${chatLoading?"Generating...":"👥 Generate Characters"}
               </button>
-              ${lastStoryDialogData && html`
-                <button class="ghost small" onClick=${() => applyStoryToForm(lastStoryDialogData.story, lastStoryDialogData.dialogue)} title="Apply story & dialogue to form">Apply Story & Dialogue</button>
-              `}
               ${lastCharactersData && html`
                 <button class="ghost small" onClick=${() => applyCharactersToForm(lastCharactersData.characters)} title="Apply characters to form">Apply Characters</button>
               `}
-            </div>
+            `}
           </div>
         </div>
 

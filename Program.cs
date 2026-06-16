@@ -55,6 +55,7 @@ var _internalToken = app.Services.GetRequiredService<InternalAuth>().Token;
 static bool IsPublicAuthPath(PathString p) =>
     p.StartsWithSegments("/health") ||
     p.StartsWithSegments("/.auth") ||
+    p.StartsWithSegments("/api/skeleton-story") ||
     p.StartsWithSegments("/api/generate-story-idea") ||
     p.StartsWithSegments("/api/generate-characters") ||
     p.Equals("/sw.js", StringComparison.OrdinalIgnoreCase) ||
@@ -1513,6 +1514,78 @@ Plan the {segmentCount}-segment arc as JSON now.";
         translatedNarration, lang = langPrefix, langName,
         totalSeconds, chunkSeconds, segmentCount
     });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Generate Skeleton Story: Create basic story structure from naive user prompt
+// ─────────────────────────────────────────────────────────────────────────────
+app.MapPost("/api/skeleton-story", async (
+    [FromBody] JsonElement req,
+    IHttpClientFactory hf,
+    IConfiguration cfg,
+    CancellationToken ct) =>
+{
+    var prompt = req.GetProperty("prompt").GetString() ?? "";
+    if (string.IsNullOrWhiteSpace(prompt))
+        return Results.BadRequest(new { error = "prompt is required" });
+
+    try
+    {
+        // Generate basic story skeleton locally for instant response
+        var hashCode = Math.Abs(prompt.GetHashCode());
+        var rand = new Random(hashCode);
+        
+        // Story skeleton templates - basic structure from simple prompts
+        var skeletons = new[]
+        {
+            new { 
+                title = $"The Tale of {prompt}", 
+                setup = $"Our story begins when {prompt}. Everything seems normal at first.",
+                conflict = "But then something unexpected happens that changes everything.",
+                resolution = "In the end, they discover that the truth was more complex than they thought.",
+                themes = new[] { "discovery", "change", "truth" }
+            },
+            new { 
+                title = $"{prompt}: A Journey",
+                setup = $"It all started with {prompt}. The initial encounter was deceptive in its simplicity.",
+                conflict = "As events unfold, hidden layers of complexity reveal themselves.",
+                resolution = "The final revelation brings understanding and acceptance.",
+                themes = new[] { "growth", "revelation", "acceptance" }
+            },
+            new { 
+                title = $"When {prompt} Occurs",
+                setup = $"The premise is simple: {prompt}. At the surface, it seems straightforward.",
+                conflict = "Yet beneath the surface lies a deeper struggle that demands attention.",
+                resolution = "Resolution comes not through force, but through understanding.",
+                themes = new[] { "depth", "struggle", "understanding" }
+            }
+        };
+
+        var skeleton = skeletons[rand.Next(skeletons.Length)];
+        
+        return Results.Ok(new 
+        { 
+            userPrompt = prompt,
+            skeleton = new 
+            {
+                skeleton.title,
+                skeleton.setup,
+                skeleton.conflict,
+                skeleton.resolution,
+                skeleton.themes
+            },
+            editableStory = $"{skeleton.setup}\n\n{skeleton.conflict}\n\n{skeleton.resolution}",
+            instructions = "Edit the story above to make it more detailed and unique. Add specific characters, settings, and emotions."
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Ok(new { 
+            error = ex.Message,
+            userPrompt = prompt,
+            skeleton = (object)null
+        });
+    }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
