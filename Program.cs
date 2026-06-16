@@ -1530,17 +1530,13 @@ app.MapPost("/api/generate-story-idea", async (
     var key = Cfg(cfg, "AOAI_KEY");
     var deployment = cfg["CHAT_DEPLOYMENT"] ?? "gpt-4o-mini";
 
-    var systemPrompt = @"You are a creative screenwriter. Generate story and dialogue for a film concept.
+    var systemPrompt = @"Return EXACTLY this format - no reasoning, just output:
+[STORY]3-4 sentences[/STORY]
+[DIALOGUE]dialogue lines[/DIALOGUE]";
 
-Return EXACTLY this format:
-[STORY]3-4 sentence vivid story treatment with character, setting, and emotion[/STORY]
-[DIALOGUE]2-3 dialogue exchanges showing character and conflict[/DIALOGUE]";
+        var userPrompt = $@"Concept: ""{userInput}""
 
-    var userPrompt = $@"Create a story and dialogue for this film concept:
-
-""{userInput}""
-
-Remember to use the [STORY] [/STORY] and [DIALOGUE] [/DIALOGUE] delimiters.";
+Generate a story and dialogue IMMEDIATELY using the format above. Start with [STORY].";
 
     try
     {
@@ -1553,7 +1549,7 @@ Remember to use the [STORY] [/STORY] and [DIALOGUE] [/DIALOGUE] delimiters.";
                 new { role = "system", content = systemPrompt },
                 new { role = "user", content = userPrompt }
             },
-            max_completion_tokens = 8000  // gpt-5-mini needs high budget for reasoning + story+dialogue output
+            max_completion_tokens = 1000  // minimal prompt = less reasoning needed
         };
 
         using var msg = new HttpRequestMessage(HttpMethod.Post,
