@@ -645,6 +645,7 @@ function App() {
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
   const [lastStoryDialogData, setLastStoryDialogData] = useState(null); // store story + dialogue for "Apply" button
+  const [lastCharactersData, setLastCharactersData] = useState(null); // store characters for "Apply Characters" button
 
   async function sendChatMessage() {
     if (!chatInput.trim() || chatLoading) return;
@@ -684,6 +685,52 @@ function App() {
       setWizStep(1);
       toast("Story & dialogue applied! Review in step ① and continue.");
     }
+  }
+
+  async function generateCharacters() {
+    if (!scPrompt.trim() || chatLoading) return;
+    setChatLoading(true);
+    try {
+      const r = await fetch("/api/generate-characters", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ userStory: scPrompt })
+      });
+      const j = await jsonOrThrow(r);
+      const characters = j.characters || [];
+      const dialogue = j.dialogue || "";
+      
+      // Format character display
+      let assistantMsg = `👥 Characters Generated:\n\n`;
+      characters.forEach((char, i) => {
+        assistantMsg += `${i+1}. ${char.name} - ${char.role}\n`;
+        assistantMsg += `   Personality: ${char.personality}\n`;
+        assistantMsg += `   Age: ${char.age}\n`;
+        assistantMsg += `   Motivation: ${char.motivation}\n\n`;
+      });
+      assistantMsg += `💬 Dialogue:\n${dialogue}`;
+      
+      setChatMessages(prev => [...prev, { role: "assistant", text: assistantMsg }]);
+      setLastCharactersData({ characters, dialogue });
+      dbg("ok", `${characters.length} characters generated`);
+    } catch (e) {
+      setChatMessages(prev => [...prev, { role: "assistant", text: `❌ Error: ${e.message.slice(0, 100)}` }]);
+    } finally { setChatLoading(false); }
+  }
+
+  function applyCharactersToForm(characters) {
+    if (!Array.isArray(characters) || characters.length === 0) return;
+    
+    const castList = characters.map((char, i) => ({
+      id: `char_${i}`,
+      name: char.name,
+      role: char.role,
+      description: `${char.personality}. Motivation: ${char.motivation}`
+    }));
+    
+    setScCast(castList);
+    setScDialogPrompt(castList.map(c => `${c.name} (${c.role})`).join(", "));
+    setWizStep(3); // Go to cast selection step
+    toast(`${characters.length} character${characters.length > 1 ? "s" : ""} added! Review and adjust in step ③.`);
   }
 
 
@@ -1724,8 +1771,14 @@ function App() {
               <button class="primary small" onClick=${sendChatMessage} disabled=${!chatInput.trim()||chatLoading}>
                 ${chatLoading?"Generating...":"Get Story Idea"}
               </button>
+              <button class="primary small" onClick=${generateCharacters} disabled=${!scPrompt.trim()||chatLoading} title="Generate characters from your story idea">
+                ${chatLoading?"Generating...":"Generate Characters"}
+              </button>
               ${lastStoryDialogData && html`
                 <button class="ghost small" onClick=${() => applyStoryToForm(lastStoryDialogData.story, lastStoryDialogData.dialogue)} title="Apply story & dialogue to form">Apply Story & Dialogue</button>
+              `}
+              ${lastCharactersData && html`
+                <button class="ghost small" onClick=${() => applyCharactersToForm(lastCharactersData.characters)} title="Apply characters to form">Apply Characters</button>
               `}
             </div>
           </div>

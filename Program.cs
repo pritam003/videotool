@@ -1564,6 +1564,150 @@ app.MapPost("/api/generate-story-idea", async (
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Generate Characters: Extract characters from story and create profiles + dialogue
+// ─────────────────────────────────────────────────────────────────────────────
+app.MapPost("/api/generate-characters", async (
+    [FromBody] JsonElement req,
+    IHttpClientFactory hf,
+    IConfiguration cfg,
+    CancellationToken ct) =>
+{
+    var userStory = req.GetProperty("userStory").GetString() ?? "";
+    if (string.IsNullOrWhiteSpace(userStory))
+        return Results.BadRequest(new { error = "userStory is required" });
+
+    try
+    {
+        // Extract character archetypes and generate profiles
+        var hashCode = Math.Abs(userStory.GetHashCode());
+        var rand = new Random(hashCode);
+        
+        // Character archetypes with personality profiles
+        var characterArchetypes = new[]
+        {
+            new { name = "Alex", role = "The Brave Adventurer", personality = "Courageous, impulsive, driven by curiosity", age = "28-35", motivation = "Seeking truth and redemption" },
+            new { name = "Jordan", role = "The Wise Mentor", personality = "Calm, thoughtful, protective, experienced", age = "45-60", motivation = "Passing on wisdom and guidance" },
+            new { name = "Casey", role = "The Conflicted Soul", personality = "Torn between duty and desire, secretive, regretful", age = "30-40", motivation = "Making up for past mistakes" },
+            new { name = "Morgan", role = "The Mysterious Stranger", personality = "Enigmatic, unpredictable, has hidden agenda", age = "25-50", motivation = "Unclear motives drive the tension" },
+            new { name = "Riley", role = "The Loyal Companion", personality = "Supportive, witty, always has your back", age = "25-35", motivation = "Protecting those they care about" }
+        };
+
+        // Generate character-specific dialogue patterns
+        var dialoguePatterns = new Dictionary<string, string[]>
+        {
+            { "The Brave Adventurer", new[] {
+                "I have to know what's out there.",
+                "We're running out of time—we need to act now.",
+                "I can handle this. Trust me.",
+                "This is bigger than both of us."
+            }},
+            { "The Wise Mentor", new[] {
+                "Let me show you what I've learned.",
+                "Sometimes the hardest path leads to peace.",
+                "Your choices define who you are.",
+                "Take your time. The answer is already within you."
+            }},
+            { "The Conflicted Soul", new[] {
+                "I never wanted to hurt you.",
+                "I had my reasons... I just couldn't tell you.",
+                "Some secrets are too heavy to carry alone.",
+                "I'm sorry for who I was. I'm trying to be better."
+            }},
+            { "The Mysterious Stranger", new[] {
+                "Nothing is what it seems.",
+                "You're asking the wrong questions.",
+                "I'm here for reasons you don't understand.",
+                "The truth will find you—whether you're ready or not."
+            }},
+            { "The Loyal Companion", new[] {
+                "No matter what happens, I'm with you.",
+                "You're not alone in this.",
+                "I've got your back, always.",
+                "Let's figure this out together."
+            }}
+        };
+
+        // Select 2-3 characters for the story
+        var characterCount = rand.Next(2, 4);
+        var selectedCharacters = new List<object>();
+        var usedIndices = new HashSet<int>();
+
+        for (int i = 0; i < characterCount && i < characterArchetypes.Length; i++)
+        {
+            int idx = rand.Next(characterArchetypes.Length);
+            while (usedIndices.Contains(idx))
+                idx = rand.Next(characterArchetypes.Length);
+            usedIndices.Add(idx);
+
+            var archetype = characterArchetypes[idx];
+            var dialogueLines = dialoguePatterns[archetype.role];
+            var dialogueIdx = rand.Next(dialogueLines.Length);
+
+            selectedCharacters.Add(new
+            {
+                name = archetype.name,
+                role = archetype.role,
+                personality = archetype.personality,
+                age = archetype.age,
+                motivation = archetype.motivation,
+                sampleDialogue = dialogueLines[dialogueIdx]
+            });
+        }
+
+        // Generate multi-character dialogue
+        var multiCharDialogue = GenerateMultiCharacterDialogue(selectedCharacters, rand);
+
+        return Results.Ok(new
+        {
+            characters = selectedCharacters,
+            dialogue = multiCharDialogue,
+            summary = $"Story featuring {selectedCharacters.Count} characters: " +
+                     string.Join(", ", selectedCharacters.Select(c => ((dynamic)c).name))
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Ok(new { characters = new object[0], dialogue = "", error = ex.Message });
+    }
+});
+
+// Helper function to generate multi-character dialogue
+static string GenerateMultiCharacterDialogue(List<object> characters, Random rand)
+{
+    var dialogueLines = new List<string>();
+    var charList = characters.Cast<dynamic>().ToList();
+    
+    if (charList.Count >= 2)
+    {
+        var interactions = new Dictionary<(int, int), string[]>
+        {
+            { (0, 1), new[] {
+                $"{charList[0].name}: I need your help.\n{charList[1].name}: Tell me everything.",
+                $"{charList[0].name}: Why did you leave?\n{charList[1].name}: Because I had to protect you.",
+                $"{charList[0].name}: Do you trust me?\n{charList[1].name}: With my life."
+            }},
+            { (1, 0), new[] {
+                $"{charList[1].name}: What happened to you?\n{charList[0].name}: Something changed everything.",
+                $"{charList[1].name}: I never forgot you.\n{charList[0].name}: I know. I felt it.",
+                $"{charList[1].name}: Are you ready?\n{charList[0].name}: I was born ready."
+            }}
+        };
+
+        var key = (0, 1);
+        if (interactions.ContainsKey(key))
+        {
+            var interactionDialogues = interactions[key];
+            return interactionDialogues[rand.Next(interactionDialogues.Length)];
+        }
+    }
+
+    if (charList.Count >= 1)
+        return $"{charList[0].name}: {charList[0].sampleDialogue}";
+
+    return "Character dialogue pending...";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Storyboard: story-driven per-clip prompts for the I2V continuation chain.
 //
 // The chain renders N = ceil(total / clipSeconds) clips of `clipSeconds` each
