@@ -833,8 +833,9 @@ app.MapPost("/api/stitch", async (StitchRequest req, IHttpClientFactory hf,
 app.MapPost("/api/mux-audio", async (MuxAudioRequest req, IHttpClientFactory hf,
     IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
 {
-    if (string.IsNullOrWhiteSpace(req?.VideoUrl) || string.IsNullOrWhiteSpace(req?.AudioUrl))
-        return Results.BadRequest(new { error = "videoUrl and audioUrl are required" });
+    var mode = (req?.Mode ?? "replace").ToLowerInvariant();
+    if (string.IsNullOrWhiteSpace(req?.VideoUrl) || (mode != "silence" && string.IsNullOrWhiteSpace(req?.AudioUrl)))
+        return Results.BadRequest(new { error = "videoUrl is required (and audioUrl unless mode=silence)" });
 
     var ffmpeg = LocateFfmpeg();
     if (ffmpeg is null)
@@ -850,13 +851,20 @@ app.MapPost("/api/mux-audio", async (MuxAudioRequest req, IHttpClientFactory hf,
         var aIn = Path.Combine(work, "in.mp3");
         using (var s = await http.GetStreamAsync(req.VideoUrl, ct))
         await using (var f = File.Create(vIn)) await s.CopyToAsync(f, ct);
-        using (var s = await http.GetStreamAsync(req.AudioUrl, ct))
-        await using (var f = File.Create(aIn)) await s.CopyToAsync(f, ct);
+        if (mode != "silence")
+        {
+            using var s = await http.GetStreamAsync(req.AudioUrl, ct);
+            await using var f = File.Create(aIn);
+            await s.CopyToAsync(f, ct);
+        }
 
         var outPath = Path.Combine(work, "out.mp4");
-        var mode = (req.Mode ?? "replace").ToLowerInvariant();
         string args;
-        if (mode == "fit")
+        if (mode == "silence")
+            // Add a silent mono track the length of the video so a line-less clip still carries an
+            // audio stream — required so the concat-filter stitch sees identical streams on every clip.
+            args = $"-y -i \"{vIn}\" -f lavfi -i anullsrc=channel_layout=mono:sample_rate=24000 -map 0:v -map 1:a -c:v copy -c:a aac -b:a 96k -shortest -movflags +faststart \"{outPath}\"";
+        else if (mode == "fit")
         {
             // Keep the spoken line in sync with the SHOT without the two artefacts that read as
             // "dubbed/pasted": a sped-up "chipmunk" voice and a frozen-frame tail. Instead keep the
@@ -933,6 +941,52 @@ app.MapPost("/api/mux-audio", async (MuxAudioRequest req, IHttpClientFactory hf,
     {
         try { Directory.Delete(work, recursive: true); } catch { }
     }
+});
+
+// Mix several audio tracks into ONE (track[0] = the voice at full level; the rest laid UNDER it) so the
+// Sound step can preview the WHOLE soundtrack — narration/dialogue + background bed — with no video.
+// amix normalize=0 keeps the voice at full volume; duration=first makes the mix as long as the voice.
+app.MapPost("/api/mix-audio-tracks", async (MixTracksRequest req, IHttpClientFactory hf,
+    IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
+{
+    var urls = (req?.AudioUrls ?? Array.Empty<string>()).Where(u => !string.IsNullOrWhiteSpace(u)).ToArray();
+    if (urls.Length == 0) return Results.BadRequest(new { error = "audioUrls is required" });
+    if (urls.Length == 1) return Results.Ok(new { url = urls[0], single = true });
+
+    var ffmpeg = LocateFfmpeg();
+    if (ffmpeg is null) return Results.Problem("ffmpeg binary not found.");
+
+    var work = Path.Combine(Path.GetTempPath(), $"mix-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(work);
+    try
+    {
+        var http = hf.CreateClient();
+        http.Timeout = TimeSpan.FromMinutes(3);
+        var inputs = new System.Text.StringBuilder();
+        var labels = new System.Text.StringBuilder();
+        for (int i = 0; i < urls.Length; i++)
+        {
+            var p = Path.Combine(work, $"a{i}");
+            using (var s = await http.GetStreamAsync(urls[i], ct))
+            await using (var f = File.Create(p)) await s.CopyToAsync(f, ct);
+            inputs.Append($"-i \"{p}\" ");
+            labels.Append($"[{i}:a]");
+        }
+        var outPath = Path.Combine(work, "mix.wav");
+        var args = $"-y {inputs}-filter_complex \"{labels}amix=inputs={urls.Length}:duration=first:normalize=0[a]\" -map \"[a]\" -c:a pcm_s16le \"{outPath}\"";
+        var (ec, stderr) = await RunProcessAsync(ffmpeg, args, ct);
+        if (ec != 0 || !File.Exists(outPath))
+            return Results.Problem($"ffmpeg mix failed (exit {ec}): {stderr.Substring(0, Math.Min(stderr.Length, 800))}");
+        var bytes = await File.ReadAllBytesAsync(outPath, ct);
+        var account = Cfg(cfg, "STORAGE_ACCOUNT");
+        var svc = new BlobServiceClient(new Uri($"https://{account}.blob.core.windows.net"), cred);
+        var container = svc.GetBlobContainerClient(cfg["STORAGE_CONTAINER"] ?? "videos");
+        var name = $"mix/{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}.wav";
+        using var ms = new MemoryStream(bytes);
+        var url = await UploadAndSign(container, name, ms, "audio/wav", svc, account, ct);
+        return Results.Ok(new { url, blob = name, bytes = bytes.Length });
+    }
+    finally { try { Directory.Delete(work, recursive: true); } catch { } }
 });
 
 // Concatenate several narration/dialogue MP3s into ONE audio track (dialogue first, then
@@ -1176,7 +1230,7 @@ app.MapPost("/api/animate-submit", async (HttpRequest http, WanClient wan, IConf
     if (videoFile is null || videoFile.Length == 0)
         return Results.BadRequest(new { error = "video file is required" });
     var (W, H) = ParseSize(form["size"].ToString());
-    var seconds = int.TryParse(form["seconds"].ToString(), out var s) ? Math.Clamp(s, 1, 5) : 5;
+    var seconds = int.TryParse(form["seconds"].ToString(), out var s) ? Math.Clamp(s, 1, 60) : 5;
     var prompt = form["prompt"].ToString();
     var imgExt = string.IsNullOrEmpty(Path.GetExtension(imageFile.FileName)) ? ".png" : Path.GetExtension(imageFile.FileName);
     var vidExt = string.IsNullOrEmpty(Path.GetExtension(videoFile.FileName)) ? ".mp4" : Path.GetExtension(videoFile.FileName);
@@ -3777,6 +3831,7 @@ public record StoryboardRequest(string Prompt, int? TotalSeconds, int? ClipSecon
 public record NarrationScriptRequest(string? Idea, string? Title, string? Logline, string[]? Actions, int? TotalSeconds, string? Prompt, string? Voice);
 public record MuxAudioRequest(string VideoUrl, string AudioUrl, string? Mode);
 public record ConcatAudioRequest(string[]? AudioUrls, int? GapMs);
+public record MixTracksRequest(string[]? AudioUrls);
 public record GenerateBackgroundMusicRequest(string? Mood, int? DurationSeconds, double? MusicVolume);
 // A per-clip ambient soundscape (room tone / wind / rain / crowd / waves / city …) synthesized
 // from the clip's mood + location keywords, laid UNDER the spoken track so each shot has a real

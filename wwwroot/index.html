@@ -509,11 +509,18 @@ function App() {
     "She reads the first line, and the grey morning turns to gold.",
   ].join("\n");
   const [alScript, setAlScript] = useState(AUDIO_LAB_SAMPLE);
-  const [alClipSec, setAlClipSec] = useState(5);
-  const [alResults, setAlResults] = useState({}); // { [locale]: { voice, lines:[{text,url,dur,translated}], wholeUrl, totalDur, busy, error } }
-  const [alVoiceSel, setAlVoiceSel] = useState({}); // { [locale]: shortName } — user voice override per language
+  const [alClipSec, setAlClipSec] = useState(scClipSec);
+  const [alResults, setAlResults] = useState({});
+  const [alVoiceSel, setAlVoiceSel] = useState({});
   const [alBusy, setAlBusy] = useState(false);
-  const alAudioRef = useRef(null); // the currently-playing whole-narration <audio>
+  const alAudioRef = useRef(null); // kept for playing sound-step previews
+
+  // ── Sound step: per-clip approved audio (synthesized + reviewed BEFORE render) ──
+  // Each entry: { index, url, dur, busy, error }. The worker reuses these at render
+  // so what you hear is exactly what gets muxed onto each 5s cut.
+  const [scClipAudio, setScClipAudio] = useState([]);
+  const [soundBusy, setSoundBusy] = useState(false);
+  const [soundPreviewBusy, setSoundPreviewBusy] = useState(false);
 
   // ── Wan-Animate: drive a character image with a sample/driving video (gated GPU feature) ──
   const [anImage, setAnImage] = useState(null);              // character image File
@@ -1332,6 +1339,90 @@ function App() {
     } finally { setAnBusy(false); setAnStatus(""); }
   }
 
+  // ── Sound step helpers ───────────────────────────────────────────────────────
+  // Map mood to the same Azure express-as styles the backend uses (mirrors MoodToStyle in C#).
+  function moodStyle(mood) {
+    if (!mood) return "";
+    const m = mood.toLowerCase();
+    if (/sad|grief|sorrow|mourn|melanch|lonel|heartbreak|loss|tear/.test(m)) return "sad";
+    if (/bittersweet|wistful|nostalg|longing|yearn|tender|gentle|warm|fond|intimate/.test(m)) return "gentle";
+    if (/hopeful|uplift|promis|bright|dawn/.test(m)) return "hopeful";
+    if (/cheerful|playful|light|joyful|whims|happy|celebr/.test(m)) return "cheerful";
+    if (/excit|thrill|elat|intense|passionate|burst/.test(m)) return "excited";
+    if (/affect|care|nurtur|protect|mother/.test(m)) return "affectionate";
+    if (/calm|peaceful|still|serene|tranquil|slow/.test(m)) return "calm";
+    if (/whisper|mutter|hush|quiet|breathe/.test(m)) return "whispering";
+    if (/fear|dread|terr|horr|panic/.test(m)) return "fearful";
+    if (/angry|rage|furious|outrage/.test(m)) return "angry";
+    if (/serious|solemn|grave|stern/.test(m)) return "serious";
+    return "";
+  }
+  // Synthesize audio for one clip (using voice overrides when given) and store in scClipAudio.
+  async function synthClipAudio(i, nVoice, dVoice) {
+    const clip = (scStory?.clips || [])[i];
+    if (!clip) return;
+    const nLine = (clip.narration || "").trim();
+    const dLine = (clip.dialog || "").trim();
+    if (!nLine && !dLine) return;
+    const style = moodStyle(clip.mood || "");
+    setScClipAudio(prev => prev.map((c, idx) => idx === i ? {...c, busy: true, error: null} : c));
+    try {
+      const tracks = [];
+      if (nLine) {
+        const r = await fetch("/api/narrate", { method: "POST", headers: {"Content-Type":"application/json"},
+          body: JSON.stringify({ text: nLine, voice: nVoice || voice, style }) });
+        tracks.push((await jsonOrThrow(r)).url);
+      }
+      if (dLine) {
+        const speakerId = clip.speaker || (Array.isArray(clip.characters) && clip.characters.length === 1 ? clip.characters[0] : "");
+        const dv = (speakerId && scCast?.find(c => c.id === speakerId)?.voice) || dVoice || scDialogVoice || voice;
+        const r = await fetch("/api/narrate", { method: "POST", headers: {"Content-Type":"application/json"},
+          body: JSON.stringify({ text: dLine, voice: dv, style }) });
+        tracks.push((await jsonOrThrow(r)).url);
+      }
+      let url = tracks[0] || null;
+      if (tracks.length > 1) {
+        const r = await fetch("/api/concat-audio", { method: "POST", headers: {"Content-Type":"application/json"},
+          body: JSON.stringify({ audioUrls: tracks, gapMs: 200 }) });
+        url = (await jsonOrThrow(r)).url;
+      }
+      const dur = url ? await measureAudio(url) : 0;
+      setScClipAudio(prev => prev.map((c, idx) => idx === i ? {...c, url, dur, busy: false, error: null} : c));
+    } catch (e) {
+      if (e.message !== "Cancelled") setScClipAudio(prev => prev.map((c, idx) => idx === i ? {...c, busy: false, error: e.message.slice(0,120)} : c));
+    }
+  }
+  async function synthAllSoundClips() {
+    if (!scStory) return;
+    const clips = scStory.clips || [];
+    setSoundBusy(true);
+    // Ensure a slot exists for every clip
+    setScClipAudio(clips.map((_, i) => scClipAudio.find(c => c.index === i) || {index: i, url: null, dur: 0, busy: false, error: null}));
+    try {
+      for (let i = 0; i < clips.length; i++) {
+        const existing = scClipAudio.find ? scClipAudio.find(c => c.index === i) : null;
+        if (existing?.url) continue; // already approved
+        await synthClipAudio(i);
+      }
+    } finally { setSoundBusy(false); }
+  }
+  async function previewWholeSoundtrack() {
+    const urls = scClipAudio.filter(c => c.url).map(c => c.url);
+    if (!urls.length) { toast("Synthesize clips first.", true); return; }
+    setSoundPreviewBusy(true);
+    try {
+      let url = urls[0];
+      if (urls.length > 1) {
+        const r = await fetch("/api/concat-audio", { method: "POST", headers: {"Content-Type":"application/json"},
+          body: JSON.stringify({ audioUrls: urls, gapMs: 320 }) });
+        url = (await jsonOrThrow(r)).url;
+      }
+      try { if (alAudioRef.current) alAudioRef.current.pause(); const a = new Audio(url); alAudioRef.current = a; a.play(); } catch {}
+      toast("▶ Playing whole narration");
+    } catch (e) { toast("Preview failed: " + e.message, true); }
+    finally { setSoundPreviewBusy(false); }
+  }
+
   // Submit a TEXT-TO-VIDEO job (no start image) — used to render canonical
   // reference snapshots for casting and multi-character establishing stills.
   async function submitT2V(thePrompt, clipSec, label) {
@@ -1615,6 +1706,7 @@ function App() {
     setScStory(null); setScCast([]); setScProgress([]);
     setScCharFile(null); setScCharPreview(null); setScNarrAudio(null);
     setScPrompt(""); setScDialogPrompt("");
+    setScClipAudio([]);
     voiceSuggestStoryRef.current = null;
   }
 
@@ -1659,7 +1751,8 @@ function App() {
         backgroundMusic: scBackgroundMusic || "",
         musicVolume: scMusicVolume || 0.5,
         soundscape: scSoundscape,
-        soundscapeVolume: scSoundscapeVolume || 0.5
+        soundscapeVolume: scSoundscapeVolume || 0.5,
+        clipAudio: scClipAudio.filter(c => c.url).map(c => ({ index: c.index, url: c.url, durationSeconds: c.dur || 0 }))
       };
       const r = await fetch("/api/story-jobs", {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(spec)
@@ -1680,8 +1773,9 @@ function App() {
     2: () => true,
     3: () => !!(scStory && Array.isArray(scStory.clips) && scStory.clips.length),
     4: () => true,
+    5: () => true, // Sound step: always passable — user can proceed to render even without previewing
   };
-  function wizNext() { if (wizStep < 5 && (wizCanNext[wizStep] ? wizCanNext[wizStep]() : true)) setWizStep(wizStep + 1); }
+  function wizNext() { if (wizStep < 6 && (wizCanNext[wizStep] ? wizCanNext[wizStep]() : true)) setWizStep(wizStep + 1); }
   function wizBack() { if (wizStep > 1) setWizStep(wizStep - 1); }
 
   // ── Casting phase: generate ONE canonical reference image per character BEFORE
@@ -1996,6 +2090,14 @@ function App() {
   }, [jobs]);
   // Advance to the story-review step automatically once a storyboard is generated.
   useEffect(() => { if (scStory && wizStep === 2) setWizStep(3); }, [scStory]);
+  // When entering the Sound step, initialize scClipAudio slots for all clips
+  // (existing entries with approved audio are kept; new slots start empty).
+  useEffect(() => {
+    if (wizStep === 5 && scStory && scNarrationMode !== "off") {
+      const clips = scStory.clips || [];
+      setScClipAudio(prev => clips.map((_, i) => prev.find(c => c.index === i) || {index: i, url: null, dur: 0, busy: false, error: null}));
+    }
+  }, [wizStep]);
 
   // GPU badge display: a render in flight means the GPU is busy; otherwise reflect the polled state.
   const gpuBusy = (jobs || []).some(j => j.status === "running");
@@ -2011,8 +2113,6 @@ function App() {
       <div style=${{display:"flex",gap:4,marginLeft:12}}>
         <button class="ghost small" onClick=${() => setPage("studio")}
           style=${page==="studio" ? {background:"var(--accent)",color:"#fff",borderColor:"var(--accent)"} : {}}>Studio</button>
-        <button class="ghost small" onClick=${() => setPage("voices")}
-          style=${page==="voices" ? {background:"var(--accent)",color:"#fff",borderColor:"var(--accent)"} : {}}>Voices</button>
         <button class="ghost small" onClick=${() => setPage("animate")}
           style=${page==="animate" ? {background:"var(--accent)",color:"#fff",borderColor:"var(--accent)"} : {}}>Animate</button>
         <button class="ghost small" onClick=${() => { setPage("history"); setRefreshLib(x => x + 1); }}
@@ -2097,103 +2197,6 @@ function App() {
           })()}
         </div>
       </div>
-      ` : page === "voices" ? html`
-      <!-- VOICES: preview the whole narration in every Indian voice, before building a story -->
-      <div style=${{gridColumn:"1 / -1"}}>
-        <div class="card">
-          <h3 style=${{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>🎙️ Audio preview lab <span class="muted small" style=${{fontWeight:400}}>· hear your narration in every Indian voice before you build the film</span></h3>
-          <p class="muted small" style=${{marginTop:0}}>Write a few narration lines — one per ${alClipSec}-second cut. We synthesize the WHOLE story in <strong>English</strong>, <strong>Hindi</strong> and <strong>Bengali</strong> at once, using the most natural voice for each, so you can pick the language and voice that sound right and see exactly how the audio lands on the ${alClipSec}s cuts. <span class="muted">Hindi & Bengali are auto-translated from your English lines for this preview.</span></p>
-
-          <label>Narration script <span class="muted small">· one line = one ${alClipSec}s cut</span></label>
-          <textarea rows="6" value=${alScript} onInput=${e => setAlScript(e.target.value)} style=${{fontSize:13,fontFamily:"inherit",lineHeight:1.5,width:"100%"}}></textarea>
-
-          <div style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",marginTop:8}}>
-            <label class="muted small">Cut length</label>
-            <select value=${alClipSec} onChange=${e => setAlClipSec(Number(e.target.value))}>
-              ${[3,4,5].map(s => html`<option value=${s} key=${s}>${s}s</option>`)}
-            </select>
-            <span class="muted small">${alLines().length} cuts · ${alLines().length * alClipSec}s of video</span>
-            ${scStory && (scStory.clips||[]).some(c => (c.narration||"").trim())
-              ? html`<button class="ghost small" onClick=${() => setAlScript((scStory.clips||[]).map(c => (c.narration||"").trim()).filter(Boolean).join("\n"))}>↧ Load from current storyboard</button>`
-              : ""}
-            <div class="spacer"></div>
-            <button class="primary" onClick=${previewAllIndian} disabled=${alBusy || !voices.length}>
-              ${alBusy ? "Synthesizing…" : "🔊 Preview English · Hindi · Bengali"}
-            </button>
-          </div>
-
-          <!-- instant writing suggestions -->
-          <div style=${{marginTop:12,padding:"8px 12px",border:"1px solid var(--border)",borderRadius:8,background:"var(--surface-2)"}}>
-            <div class="muted small" style=${{textTransform:"uppercase",fontSize:11,letterSpacing:".4px",marginBottom:4}}>✍️ Suggestions</div>
-            ${alSuggestions().map((s,i) => html`<div key=${i} class="small" style=${{color: s.kind==="long" ? "#d97706" : "var(--muted)"}}>${s.kind==="long" ? "⚠️ " : "✓ "}${s.msg}</div>`)}
-          </div>
-
-          ${!alLanguages().some(l => ["en-IN","hi-IN","bn-IN"].includes(l))
-            ? html`<p class="muted small" style=${{marginTop:10}}>Indian voices are still loading from Azure — give it a moment and they will appear below.</p>`
-            : ""}
-
-          <!-- one panel per language -->
-          <div style=${{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(300px,1fr))",gap:12,marginTop:14}}>
-            ${alLanguages().map(loc => {
-              const res = alResults[loc];
-              const inLoc = voices.filter(v => v.locale === loc).slice().sort((a,b)=>voiceRank(a)-voiceRank(b));
-              const film = alLines().length * alClipSec;
-              return html`
-                <div key=${loc} style=${{border:"1px solid var(--border)",borderRadius:10,padding:12,background:"var(--surface-2)"}}>
-                  <div style=${{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
-                    <strong style=${{fontSize:14}}>${langLabel(loc)}</strong>
-                    ${res && !res.busy && res.lines && res.lines.length ? html`<span class="pill ok small">${res.totalDur.toFixed(1)}s total</span>` : ""}
-                  </div>
-                  <div style=${{display:"flex",gap:6,alignItems:"center",marginTop:8,flexWrap:"wrap"}}>
-                    <label class="muted small">Voice</label>
-                    <select value=${alVoiceFor(loc)} onChange=${e => setAlVoiceSel(prev => ({...prev,[loc]:e.target.value}))} style=${{fontSize:12,flex:"1 1 120px"}}>
-                      ${inLoc.map(v => html`<option value=${v.shortName} key=${v.shortName}>${(v.localName||v.shortName)} (${v.gender||"?"})${voiceRank(v)<=1?" · HD":""}</option>`)}
-                    </select>
-                    <button class="ghost small" onClick=${() => previewLanguage(loc)} disabled=${res && res.busy}>${res && res.busy ? "…" : "▶ Render"}</button>
-                  </div>
-
-                  ${res && res.busy ? html`<div class="muted small" style=${{marginTop:10}}>Synthesizing ${alLines().length} lines in ${langLabel(loc)}…</div>` : ""}
-                  ${res && res.error ? html`<div class="small" style=${{marginTop:10,color:"#ef4444"}}>${res.error}</div>` : ""}
-
-                  ${res && !res.busy && res.lines && res.lines.length ? html`
-                    <div style=${{margin:"10px 0 6px",display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
-                      <button class="primary small" onClick=${() => playWhole(res.wholeUrl)}>▶ Play whole narration</button>
-                      <a class="ghost small" href=${res.wholeUrl} target="_blank" rel="noopener" style=${{textDecoration:"none"}}>open ↗</a>
-                    </div>
-                    <div class="muted small" style=${{textTransform:"uppercase",fontSize:11,letterSpacing:".4px",margin:"8px 0 4px"}}>How it lands on ${alClipSec}s cuts</div>
-                    <div class="stack" style=${{gap:7}}>
-                      ${res.lines.map((ln,i) => {
-                        const over = ln.dur > alClipSec + 0.25;
-                        const scale = Math.max(alClipSec, ln.dur) || alClipSec;
-                        const greenPct = Math.min(ln.dur, alClipSec) / scale * 100;
-                        const amberPct = Math.max(0, ln.dur - alClipSec) / scale * 100;
-                        return html`
-                          <div key=${i}>
-                            <div style=${{display:"flex",justifyContent:"space-between",gap:8,fontSize:12}}>
-                              <span><strong>Clip ${i+1}</strong> <span class="muted">/ ${alClipSec}s</span></span>
-                              <span style=${{color: over ? "#d97706" : "var(--muted)"}}>${ln.dur.toFixed(1)}s ${over ? ("⚠ over " + (ln.dur-alClipSec).toFixed(1) + "s") : "✓ fits"}</span>
-                            </div>
-                            <div style=${{display:"flex",height:8,borderRadius:4,overflow:"hidden",background:"var(--border)",margin:"3px 0"}}>
-                              <div style=${{width:greenPct+"%",background:"#16a34a"}}></div>
-                              <div style=${{width:amberPct+"%",background:"#f59e0b"}}></div>
-                            </div>
-                            <div class="muted small" style=${{whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}} title=${ln.translated || ln.text}>${ln.translated || ln.text}</div>
-                          </div>`;
-                      })}
-                    </div>
-                    ${(() => {
-                      const ratio = res.totalDur / Math.max(1, film);
-                      const slow = ratio > 1.05;
-                      return html`<div class="small" style=${{marginTop:8,padding:"6px 8px",borderRadius:8,background: slow ? "rgba(245,158,11,.14)" : "rgba(22,163,74,.14)"}}>
-                        Narration ${res.totalDur.toFixed(1)}s vs ${film}s of video — ${slow ? ("the film gently slows ~" + ratio.toFixed(2) + "× to fit the voice.") : "fits comfortably; no slow-down needed."}
-                      </div>`;
-                    })()}
-                  ` : ""}
-                </div>`;
-            })}
-          </div>
-        </div>
-      </div>
       ` : page === "animate" ? html`
       <!-- ANIMATE: Wan2.2-Animate — drive a character image with a sample video -->
       <div style=${{gridColumn:"1 / -1"}}>
@@ -2222,7 +2225,7 @@ function App() {
           <div style=${{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap",marginTop:10}}>
             <label class="muted small">Length</label>
             <select value=${anSeconds} onChange=${e => setAnSeconds(Number(e.target.value))} disabled=${anBusy}>
-              ${[3,4,5].map(s => html`<option value=${s} key=${s}>${s}s</option>`)}
+              ${[5,10,15,20,30,45,60].map(s => html`<option value=${s} key=${s}>${s}s</option>`)}
             </select>
             <span class="muted small">· ${scSize}</span>
             <div class="spacer"></div>
@@ -2347,9 +2350,9 @@ function App() {
 
         <!-- Film Wizard Card -->
         <div class="card" style=${{borderColor:"var(--accent)",borderWidth:1,borderStyle:"solid"}}>
-          <h3 style=${{display:"flex",alignItems:"center",gap:8}}>🎬 Make a film <span class="pill ok small">step ${wizStep}/5</span></h3>
+          <h3 style=${{display:"flex",alignItems:"center",gap:8}}>🎬 Make a film <span class="pill ok small">step ${wizStep}/6</span></h3>
           <div style=${{display:"flex",gap:4,flexWrap:"wrap",margin:"6px 0 12px"}}>
-            ${[[1,"Idea"],[2,"Language"],[3,"Story"],[4,"Cast"],[5,"Render"]].map(([n,lbl]) => html`
+            ${[[1,"Idea"],[2,"Language"],[3,"Story"],[4,"Cast"],[5,"Sound"],[6,"Render"]].map(([n,lbl]) => html`
               <button key=${n} type="button" class="ghost small" title=${lbl}
                 onClick=${() => { if (n <= wizStep) setWizStep(n); }}
                 style=${{flex:"1 1 0",minWidth:48,fontSize:11,padding:"4px 2px",cursor:n<=wizStep?"pointer":"default",...(wizStep===n ? {background:"var(--accent)",color:"#fff",borderColor:"var(--accent)"} : {}),...(n<wizStep ? {opacity:.85} : n>wizStep ? {opacity:.45} : {})}}>
@@ -2619,10 +2622,76 @@ function App() {
             </div>
             `}
 
-            <!-- STEP 5: render -->
+            <!-- STEP 5: Sound — per-clip audio preview + approve before render -->
             ${wizStep === 5 && html`
             <div>
-              <label>⑤ Render</label>
+              <label>⑥ Sound <span class="muted small">· hear each 5s cut, redo any line, then render</span></label>
+              ${scNarrationMode === "off" ? html`<p class="muted small" style=${{marginTop:6}}>Voiceover is off. Turn it on in step 2 to preview and edit the story audio here.</p>` : html`
+              <p class="muted small" style=${{marginTop:4}}>We synthesize each cut’s narration + dialogue so you can hear it, adjust the voice, and redo any line. The audio you approve here is used exactly in the render — no re-synthesis, full sync control.</p>
+              <div style=${{display:"flex",gap:8,flexWrap:"wrap",marginBottom:10}}>
+                <button class="ghost small" onClick=${() => {
+                  setScClipAudio((scStory?.clips||[]).map((_,i) => scClipAudio.find(c=>c.index===i) || {index:i,url:null,dur:0,busy:false,error:null}));
+                  synthAllSoundClips();
+                }} disabled=${soundBusy || !scStory}>🔊 ${soundBusy ? "Synthesizing…" : "Synthesize all clips"}</button>
+                ${scClipAudio.some(c=>c.url) ? html`
+                  <button class="ghost small" onClick=${previewWholeSoundtrack} disabled=${soundPreviewBusy}>
+                    ${soundPreviewBusy ? "…" : "▶ Play whole narration"}
+                  </button>` : ""}
+              </div>
+              <div class="stack" style=${{gap:8}}>
+                ${(scStory?.clips||[]).map((clip,i) => {
+                  const ca = scClipAudio.find(c=>c.index===i) || {index:i,url:null,dur:0,busy:false,error:null};
+                  const clipSec = scClipSec;
+                  const nLine = (clip.narration||"").trim();
+                  const dLine = (clip.dialog||"").trim();
+                  const hasLines = nLine || dLine;
+                  const over = ca.dur > clipSec + 0.25;
+                  const scale = Math.max(clipSec, ca.dur||clipSec);
+                  const greenPct = Math.min(ca.dur||clipSec, clipSec) / scale * 100;
+                  const amberPct = Math.max(0, (ca.dur||0) - clipSec) / scale * 100;
+                  return html`
+                  <div key=${i} style=${{border:"1px solid var(--border)",borderRadius:8,padding:"10px 12px",background:"var(--surface-2)"}}>
+                    <div style=${{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+                      <strong style=${{fontSize:13,flex:"1 1 100px",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title=${clip.title}>
+                        Clip ${i+1} · ${clip.title||""}
+                      </strong>
+                      ${ca.busy ? html`<span class="pill small">synth…</span>`
+                        : ca.url ? html`<span class="pill ok small">✓ ${ca.dur.toFixed(1)}s</span>`
+                        : hasLines ? html`<span class="muted small">not synthesized</span>`
+                        : html`<span class="muted small">silent clip</span>`}
+                    </div>
+                    ${hasLines && ca.url ? html`
+                      <div style=${{display:"flex",height:7,borderRadius:4,overflow:"hidden",background:"var(--border)",margin:"6px 0 2px"}}>
+                        <div style=${{width:greenPct+"%",background:"#16a34a"}}></div>
+                        <div style=${{width:amberPct+"%",background:"#f59e0b"}}></div>
+                      </div>
+                      <div class="muted small">${ca.dur.toFixed(1)}s vs ${clipSec}s cut · ${over ? ("⚠ over by " + (ca.dur-clipSec).toFixed(1) + "s — video will slow to fit") : "✓ fits"}</div>
+                    ` : ""}
+                    ${hasLines ? html`
+                      <div class="muted small" style=${{margin:"4px 0",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title=${nLine||""}>&#128250; ${nLine||"(no narration)"}</div>
+                      ${dLine ? html`<div class="muted small" style=${{overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title=${dLine}><em>&#128172; ${dLine}</em></div>` : ""}
+                    ` : ""}
+                    ${hasLines ? html`
+                      <div style=${{display:"flex",gap:6,flexWrap:"wrap",marginTop:6,alignItems:"center"}}>
+                        ${ca.url ? html`<button class="ghost small" onClick=${()=>{try{if(alAudioRef.current)alAudioRef.current.pause();const a=new Audio(ca.url);alAudioRef.current=a;a.play();}catch{}}}>&#9654; Play</button>` : ""}
+                        <button class="ghost small" onClick=${()=>synthClipAudio(i)} disabled=${ca.busy||soundBusy}>↺ Redo</button>
+                        <select style=${{fontSize:11}} onChange=${e=>{const v=e.target.value; synthClipAudio(i,v,null);}} title="Change narrator voice for this clip">
+                          <option value="">Narrator: ${voices.find(v=>v.shortName===voice)?.localName||voice}</option>
+                          ${langVoices.filter(v=>v.gender==="female"||v.gender==="Female").slice(0,4).map(v=>html`<option key=${v.shortName} value=${v.shortName}>${v.localName||v.shortName}</option>`)}
+                        </select>
+                        ${ca.error ? html`<span class="small" style=${{color:"#ef4444",flex:"1 1 200px"}}>${ca.error}</span>` : ""}
+                      </div>
+                    ` : ""}
+                  </div>`;
+                })}
+              </div>
+              `}
+            </div>
+            `}
+
+            <!-- STEP 6: render -->            ${wizStep === 6 && html`
+            <div>
+              <label>⑥ Render</label>
               <div class="plan" style=${{marginTop:6}}>
                 <div class="plan-head"><strong>${(scStory && scStory.title) || "Your film"}</strong><span class="pill">${scClipCount} clips · ${scClipSec}s</span></div>
                 <div class="muted small" style=${{padding:"0 12px 10px",display:"flex",flexDirection:"column",gap:4}}>
@@ -2646,8 +2715,8 @@ function App() {
             <!-- wizard navigation -->
             <div style=${{display:"flex",gap:8,alignItems:"center",justifyContent:"space-between",marginTop:8,borderTop:"1px solid var(--border)",paddingTop:10}}>
               <button class="ghost" onClick=${wizBack} disabled=${wizStep === 1}>← Back</button>
-              <span class="muted small">Step ${wizStep} of 5</span>
-              ${wizStep < 5
+              <span class="muted small">Step ${wizStep} of 6</span>
+              ${wizStep < 6
                 ? html`<button class="primary" onClick=${wizNext} disabled=${wizCanNext[wizStep] && !wizCanNext[wizStep]()}>Next →</button>`
                 : html`<span style=${{width:64}}></span>`}
             </div>

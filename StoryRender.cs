@@ -43,6 +43,11 @@ public sealed class InternalAuth
 
 public sealed record CastMemberSpec(string Id, string Name, string Description, string? Voice, string? RefName);
 
+/// <summary>Pre-synthesized + user-approved audio for ONE storyboard clip (the "5-second cut sound"
+/// previewed in the Sound step). The render worker muxes this onto the matching clip instead of
+/// re-synthesizing, so what the user heard is exactly what gets used — full control over sync.</summary>
+public sealed record ClipAudioSpec(int Index, string? Url, double DurationSeconds);
+
 /// <summary>The finalized film the UI submits: a reviewed storyboard + cast +
 /// voice choices + render options. Everything the worker needs to render headless.</summary>
 public sealed record StorySpec
@@ -66,6 +71,10 @@ public sealed record StorySpec
     // procedural bed. Defaults true so activation is a SINGLE server switch: until WAN_AUDIO_ENABLED
     // is set, /api/foley returns 501 instantly (no GPU touched) and the procedural bed is used.
     public bool NeuralFoley { get; init; } = true;
+    // Per-clip audio the user previewed + approved in the Sound step (index -> audio url). When present
+    // the worker muxes each onto its clip instead of re-synthesizing, so the approved 5s-cut sounds are
+    // exactly what's combined at render. Falls back to per-clip synthesis when an entry is missing.
+    public List<ClipAudioSpec>? ClipAudio { get; init; }
 }
 
 public sealed class StoryJob
@@ -331,11 +340,10 @@ public sealed class StoryRenderWorker : BackgroundService
         var finals = new List<string>();
         string? prevFrameName = null;
         JsonNode? prevClip = null;
-        // Every spoken line, collected across all clips IN STORY ORDER, for ONE continuous
-        // voiceover built AFTER the stitch. Per-clip muxing made the voice restart choppily at
-        // each cut and bolted a separate ambient bed onto every shot; the whole-film soundtrack
-        // (one flowing voice + one background) is assembled once at the end instead.
-        var voiceSegments = new List<(string Text, string Voice, string Style)>();
+        // Per-clip audio is muxed directly onto each rendered clip. Every clip gets either a
+        // spoken track (approved from the Sound step, or synthesized here) or a silent dummy
+        // track so the reencode-stitch sees identical stream structures across all inputs.
+        var anyVoice = false;
 
         for (int i = 0; i < N; i++)
         {
@@ -421,26 +429,81 @@ public sealed class StoryRenderWorker : BackgroundService
                 catch { prevFrameName = null; }
             }
 
-            // Collect this clip's spoken lines (narrator voiceover + the speaking character's
-            // dialogue) for the ONE continuous voiceover assembled after the stitch. The clip
-            // itself stays SILENT here — its mood drives the per-line emotional delivery.
+            // PER-CLIP AUDIO: use the user-approved audio from the Sound step when present;
+            // otherwise synthesize on the fly (same quality, full fallback). Every clip gets an
+            // audio stream (spoken or silent) so the reencode-stitch concat-filter sees identical
+            // stream structures across all N inputs and can re-encode cleanly.
+            var clipHasAudio = false;
             if (narrating)
             {
                 var nLine = S(clip["narration"], "").Trim();
                 var dLine = S(clip["dialog"], "").Trim();
                 var style = MoodToStyle(S(clip["mood"], ""));
-                if (nLine.Length > 0)
-                    voiceSegments.Add((nLine, spec.NarratorVoice, style));
-                if (dLine.Length > 0)
+
+                // 1. Pre-approved audio from the Sound step (user already heard and approved it).
+                var approved = spec.ClipAudio?.FirstOrDefault(a => a.Index == i);
+                string? clipAudioUrl = !string.IsNullOrWhiteSpace(approved?.Url) ? approved!.Url : null;
+
+                // 2. No approved audio → synthesize on the fly.
+                if (string.IsNullOrWhiteSpace(clipAudioUrl) && (nLine.Length > 0 || dLine.Length > 0))
                 {
-                    var speakerId = S(clip["speaker"], "");
-                    if (string.IsNullOrEmpty(speakerId) && clip["characters"] is JsonArray cs && cs.Count == 1)
-                        speakerId = S(cs[0], "");
-                    var dVoice = (!string.IsNullOrEmpty(speakerId) && cast.TryGetValue(speakerId, out var sw) && !string.IsNullOrWhiteSpace(sw.Voice))
-                        ? sw.Voice!
-                        : (!string.IsNullOrWhiteSpace(spec.DialogVoice) ? spec.DialogVoice! : spec.NarratorVoice);
-                    voiceSegments.Add((dLine, dVoice, style));
+                    try
+                    {
+                        var trackUrls = new List<string>();
+                        if (nLine.Length > 0)
+                        {
+                            var nr = await PostJsonAsync("/api/narrate",
+                                new { text = nLine, voice = spec.NarratorVoice, style }, ct);
+                            trackUrls.Add(nr.GetProperty("url").GetString()!);
+                        }
+                        if (dLine.Length > 0)
+                        {
+                            var sid = S(clip["speaker"], "");
+                            if (string.IsNullOrEmpty(sid) && clip["characters"] is JsonArray cs && cs.Count == 1)
+                                sid = S(cs[0], "");
+                            var dv = (!string.IsNullOrEmpty(sid) && cast.TryGetValue(sid, out var sw2) && !string.IsNullOrWhiteSpace(sw2.Voice))
+                                ? sw2.Voice!
+                                : (!string.IsNullOrWhiteSpace(spec.DialogVoice) ? spec.DialogVoice! : spec.NarratorVoice);
+                            var dr = await PostJsonAsync("/api/narrate",
+                                new { text = dLine, voice = dv, style }, ct);
+                            trackUrls.Add(dr.GetProperty("url").GetString()!);
+                        }
+                        clipAudioUrl = trackUrls.Count == 1 ? trackUrls[0]
+                            : trackUrls.Count > 1
+                                ? (await PostJsonAsync("/api/concat-audio",
+                                    new { audioUrls = trackUrls.ToArray(), gapMs = 200 }, ct)).GetProperty("url").GetString()
+                            : null;
+                    }
+                    catch (OperationCanceledException) { throw; }
+                    catch (Exception ex) { _log.LogWarning(ex, "per-clip synth failed for clip {I}; clip will be silent", i); }
                 }
+
+                // 3. Mux audio onto the clip via "fit" (picture gently slows to match the line).
+                if (!string.IsNullOrWhiteSpace(clipAudioUrl))
+                {
+                    try
+                    {
+                        var mr = await PostJsonAsync("/api/mux-audio",
+                            new { videoUrl = clipUrl, audioUrl = clipAudioUrl, mode = "fit" }, ct);
+                        var w = mr.GetProperty("url").GetString();
+                        if (!string.IsNullOrWhiteSpace(w)) { clipUrl = w!; clipHasAudio = true; anyVoice = true; }
+                    }
+                    catch (OperationCanceledException) { throw; }
+                    catch (Exception ex) { _log.LogWarning(ex, "per-clip audio mux failed for clip {I}; clip will be silent", i); }
+                }
+            }
+            // Every clip needs an audio stream for the reencode-stitch; add a silent dummy when none.
+            if (!clipHasAudio)
+            {
+                try
+                {
+                    var mr = await PostJsonAsync("/api/mux-audio",
+                        new { videoUrl = clipUrl, audioUrl = "", mode = "silence" }, ct);
+                    var w = mr.GetProperty("url").GetString();
+                    if (!string.IsNullOrWhiteSpace(w)) clipUrl = w!;
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex) { _log.LogWarning(ex, "silence track add failed for clip {I}", i); }
             }
 
             finals.Add(clipUrl);
@@ -449,8 +512,8 @@ public sealed class StoryRenderWorker : BackgroundService
             prevClip = clip;
         }
 
-        // ---- 3) STITCH the SILENT clips into one continuous film. The whole-film soundtrack
-        //         (voiceover + background) is laid on next, so the clips carry no audio yet. ----
+        // ---- 3) STITCH: all clips now carry audio (spoken or silent), so use reencode=true
+        //         which runs the concat filter with v=1:a=1 and produces one clean MP4. ----
         if (finals.Count >= 2)
         {
             job.Pct = 92; job.Label = $"stitching {finals.Count} clips into the film";
@@ -459,7 +522,7 @@ public sealed class StoryRenderWorker : BackgroundService
                 var logline = "";
                 try { logline = spec.Story?["logline"]?.GetValue<string>() ?? ""; } catch { }
                 var r = await PostJsonAsync("/api/stitch",
-                    new { urls = finals.ToArray(), crossfade = 0, reencode = false,
+                    new { urls = finals.ToArray(), crossfade = 0, reencode = true,
                           title = job.Title, idea = spec.Idea ?? "", logline }, ct);
                 job.ResultUrl = r.GetProperty("url").GetString();
             }
@@ -475,42 +538,7 @@ public sealed class StoryRenderWorker : BackgroundService
             job.ResultUrl = finals[0];
         }
 
-        // ---- 4) CONTINUOUS VOICEOVER: synth every spoken line in story order, join them into one
-        //         flowing track, and lay it over the WHOLE film. 'fit' paces the picture to the
-        //         voice (gentle slow-mo only if the lines run long) so they end together — no
-        //         per-clip freezes or chipmunk speed-ups, and the voice never restarts at a cut. ----
-        var anyVoice = false;
-        if (narrating && voiceSegments.Count > 0 && !string.IsNullOrWhiteSpace(job.ResultUrl))
-        {
-            try
-            {
-                job.Pct = 94; job.Label = "recording the voiceover";
-                var urls = new List<string>();
-                foreach (var seg in voiceSegments)
-                {
-                    var nr = await PostJsonAsync("/api/narrate",
-                        new { text = seg.Text, voice = seg.Voice, style = seg.Style }, ct);
-                    urls.Add(nr.GetProperty("url").GetString()!);
-                }
-                var voiceUrl = urls[0];
-                if (urls.Count > 1)
-                {
-                    var cr = await PostJsonAsync("/api/concat-audio",
-                        new { audioUrls = urls.ToArray(), gapMs = 320 }, ct);
-                    voiceUrl = cr.GetProperty("url").GetString()!;
-                }
-                job.Label = "laying the voiceover over the film";
-                var mr = await PostJsonAsync("/api/mux-audio",
-                    new { videoUrl = job.ResultUrl, audioUrl = voiceUrl, mode = "fit" }, ct);
-                var withVoice = mr.GetProperty("url").GetString();
-                if (!string.IsNullOrWhiteSpace(withVoice)) { job.ResultUrl = withVoice; anyVoice = true; }
-                await _queue.PersistAsync(job);
-            }
-            catch (OperationCanceledException) { throw; }
-            catch (Exception ex) { _log.LogWarning(ex, "voiceover failed; film kept silent"); }
-        }
-
-        // ---- 5) BACKGROUND: ONE continuous bed under the whole film — a real ACE-Step score when a
+        // ---- 4) BACKGROUND: ONE continuous bed under the whole film — a real ACE-Step score when a
         //         music mood is chosen (procedural fallback), else a single ambient soundscape from
         //         the opening scene. Mixed UNDER the voice (musicmix) so narration stays on top. ----
         if (!string.IsNullOrWhiteSpace(job.ResultUrl) &&

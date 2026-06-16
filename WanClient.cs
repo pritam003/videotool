@@ -121,7 +121,13 @@ public sealed class WanClient
         var inv = System.Globalization.CultureInfo.InvariantCulture;
         var imageName = await UploadImageAsync(image, imageFilename, ct);
         var videoName = await UploadVideoAsync(video, videoFilename, ct);
-        var (frames, w, h, seed) = NormalizeDims(seconds, width, height);
+        // Wan-Animate output length follows the driving video, up to ~1 minute (NOT the 5s clip cap).
+        // 16 fps, frame count 4n+1 (temporal compression factor 4); spatial dims multiples of 16.
+        var secClamped = Math.Clamp(seconds, 1, 60);
+        var frames = secClamped * 16 + 1;
+        var w = Math.Max(256, (width / 16) * 16);
+        var h = Math.Max(256, (height / 16) * 16);
+        var seed = Random.Shared.NextInt64() & 0x7FFFFFFFFFFFFFFFL;
         var workflow = _animateWorkflowJson.Value
             .Replace("__IMAGE__", JsonSerializer.Serialize(imageName))
             .Replace("__VIDEO__", JsonSerializer.Serialize(videoName))
