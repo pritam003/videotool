@@ -776,19 +776,29 @@ app.MapPost("/api/mux-audio", async (MuxAudioRequest req, IHttpClientFactory hf,
         string args;
         if (mode == "fit")
         {
-            // Cinematic fit: hold the shot to the spoken line instead of truncating it.
-            // Brief lead-in before the voice, then a tail to breathe; extend the (silent)
-            // video by freezing its last frame so the whole line is heard, never clipped.
+            // Keep the spoken line in sync with the SHOT. The Wan clip only has ~clipSec of
+            // real motion, but narration+dialogue can run longer. Instead of freezing the last
+            // frame for several seconds while the voice keeps talking (the old behaviour — a
+            // 5s shot stretched to 9s), gently speed the voice up so it lands inside the clip's
+            // own motion, and only freeze a tiny residual if it still overruns after a natural
+            // speed cap. This removes the long frozen-frame tail and keeps picture+voice aligned.
             var ci = System.Globalization.CultureInfo.InvariantCulture;
             var vDur = await ProbeDurationAsync(ffmpeg, vIn, ct);
             var aDur = await ProbeDurationAsync(ffmpeg, aIn, ct);
-            const double leadIn = 0.4, tail = 0.7;
-            var target = Math.Max(vDur, leadIn + aDur + tail);
-            var ext = Math.Max(0.0, target - vDur);
-            var leadMs = (int)Math.Round(leadIn * 1000);
+            const double leadIn = 0.25, tail = 0.35, maxTempo = 1.5;
             string F(double x) => x.ToString("0.###", ci);
+
+            // Ideal window for the voice = the clip minus a small lead-in/tail.
+            var window = Math.Max(0.5, vDur - leadIn - tail);
+            // Speed the voice up only when it overruns the window; cap so it stays intelligible.
+            var tempo = (aDur > window) ? Math.Min(maxTempo, aDur / window) : 1.0;
+            var effAudio = aDur / tempo;                        // spoken length after the speed-up
+            var target = Math.Max(vDur, leadIn + effAudio + tail);
+            var ext = Math.Max(0.0, target - vDur);             // residual freeze (small or zero)
+            var leadMs = (int)Math.Round(leadIn * 1000);
+            var atempo = tempo > 1.001 ? $"atempo={F(tempo)}," : "";
             args = $"-y -i \"{vIn}\" -i \"{aIn}\" -filter_complex "
-                 + $"\"[0:v]tpad=stop_mode=clone:stop_duration={F(ext)}[v];[1:a]adelay=delays={leadMs}:all=1,apad[a]\" "
+                 + $"\"[0:v]tpad=stop_mode=clone:stop_duration={F(ext)}[v];[1:a]{atempo}adelay=delays={leadMs}:all=1,apad[a]\" "
                  + $"-map \"[v]\" -map \"[a]\" -t {F(target)} -c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p "
                  + $"-c:a aac -b:a 192k -movflags +faststart \"{outPath}\"";
         }

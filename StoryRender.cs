@@ -862,7 +862,8 @@ public static class StoryJobView
             finishedAt = j.FinishedAt,
             language = j.Spec.Language,
             size = j.Spec.Size,
-            narrate = j.Spec.Narrate
+            narrate = j.Spec.Narrate,
+            idea = j.Spec.Idea
         };
     }
 

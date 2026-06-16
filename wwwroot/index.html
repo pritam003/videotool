@@ -1732,14 +1732,15 @@ function App() {
 
   const recentLines = dbgLines.slice(-200);
 
-  // Poll the server-side render queue so finished films appear automatically; the
-  // steady 3s poll also keeps the F1 app warm so background renders don't get
-  // recycled mid-flight while a tab is open.
+  // Poll the server-side render queue. Poll briskly (3s) ONLY while a film is actually
+  // rendering — that keeps progress live and the F1 app warm mid-render — and back off to
+  // a slow 20s heartbeat when the queue is idle, so the page isn't constantly refetching.
+  const anyJobActive = jobs.some(j => j.status === "queued" || j.status === "running");
   useEffect(() => {
     refreshJobs();
-    const iv = setInterval(refreshJobs, 3000);
+    const iv = setInterval(refreshJobs, anyJobActive ? 3000 : 20000);
     return () => clearInterval(iv);
-  }, []);
+  }, [anyJobActive]);
   // Advance to the story-review step automatically once a storyboard is generated.
   useEffect(() => { if (scStory && wizStep === 2) setWizStep(3); }, [scStory]);
 
@@ -1776,33 +1777,49 @@ function App() {
       <!-- RENDER QUEUE on history page -->
       <div style=${{gridColumn:"1 / -1"}}>
         <div class="card">
-          <h3 style=${{display:"flex",alignItems:"center",gap:8}}>🎞️ Render queue ${jobs.length > 0 && html`<span class="pill">${jobs.length}</span>`}</h3>
-          ${jobs.length === 0
-            ? html`<p class="muted small">No films rendering. Build one in Studio and submit — it will appear here in the background.</p>`
-            : html`<div class="stack" style=${{gap:8}}>
-                ${jobs.map(j => {
-                  const active = j.status === "queued" || j.status === "running";
-                  const pillCls = j.status === "succeeded" ? "ok" : (j.status === "failed" || j.status === "interrupted") ? "err" : "";
-                  return html`
-                    <div key=${j.id} style=${{border:"1px solid var(--border)",borderRadius:"var(--radius-sm)",padding:10,background:"var(--surface-2)"}}>
-                      <div style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
-                        <strong style=${{flex:"1 1 120px",fontSize:13,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}} title=${j.title}>${j.title || "Untitled"}</strong>
-                        <span class=${"pill small " + pillCls}>${j.status}</span>
-                        ${active && html`<button class="ghost small" onClick=${() => cancelJob(j.id)}>✕ Cancel</button>`}
-                      </div>
-                      ${j.label && html`<div class="muted small" style=${{margin:"4px 0"}}>${j.label}</div>`}
-                      ${active && html`<div class="progress"><div style=${{width:(j.pct || 0) + "%"}}></div></div>`}
-                      ${j.resultUrl && html`
-                        <video src=${j.resultUrl} controls loop playsinline style=${{width:"100%",borderRadius:6,marginTop:6}}></video>
-                        <div class="meta" style=${{flexWrap:"wrap"}}>
-                          <a href=${j.resultUrl} target="_blank" rel="noopener">download ↗</a>
-                          <span class="muted small">${j.narrate ? "voiced" : "silent"} · ${j.size || ""}</span>
+          <h3 style=${{display:"flex",alignItems:"center",gap:8}}>🎞️ Render queue</h3>
+          ${(() => {
+            const activeJobs = jobs.filter(j => j.status === "queued" || j.status === "running");
+            const doneJobs = jobs.filter(j => j.status !== "queued" && j.status !== "running");
+            if (jobs.length === 0)
+              return html`<p class="muted small">No films rendering. Build one in Studio and submit — it renders here in the background.</p>`;
+            return html`
+              ${activeJobs.length > 0
+                ? html`<div class="stack" style=${{gap:8}}>
+                    ${activeJobs.map(j => html`
+                      <div key=${j.id} style=${{border:"1px solid var(--border)",borderRadius:"var(--radius-sm)",padding:10,background:"var(--surface-2)"}}>
+                        <div style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                          <strong style=${{flex:"1 1 120px",fontSize:13,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}} title=${j.title}>${j.title || "Untitled"}</strong>
+                          <span class="pill small">${j.status}</span>
+                          <button class="ghost small" onClick=${() => cancelJob(j.id)}>✕ Cancel</button>
                         </div>
-                      `}
-                      ${j.error && !j.resultUrl && html`<div class="muted small" style=${{color:"#ef4444"}}>${j.error}</div>`}
-                    </div>`;
-                })}
-              </div>`}
+                        ${j.label && html`<div class="muted small" style=${{margin:"4px 0"}}>${j.label}</div>`}
+                        <div class="progress"><div style=${{width:(j.pct || 0) + "%"}}></div></div>
+                      </div>`)}
+                  </div>`
+                : html`<p class="muted small">Nothing rendering right now.</p>`}
+              ${doneJobs.length > 0 && html`
+                <div style=${{marginTop:activeJobs.length > 0 ? 12 : 0}}>
+                  <div class="muted small" style=${{margin:"8px 0 6px",textTransform:"uppercase",fontSize:11,letterSpacing:".4px"}}>Completed</div>
+                  <div class="stack" style=${{gap:6}}>
+                    ${doneJobs.map(j => {
+                      const pillCls = j.status === "succeeded" ? "ok" : "err";
+                      const label = j.status === "succeeded" ? "✓ completed" : j.status;
+                      return html`
+                        <div key=${j.id} style=${{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",padding:"7px 10px",border:"1px solid var(--border)",borderRadius:"var(--radius-sm)",background:"var(--surface-2)"}}>
+                          <span class=${"pill small " + pillCls} style=${{flex:"0 0 auto"}}>${label}</span>
+                          <span style=${{flex:"1 1 140px",fontSize:13,fontWeight:600,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}} title=${j.title}>${j.title || "Untitled"}</span>
+                          ${j.idea && html`<span class="muted small" style=${{flex:"2 1 180px",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}} title=${j.idea}>${j.idea}</span>`}
+                          ${j.status === "succeeded" && j.resultUrl && html`<a class="ghost small" href=${j.resultUrl} target="_blank" rel="noopener" style=${{flex:"0 0 auto",textDecoration:"none"}}>open ↗</a>`}
+                          ${j.status === "interrupted" && html`<span class="muted small" style=${{flex:"0 0 auto"}}>re-submit to render</span>`}
+                          ${j.status === "failed" && html`<span class="muted small" style=${{flex:"0 0 auto",color:"#ef4444"}} title=${j.error || "render failed"}>render failed</span>`}
+                        </div>`;
+                    })}
+                  </div>
+                </div>
+              `}
+            `;
+          })()}
         </div>
       </div>
       ` : html`
