@@ -21,6 +21,7 @@ public sealed class WanClient
     private readonly Lazy<string> _fluxWorkflowJson;
     private readonly Lazy<string> _foleyWorkflowJson;
     private readonly Lazy<string> _aceWorkflowJson;
+    private readonly Lazy<string> _animateWorkflowJson;
     private readonly ILogger<WanClient> _log;
 
     public WanClient(IHttpClientFactory hf, IConfiguration cfg, IHostEnvironment env, ILogger<WanClient> log)
@@ -57,6 +58,13 @@ public sealed class WanClient
         var aceWorkflowPath = cfg["WAN_ACE_WORKFLOW_PATH"]
             ?? Path.Combine(env.ContentRootPath, "workflows", "ace-step.json");
         _aceWorkflowJson = new Lazy<string>(() => File.ReadAllText(aceWorkflowPath));
+        // Wan2.2-Animate workflow (character image + driving video -> animated video). Only loaded when
+        // the gated /api/animate-submit endpoint is hit (WAN_ANIMATE_ENABLED + the Animate weights on the
+        // share + a ComfyUI with the WanAnimateToVideo node + VideoHelperSuite). Starter graph — validate
+        // node inputs against the installed node at activation.
+        var animateWorkflowPath = cfg["WAN_ANIMATE_WORKFLOW_PATH"]
+            ?? Path.Combine(env.ContentRootPath, "workflows", "wan-animate.json");
+        _animateWorkflowJson = new Lazy<string>(() => File.ReadAllText(animateWorkflowPath));
     }
 
     /// <summary>
@@ -96,6 +104,32 @@ public sealed class WanClient
             .Replace("__HEIGHT__", h.ToString(System.Globalization.CultureInfo.InvariantCulture))
             .Replace("__FRAMES__", frames.ToString(System.Globalization.CultureInfo.InvariantCulture))
             .Replace("__SEED__", seed.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        return await PostGraphAsync(workflow, ct);
+    }
+
+    /// <summary>
+    /// Submit a Wan2.2-Animate job: drive a character <paramref name="image"/> with a sample/driving
+    /// <paramref name="video"/> so the character replicates its motion and expression. Uploads both into
+    /// ComfyUI's input dir, substitutes the animate workflow, and returns the prompt_id — poll it with
+    /// <see cref="GetStatusJsonAsync"/> and download the produced MP4 with <see cref="DownloadAsync"/>.
+    /// Requires the Animate weights on the share + a ComfyUI with the WanAnimateToVideo node.
+    /// </summary>
+    public async Task<string> SubmitAnimateAsync(
+        Stream image, string imageFilename, Stream video, string videoFilename,
+        string prompt, int seconds, int width, int height, CancellationToken ct)
+    {
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
+        var imageName = await UploadImageAsync(image, imageFilename, ct);
+        var videoName = await UploadVideoAsync(video, videoFilename, ct);
+        var (frames, w, h, seed) = NormalizeDims(seconds, width, height);
+        var workflow = _animateWorkflowJson.Value
+            .Replace("__IMAGE__", JsonSerializer.Serialize(imageName))
+            .Replace("__VIDEO__", JsonSerializer.Serialize(videoName))
+            .Replace("__PROMPT__", JsonSerializer.Serialize(WithRealismDirectives(prompt)))
+            .Replace("__WIDTH__", w.ToString(inv))
+            .Replace("__HEIGHT__", h.ToString(inv))
+            .Replace("__FRAMES__", frames.ToString(inv))
+            .Replace("__SEED__", seed.ToString(inv));
         return await PostGraphAsync(workflow, ct);
     }
 

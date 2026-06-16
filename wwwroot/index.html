@@ -515,6 +515,19 @@ function App() {
   const [alBusy, setAlBusy] = useState(false);
   const alAudioRef = useRef(null); // the currently-playing whole-narration <audio>
 
+  // ── Wan-Animate: drive a character image with a sample/driving video (gated GPU feature) ──
+  const [anImage, setAnImage] = useState(null);              // character image File
+  const [anImagePreview, setAnImagePreview] = useState(null); // object URL
+  const [anVideo, setAnVideo] = useState(null);              // sample/driving video File
+  const [anVideoPreview, setAnVideoPreview] = useState(null); // object URL
+  const [anPrompt, setAnPrompt] = useState("");
+  const [anSeconds, setAnSeconds] = useState(5);
+  const [anBusy, setAnBusy] = useState(false);
+  const [anStatus, setAnStatus] = useState("");              // human label while running
+  const [anResult, setAnResult] = useState(null);            // { url }
+  const [anError, setAnError] = useState("");
+  const anCancelRef = useRef(false);
+
   // Background music
   const [scBackgroundMusic, setScBackgroundMusic] = useState(""); // music mood: "none", "cinematic", "dramatic", "ambient", "uplifting", "suspenseful"
   const [scMusicVolume, setScMusicVolume] = useState(0.5);    // music volume 0-1, mixed with narration
@@ -1263,6 +1276,62 @@ function App() {
     return out;
   }
 
+  // ── Wan-Animate helpers (character image + sample video → animated clip, via the gated GPU endpoints) ──
+  function pickAnImage(file) {
+    if (anImagePreview) { try { URL.revokeObjectURL(anImagePreview); } catch {} }
+    setAnImage(file || null);
+    setAnImagePreview(file ? URL.createObjectURL(file) : null);
+  }
+  function pickAnVideo(file) {
+    if (anVideoPreview) { try { URL.revokeObjectURL(anVideoPreview); } catch {} }
+    setAnVideo(file || null);
+    setAnVideoPreview(file ? URL.createObjectURL(file) : null);
+  }
+  function cancelAnimate() { anCancelRef.current = true; setAnBusy(false); setAnStatus(""); }
+  async function submitAnimate() {
+    if (!anImage) { toast("Add a character image first.", true); return; }
+    if (!anVideo) { toast("Add a sample / driving video first.", true); return; }
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    setAnBusy(true); setAnError(""); setAnResult(null); anCancelRef.current = false;
+    setAnStatus("Waking the GPU…");
+    try {
+      // Pre-warm the scale-to-zero A100 so the first submit lands on a hot container.
+      try { await fetch("/api/gpu/start", { method: "POST" }); } catch {}
+      const fd = new FormData();
+      fd.append("image", anImage);
+      fd.append("video", anVideo);
+      fd.append("prompt", anPrompt || "");
+      fd.append("size", scSize);
+      fd.append("seconds", String(anSeconds));
+      let id = null;
+      for (let attempt = 0; attempt < 40 && !id; attempt++) {
+        if (anCancelRef.current) throw new Error("Cancelled");
+        setAnStatus(attempt ? `Submitting… (GPU warming, retry ${attempt})` : "Submitting…");
+        const r = await fetch("/api/animate-submit", { method: "POST", body: fd });
+        if (r.status === 501) { setAnError("Wan-Animate isn't activated on the server yet — stage the weights (wan22/download-wan-animate.sh), set WAN_ANIMATE_ENABLED=1, then restart."); return; }
+        if (r.status === 503) { await sleep(15000); continue; }
+        id = (await jsonOrThrow(r)).id;
+      }
+      if (!id) throw new Error("The GPU never became ready to accept the job.");
+      setAnStatus("Rendering on the A100… (a few minutes)");
+      let gotUrl = null;
+      for (let attempt = 0; attempt < 100 && !gotUrl; attempt++) {
+        if (anCancelRef.current) throw new Error("Cancelled");
+        await sleep(6000);
+        const r = await fetch(`/api/animate-status/${encodeURIComponent(id)}`);
+        if (r.status === 503) { setAnStatus("GPU warming…"); continue; }
+        const j = await jsonOrThrow(r);
+        if (j.status === "succeeded" && j.url) { gotUrl = j.url; break; }
+        if (j.status === "failed") throw new Error(j.error || "render failed in ComfyUI");
+        setAnStatus(`Rendering…${j.progress ? " " + j.progress + "%" : ""}`);
+      }
+      if (gotUrl) { setAnResult({ url: gotUrl }); dbg("ok", "wan-animate done"); }
+      else throw new Error("Timed out waiting for the render.");
+    } catch (e) {
+      if (!anCancelRef.current) setAnError((e.message || "failed").slice(0, 200));
+    } finally { setAnBusy(false); setAnStatus(""); }
+  }
+
   // Submit a TEXT-TO-VIDEO job (no start image) — used to render canonical
   // reference snapshots for casting and multi-character establishing stills.
   async function submitT2V(thePrompt, clipSec, label) {
@@ -1944,6 +2013,8 @@ function App() {
           style=${page==="studio" ? {background:"var(--accent)",color:"#fff",borderColor:"var(--accent)"} : {}}>Studio</button>
         <button class="ghost small" onClick=${() => setPage("voices")}
           style=${page==="voices" ? {background:"var(--accent)",color:"#fff",borderColor:"var(--accent)"} : {}}>Voices</button>
+        <button class="ghost small" onClick=${() => setPage("animate")}
+          style=${page==="animate" ? {background:"var(--accent)",color:"#fff",borderColor:"var(--accent)"} : {}}>Animate</button>
         <button class="ghost small" onClick=${() => { setPage("history"); setRefreshLib(x => x + 1); }}
           style=${page==="history" ? {background:"var(--accent)",color:"#fff",borderColor:"var(--accent)"} : {}}>History</button>
       </div>
@@ -2121,6 +2192,58 @@ function App() {
                 </div>`;
             })}
           </div>
+        </div>
+      </div>
+      ` : page === "animate" ? html`
+      <!-- ANIMATE: Wan2.2-Animate — drive a character image with a sample video -->
+      <div style=${{gridColumn:"1 / -1"}}>
+        <div class="card">
+          <h3 style=${{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>🕺 Animate <span class="muted small" style=${{fontWeight:400}}>· Wan2.2-Animate — make a character copy a sample video's motion</span></h3>
+          <p class="muted small" style=${{marginTop:0}}>Upload a <strong>character image</strong> and a short <strong>sample video</strong>. Wan-Animate drives the character so it replicates the video's body motion and facial expression. Renders on the A100 (a few minutes per clip).</p>
+
+          <div style=${{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(260px,1fr))",gap:12,marginTop:8}}>
+            <div style=${{border:"1px solid var(--border)",borderRadius:10,padding:12,background:"var(--surface-2)"}}>
+              <label>① Character image</label>
+              <input type="file" accept="image/*" onChange=${e => pickAnImage(e.target.files && e.target.files[0])} style=${{display:"block",marginTop:6,fontSize:12}} />
+              ${anImagePreview ? html`<img src=${anImagePreview} style=${{marginTop:8,width:"100%",maxHeight:220,objectFit:"contain",borderRadius:8,background:"#0a0a0c"}} />` : html`<div class="muted small" style=${{marginTop:8}}>Who/what to animate (a person, character, etc.).</div>`}
+            </div>
+            <div style=${{border:"1px solid var(--border)",borderRadius:10,padding:12,background:"var(--surface-2)"}}>
+              <label>② Sample / driving video</label>
+              <input type="file" accept="video/*" onChange=${e => pickAnVideo(e.target.files && e.target.files[0])} style=${{display:"block",marginTop:6,fontSize:12}} />
+              ${anVideoPreview ? html`<video src=${anVideoPreview} controls muted style=${{marginTop:8,width:"100%",maxHeight:220,objectFit:"contain",borderRadius:8,background:"#0a0a0c"}}></video>` : html`<div class="muted small" style=${{marginTop:8}}>The motion/performance to copy. Keep it short (first ${anSeconds}s are used).</div>`}
+            </div>
+          </div>
+
+          <div style=${{marginTop:10}}>
+            <label>③ Scene direction <span class="muted small">· optional — describe the look / background</span></label>
+            <textarea rows="2" value=${anPrompt} onInput=${e => setAnPrompt(e.target.value)} placeholder="e.g. 'cinematic, warm sunset light, city street background'" style=${{fontSize:13,fontFamily:"inherit",width:"100%"}}></textarea>
+          </div>
+
+          <div style=${{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap",marginTop:10}}>
+            <label class="muted small">Length</label>
+            <select value=${anSeconds} onChange=${e => setAnSeconds(Number(e.target.value))} disabled=${anBusy}>
+              ${[3,4,5].map(s => html`<option value=${s} key=${s}>${s}s</option>`)}
+            </select>
+            <span class="muted small">· ${scSize}</span>
+            <div class="spacer"></div>
+            ${anBusy ? html`<button class="ghost" onClick=${cancelAnimate}>✕ Cancel</button>` : ""}
+            <button class="primary" onClick=${submitAnimate} disabled=${anBusy || !anImage || !anVideo}>
+              ${anBusy ? "Working…" : "🎬 Animate"}
+            </button>
+          </div>
+
+          ${anStatus && html`<div class="muted small" style=${{marginTop:10,display:"flex",alignItems:"center",gap:8}}><span class="pill">running</span> ${anStatus}</div>`}
+          ${anError && html`<div class="small" style=${{marginTop:10,color:"#ef4444"}}>${anError}</div>`}
+
+          ${anResult && anResult.url && html`
+            <div style=${{marginTop:14}}>
+              <div class="preview" style=${{maxWidth:520}}><video src=${anResult.url} controls autoplay loop></video></div>
+              <div class="meta" style=${{marginTop:6}}><a href=${anResult.url} target="_blank" rel="noopener">download ↗</a></div>
+            </div>`}
+
+          <p class="muted small" style=${{marginTop:14,borderTop:"1px solid var(--border)",paddingTop:10}}>
+            Needs the Wan-Animate weights staged on the GPU and <code>WAN_ANIMATE_ENABLED=1</code>. Until then, pressing Animate shows a clear “not activated” message.
+          </p>
         </div>
       </div>
       ` : html`

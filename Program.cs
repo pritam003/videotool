@@ -1154,6 +1154,98 @@ app.MapPost("/api/foley", async (FoleyRequest req, WanClient wan, IHttpClientFac
     }
 });
 
+// WAN-ANIMATE — drive a character IMAGE with a sample/driving VIDEO so the character replicates its
+// motion + expression (character animation). GATED behind WAN_ANIMATE_ENABLED + the Animate weights on
+// the share + a ComfyUI with the WanAnimateToVideo node. A render takes minutes on the A100, so this is a
+// SUBMIT + POLL pair (never one long request that would trip the ~230s App Service gateway timeout):
+//   POST /api/animate-submit       (multipart: image, video, prompt?, size?, seconds?) -> { id }
+//   GET  /api/animate-status/{id}  -> { status, progress } while running; { status:"succeeded", url } when done.
+app.MapPost("/api/animate-submit", async (HttpRequest http, WanClient wan, IConfiguration cfg, CancellationToken ct) =>
+{
+    var enabled = string.Equals(cfg["WAN_ANIMATE_ENABLED"], "1", StringComparison.Ordinal)
+               || string.Equals(cfg["WAN_ANIMATE_ENABLED"], "true", StringComparison.OrdinalIgnoreCase);
+    if (!enabled)
+        return Results.StatusCode(501); // not activated — stage the Animate weights + set WAN_ANIMATE_ENABLED=1
+    if (!http.HasFormContentType)
+        return Results.BadRequest(new { error = "multipart/form-data required" });
+    var form = await http.ReadFormAsync(ct);
+    var imageFile = form.Files["image"];
+    var videoFile = form.Files["video"];
+    if (imageFile is null || imageFile.Length == 0)
+        return Results.BadRequest(new { error = "image file is required" });
+    if (videoFile is null || videoFile.Length == 0)
+        return Results.BadRequest(new { error = "video file is required" });
+    var (W, H) = ParseSize(form["size"].ToString());
+    var seconds = int.TryParse(form["seconds"].ToString(), out var s) ? Math.Clamp(s, 1, 5) : 5;
+    var prompt = form["prompt"].ToString();
+    var imgExt = string.IsNullOrEmpty(Path.GetExtension(imageFile.FileName)) ? ".png" : Path.GetExtension(imageFile.FileName);
+    var vidExt = string.IsNullOrEmpty(Path.GetExtension(videoFile.FileName)) ? ".mp4" : Path.GetExtension(videoFile.FileName);
+    try
+    {
+        await using var imgStream = imageFile.OpenReadStream();
+        await using var vidStream = videoFile.OpenReadStream();
+        var id = await wan.SubmitAnimateAsync(
+            imgStream, $"animate-{Guid.NewGuid():N}{imgExt}",
+            vidStream, $"animate-{Guid.NewGuid():N}{vidExt}",
+            prompt, seconds, W, H, ct);
+        return Results.Ok(new { id });
+    }
+    catch (Exception ex) when (IsWarmingError(ex))
+    {
+        return Results.Json(new { warming = true, error = "GPU is warming up (scale-from-zero). Retry shortly." }, statusCode: 503);
+    }
+    catch (Exception ex) when (!ct.IsCancellationRequested)
+    {
+        return Results.Problem($"animate submit failed: {ex.Message}");
+    }
+});
+
+// Poll a Wan-Animate job. While running returns {status, progress}; once ComfyUI finishes it downloads
+// the MP4 from the GPU, stores it in blob, and returns {status:"succeeded", url}. On error {status:"failed"}.
+app.MapGet("/api/animate-status/{id}", async (string id, WanClient wan, IConfiguration cfg, TokenCredential cred, CancellationToken ct) =>
+{
+    var enabled = string.Equals(cfg["WAN_ANIMATE_ENABLED"], "1", StringComparison.Ordinal)
+               || string.Equals(cfg["WAN_ANIMATE_ENABLED"], "true", StringComparison.OrdinalIgnoreCase);
+    if (!enabled) return Results.StatusCode(501);
+    try
+    {
+        var statusJson = await wan.GetStatusJsonAsync(id, ct);
+        using var doc = System.Text.Json.JsonDocument.Parse(statusJson);
+        var root = doc.RootElement;
+        var status = root.GetProperty("status").GetString() ?? "running";
+        var progress = root.TryGetProperty("progress", out var p) ? p.GetInt32() : 0;
+        if (status == "failed")
+            return Results.Ok(new { status = "failed", error = "Wan-Animate render failed in ComfyUI." });
+        if (status != "succeeded")
+            return Results.Ok(new { status, progress });
+
+        // Finished — pull the MP4 from ComfyUI and store it in blob.
+        var fn = root.TryGetProperty("outputFilename", out var f) ? f.GetString() : null;
+        var sf = root.TryGetProperty("outputSubfolder", out var sfp) ? sfp.GetString() : null;
+        if (string.IsNullOrEmpty(fn))
+            return Results.Ok(new { status = "running", progress = 99 }); // done but output not surfaced yet — poll again
+        using var dl = await wan.DownloadAsync(fn!, sf, ct);
+        if (!dl.IsSuccessStatusCode)
+            return Results.Problem($"animate download failed ({(int)dl.StatusCode}).");
+        var bytes = await dl.Content.ReadAsByteArrayAsync(ct);
+        var account = Cfg(cfg, "STORAGE_ACCOUNT");
+        var svc = new BlobServiceClient(new Uri($"https://{account}.blob.core.windows.net"), cred);
+        var container = svc.GetBlobContainerClient(cfg["STORAGE_CONTAINER"] ?? "videos");
+        var name = $"animate/{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}.mp4";
+        using var ms = new MemoryStream(bytes);
+        var url = await UploadAndSign(container, name, ms, "video/mp4", svc, account, ct);
+        return Results.Ok(new { status = "succeeded", progress = 100, url, blob = name, bytes = bytes.Length });
+    }
+    catch (Exception ex) when (IsWarmingError(ex))
+    {
+        return Results.Json(new { status = "warming", warming = true }, statusCode: 503);
+    }
+    catch (Exception ex) when (!ct.IsCancellationRequested)
+    {
+        return Results.Problem($"animate status failed: {ex.Message}");
+    }
+});
+
 // LLM-DIRECTED MUSIC SCORE (ACE-Step text-to-music). The free/open upgrade over the synthesized
 // sine-tone bed: a real instrumental score composed from a tags brief (genre/mood/tempo) the LLM
 // writes for the film. GATED behind WAN_AUDIO_ENABLED + the audio GPU image (ace_step checkpoint on

@@ -1,0 +1,107 @@
+{
+  "1": {
+    "class_type": "UNETLoader",
+    "_meta": { "title": "Load Wan2.2-Animate-14B" },
+    "inputs": {
+      "unet_name": "wan2.2_animate_14B_bf16.safetensors",
+      "weight_dtype": "default"
+    }
+  },
+  "2": {
+    "class_type": "CLIPLoader",
+    "_meta": { "title": "Load CLIP (UMT5)" },
+    "inputs": {
+      "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "type": "wan",
+      "device": "default"
+    }
+  },
+  "3": {
+    "class_type": "VAELoader",
+    "_meta": { "title": "Load Wan 2.1 VAE" },
+    "inputs": { "vae_name": "wan_2.1_vae.safetensors" }
+  },
+  "4": {
+    "class_type": "LoadImage",
+    "_meta": { "title": "Character reference image" },
+    "inputs": { "image": __IMAGE__ }
+  },
+  "5": {
+    "class_type": "VHS_LoadVideo",
+    "_meta": { "title": "Driving / sample video" },
+    "inputs": {
+      "video": __VIDEO__,
+      "force_rate": 16,
+      "custom_width": 0,
+      "custom_height": 0,
+      "frame_load_cap": __FRAMES__,
+      "skip_first_frames": 0,
+      "select_every_nth": 1
+    }
+  },
+  "6": {
+    "class_type": "CLIPTextEncode",
+    "_meta": { "title": "Positive prompt" },
+    "inputs": {
+      "text": __PROMPT__,
+      "clip": ["2", 0]
+    }
+  },
+  "7": {
+    "class_type": "CLIPTextEncode",
+    "_meta": { "title": "Negative prompt" },
+    "inputs": {
+      "text": "blurry, distorted, low quality, low resolution, oversaturated, jpeg artifacts, bad anatomy, malformed, deformed face, extra limbs, watermark, on-screen text, captions, logo, ugly, morphing, flickering, identity change, face swap, different person, floating, levitating, sliding feet, foot skating, rubber limbs, warping geometry, melting, broken joints, physics defying",
+      "clip": ["2", 0]
+    }
+  },
+  "8": {
+    "class_type": "WanAnimateToVideo",
+    "_meta": { "title": "Wan-Animate (validate inputs against installed node — official template inserts DWPose pose_video + face_video preprocessing)" },
+    "inputs": {
+      "width": __WIDTH__,
+      "height": __HEIGHT__,
+      "length": __FRAMES__,
+      "batch_size": 1,
+      "positive": ["6", 0],
+      "negative": ["7", 0],
+      "vae": ["3", 0],
+      "reference_image": ["4", 0],
+      "pose_video": ["5", 0]
+    }
+  },
+  "9": {
+    "class_type": "KSampler",
+    "_meta": { "title": "Sampler" },
+    "inputs": {
+      "seed": __SEED__,
+      "steps": 20,
+      "cfg": 6.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1.0,
+      "model": ["1", 0],
+      "positive": ["8", 0],
+      "negative": ["8", 1],
+      "latent_image": ["8", 2]
+    }
+  },
+  "10": {
+    "class_type": "VAEDecode",
+    "_meta": { "title": "VAE Decode" },
+    "inputs": { "samples": ["9", 0], "vae": ["3", 0] }
+  },
+  "11": {
+    "class_type": "VHS_VideoCombine",
+    "_meta": { "title": "Save MP4" },
+    "inputs": {
+      "images": ["10", 0],
+      "frame_rate": 16,
+      "loop_count": 0,
+      "filename_prefix": "wananimate",
+      "format": "video/h264-mp4",
+      "pingpong": false,
+      "save_output": true
+    }
+  }
+}
