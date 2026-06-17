@@ -273,7 +273,9 @@ public sealed class WanClient
     {
         baseUrl ??= _baseUrl;
         var clientId = $"videotool-{Guid.NewGuid():N}";
-        var body = $"{{\"prompt\":{JsonSerializer.Serialize(workflow)},\"client_id\":{JsonSerializer.Serialize(clientId)}}}";
+        // `workflow` is the already-substituted graph JSON (an object literal), so embed it
+        // directly — serializing it would double-encode it into a string and ComfyUI would reject it.
+        var body = $"{{\"prompt\":{workflow},\"client_id\":{JsonSerializer.Serialize(clientId)}}}";
 
         var http = _hf.CreateClient();
         http.Timeout = TimeSpan.FromMinutes(2);
@@ -324,14 +326,15 @@ public sealed class WanClient
     /// callers (frontend poll, push watcher, finalize) stay unchanged. Also includes
     /// outputFilename + outputSubfolder when the job finishes, used by Finalize.
     /// </summary>
-    public async Task<string> GetStatusJsonAsync(string promptId, CancellationToken ct)
+    public async Task<string> GetStatusJsonAsync(string promptId, CancellationToken ct, string? baseUrl = null)
     {
+        baseUrl ??= _baseUrl;
         var http = _hf.CreateClient();
         http.Timeout = TimeSpan.FromSeconds(20);
         if (!string.IsNullOrEmpty(_authKey)) http.DefaultRequestHeaders.Add("X-Wan-Auth", _authKey);
 
         // /history/{id} populates only when the job reaches a terminal state.
-        using var hResp = await http.GetAsync($"{_baseUrl}/history/{Uri.EscapeDataString(promptId)}", ct);
+        using var hResp = await http.GetAsync($"{baseUrl}/history/{Uri.EscapeDataString(promptId)}", ct);
         if (!hResp.IsSuccessStatusCode)
             throw new InvalidOperationException($"ComfyUI history failed: {(int)hResp.StatusCode}");
 
@@ -386,7 +389,7 @@ public sealed class WanClient
         var queued = false;
         try
         {
-            using var qResp = await http.GetAsync($"{_baseUrl}/queue", ct);
+            using var qResp = await http.GetAsync($"{baseUrl}/queue", ct);
             if (qResp.IsSuccessStatusCode)
             {
                 using var qDoc = JsonDocument.Parse(await qResp.Content.ReadAsStringAsync(ct));
@@ -440,80 +443,13 @@ public sealed class WanClient
     }
 
     /// <summary>
-    /// Get status of a Wan-Animate job from the dedicated animate container.
-    /// Uses WAN_ANIMATE_BASE_URL if configured separately, otherwise falls back to WAN_BASE_URL.
+    /// Get status of a Wan-Animate job. Routes to the dedicated animate container
+    /// (WAN_ANIMATE_BASE_URL) when configured, otherwise falls back to WAN_BASE_URL.
+    /// Reuses the proven GetStatusJsonAsync logic (incl. output filename extraction).
     /// </summary>
-    public async Task<string> GetAnimateStatusJsonAsync(string promptId, CancellationToken ct)
-    {
-        // Use the animate container URL for status queries
-        return await GetStatusJsonAsyncInternal(promptId, ct, _animateUrl);
-    }
+    public Task<string> GetAnimateStatusJsonAsync(string promptId, CancellationToken ct)
+        => GetStatusJsonAsync(promptId, ct, _animateUrl);
 
-    /// <summary>Internal method to query status from a specific base URL.</summary>
-    private async Task<string> GetStatusJsonAsyncInternal(string promptId, CancellationToken ct, string baseUrl)
-    {
-        var http = _hf.CreateClient();
-        http.Timeout = TimeSpan.FromSeconds(20);
-        if (!string.IsNullOrEmpty(_authKey)) http.DefaultRequestHeaders.Add("X-Wan-Auth", _authKey);
-
-        // /history/{id} populates only when the job reaches a terminal state.
-        using var hResp = await http.GetAsync($"{baseUrl}/history/{Uri.EscapeDataString(promptId)}", ct);
-        if (!hResp.IsSuccessStatusCode)
-            throw new InvalidOperationException($"ComfyUI history failed: {(int)hResp.StatusCode}");
-
-        var hBody = await hResp.Content.ReadAsStringAsync(ct);
-        using (var hist = JsonDocument.Parse(hBody))
-        {
-            if (hist.RootElement.TryGetProperty(promptId, out var entry))
-            {
-                var status = "succeeded";
-                if (entry.TryGetProperty("status", out var st) &&
-                    st.TryGetProperty("status_str", out var ss) &&
-                    string.Equals(ss.GetString(), "error", StringComparison.OrdinalIgnoreCase))
-                {
-                    status = "failed";
-                }
-                return JsonSerializer.Serialize(new { id = promptId, status });
-            }
-        }
-        // Not in history yet; check queue.
-        var inFlight = false;
-        using var qResp = await http.GetAsync($"{baseUrl}/queue", ct);
-        if (qResp.IsSuccessStatusCode)
-        {
-            var qBody = await qResp.Content.ReadAsStringAsync(ct);
-            using var q = JsonDocument.Parse(qBody);
-            // queue_running and queue_pending are lists of [index, id, {...}, {...}].
-            var targets = new[] { "queue_running", "queue_pending" };
-            foreach (var key in targets)
-            {
-                if (q.RootElement.TryGetProperty(key, out var arr) && arr.ValueKind == JsonValueKind.Array)
-                {
-                    foreach (var entry in arr.EnumerateArray())
-                        if (entry.ValueKind == JsonValueKind.Array && entry.GetArrayLength() > 1)
-                        {
-                            var id = entry[1].GetString();
-                            if (string.Equals(id, promptId))
-                            {
-                                inFlight = true;
-                                break;
-                            }
-                        }
-                }
-                if (inFlight) break;
-            }
-        }
-        catch (Exception ex) { _log.LogDebug(ex, "queue probe failed for {Id}", promptId); }
-
-        return JsonSerializer.Serialize(new
-        {
-            id = promptId,
-            status = inFlight ? "running" : "queued",
-            progress = 0,
-        });
-    }
-
-    /// <summary>
     /// <summary>
     /// Streams the rendered MP4 from ComfyUI's /view endpoint. Caller is
     /// responsible for streaming to blob and disposing the response.

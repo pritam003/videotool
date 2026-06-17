@@ -1465,11 +1465,11 @@ app.MapPost("/api/animate-submit", async (HttpRequest http, WanClient wan, IConf
         }
         await using var imgStream = imageFile.OpenReadStream();
         await using var _ = vidStream;
-        vidDispose?.Dispose();
         var id = await wan.SubmitAnimateAsync(
             imgStream, $"animate-{Guid.NewGuid():N}{imgExt}",
             vidStream, vidFilename,
             prompt, seconds, W, H, ct);
+        vidDispose?.Dispose();
         return Results.Ok(new { id });
     }
     catch (Exception ex) when (IsWarmingError(ex))

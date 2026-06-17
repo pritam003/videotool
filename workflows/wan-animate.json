@@ -4,7 +4,7 @@
     "_meta": { "title": "Load Wan2.2-Animate-14B" },
     "inputs": {
       "unet_name": "wan2.2_animate_14B_bf16.safetensors",
-      "weight_dtype": "default"
+      "weight_dtype": "fp8_e4m3fn"
     }
   },
   "2": {
