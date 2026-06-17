@@ -67,7 +67,9 @@
       "negative": ["7", 0],
       "vae": ["3", 0],
       "reference_image": ["4", 0],
-      "pose_video": ["5", 0]
+      "pose_video": ["5", 0],
+      "video_frame_offset": 0,
+      "continue_motion_max_frames": __FRAMES__
     }
   },
   "9": {
