@@ -77,7 +77,7 @@
     "_meta": { "title": "Sampler" },
     "inputs": {
       "seed": __SEED__,
-      "steps": 20,
+      "steps": 8,
       "cfg": 6.0,
       "sampler_name": "euler",
       "scheduler": "simple",
