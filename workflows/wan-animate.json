@@ -77,7 +77,7 @@
     "_meta": { "title": "Sampler" },
     "inputs": {
       "seed": __SEED__,
-      "steps": 6,
+      "steps": 20,
       "cfg": 6.0,
       "sampler_name": "euler",
       "scheduler": "simple",
@@ -98,6 +98,7 @@
     "_meta": { "title": "Save MP4" },
     "inputs": {
       "images": ["10", 0],
+      "audio": ["5", 2],
       "frame_rate": 16,
       "loop_count": 0,
       "filename_prefix": "wananimate",
