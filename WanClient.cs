@@ -15,6 +15,7 @@ public sealed class WanClient
 {
     private readonly IHttpClientFactory _hf;
     private readonly string _baseUrl;
+    private readonly string _animateUrl;  // Can be different from _baseUrl if using separate container
     private readonly string? _authKey;
     private readonly Lazy<string> _workflowJson;
     private readonly Lazy<string> _i2vWorkflowJson;
@@ -30,6 +31,8 @@ public sealed class WanClient
         _log = log;
         _baseUrl = (cfg["WAN_BASE_URL"]
             ?? throw new InvalidOperationException("WAN_BASE_URL is not set")).TrimEnd('/');
+        // Optional separate endpoint for Wan-Animate (can route to dedicated container)
+        _animateUrl = (cfg["WAN_ANIMATE_BASE_URL"] ?? _baseUrl).TrimEnd('/');
         _authKey = cfg["WAN_AUTH_KEY"]; // optional shared secret, sent as X-Wan-Auth
         var workflowPath = cfg["WAN_WORKFLOW_PATH"]
             ?? Path.Combine(env.ContentRootPath, "workflows", "wan22-t2v.json");
@@ -119,8 +122,9 @@ public sealed class WanClient
         string prompt, int seconds, int width, int height, CancellationToken ct)
     {
         var inv = System.Globalization.CultureInfo.InvariantCulture;
-        var imageName = await UploadImageAsync(image, imageFilename, ct);
-        var videoName = await UploadVideoAsync(video, videoFilename, ct);
+        // Upload to animate container (might be different from _baseUrl)
+        var imageName = await UploadImageAsync(image, imageFilename, ct, _animateUrl);
+        var videoName = await UploadVideoAsync(video, videoFilename, ct, _animateUrl);
         // Wan-Animate output length follows the driving video, up to ~1 minute (NOT the 5s clip cap).
         // 16 fps, frame count 4n+1 (temporal compression factor 4); spatial dims multiples of 16.
         var secClamped = Math.Clamp(seconds, 1, 60);
@@ -136,7 +140,7 @@ public sealed class WanClient
             .Replace("__HEIGHT__", h.ToString(inv))
             .Replace("__FRAMES__", frames.ToString(inv))
             .Replace("__SEED__", seed.ToString(inv));
-        return await PostGraphAsync(workflow, ct);
+        return await PostGraphAsync(workflow, ct, _animateUrl);
     }
 
     /// <summary>
@@ -208,8 +212,9 @@ public sealed class WanClient
     /// is what the I2V workflow's LoadImage node must reference. A unique name is used
     /// per upload so ComfyUI's LoadImage cache never serves a stale frame mid-chain.
     /// </summary>
-    public async Task<string> UploadImageAsync(Stream image, string filename, CancellationToken ct)
+    public async Task<string> UploadImageAsync(Stream image, string filename, CancellationToken ct, string? baseUrl = null)
     {
+        baseUrl ??= _baseUrl;
         var http = _hf.CreateClient();
         http.Timeout = TimeSpan.FromMinutes(2);
         using var content = new MultipartFormDataContent();
@@ -220,7 +225,7 @@ public sealed class WanClient
         content.Add(new StringContent("true"), "overwrite");
         content.Add(new StringContent("input"), "type");
 
-        using var req = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/upload/image") { Content = content };
+        using var req = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/upload/image") { Content = content };
         if (!string.IsNullOrEmpty(_authKey)) req.Headers.Add("X-Wan-Auth", _authKey);
 
         using var resp = await http.SendAsync(req, ct);
@@ -264,14 +269,15 @@ public sealed class WanClient
 
     // Shared ComfyUI /prompt POST. Wraps a substituted workflow graph as
     // {"prompt": <graph>, "client_id": "..."} and returns the prompt_id.
-    private async Task<string> PostGraphAsync(string workflowGraphJson, CancellationToken ct)
+    private async Task<string> PostGraphAsync(string workflow, CancellationToken ct, string? baseUrl = null)
     {
+        baseUrl ??= _baseUrl;
         var clientId = $"videotool-{Guid.NewGuid():N}";
-        var body = $"{{\"prompt\":{workflowGraphJson},\"client_id\":{JsonSerializer.Serialize(clientId)}}}";
+        var body = $"{{\"prompt\":{JsonSerializer.Serialize(workflow)},\"client_id\":{JsonSerializer.Serialize(clientId)}}}";
 
         var http = _hf.CreateClient();
         http.Timeout = TimeSpan.FromMinutes(2);
-        using var req = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/prompt")
+        using var req = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/prompt")
         {
             Content = new StringContent(body, Encoding.UTF8, "application/json")
         };
@@ -434,6 +440,81 @@ public sealed class WanClient
     }
 
     /// <summary>
+    /// Get status of a Wan-Animate job from the dedicated animate container.
+    /// Uses WAN_ANIMATE_BASE_URL if configured separately, otherwise falls back to WAN_BASE_URL.
+    /// </summary>
+    public async Task<string> GetAnimateStatusJsonAsync(string promptId, CancellationToken ct)
+    {
+        // Use the animate container URL for status queries
+        return await GetStatusJsonAsyncInternal(promptId, ct, _animateUrl);
+    }
+
+    /// <summary>Internal method to query status from a specific base URL.</summary>
+    private async Task<string> GetStatusJsonAsyncInternal(string promptId, CancellationToken ct, string baseUrl)
+    {
+        var http = _hf.CreateClient();
+        http.Timeout = TimeSpan.FromSeconds(20);
+        if (!string.IsNullOrEmpty(_authKey)) http.DefaultRequestHeaders.Add("X-Wan-Auth", _authKey);
+
+        // /history/{id} populates only when the job reaches a terminal state.
+        using var hResp = await http.GetAsync($"{baseUrl}/history/{Uri.EscapeDataString(promptId)}", ct);
+        if (!hResp.IsSuccessStatusCode)
+            throw new InvalidOperationException($"ComfyUI history failed: {(int)hResp.StatusCode}");
+
+        var hBody = await hResp.Content.ReadAsStringAsync(ct);
+        using (var hist = JsonDocument.Parse(hBody))
+        {
+            if (hist.RootElement.TryGetProperty(promptId, out var entry))
+            {
+                var status = "succeeded";
+                if (entry.TryGetProperty("status", out var st) &&
+                    st.TryGetProperty("status_str", out var ss) &&
+                    string.Equals(ss.GetString(), "error", StringComparison.OrdinalIgnoreCase))
+                {
+                    status = "failed";
+                }
+                return JsonSerializer.Serialize(new { id = promptId, status });
+            }
+        }
+        // Not in history yet; check queue.
+        var inFlight = false;
+        using var qResp = await http.GetAsync($"{baseUrl}/queue", ct);
+        if (qResp.IsSuccessStatusCode)
+        {
+            var qBody = await qResp.Content.ReadAsStringAsync(ct);
+            using var q = JsonDocument.Parse(qBody);
+            // queue_running and queue_pending are lists of [index, id, {...}, {...}].
+            var targets = new[] { "queue_running", "queue_pending" };
+            foreach (var key in targets)
+            {
+                if (q.RootElement.TryGetProperty(key, out var arr) && arr.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var entry in arr.EnumerateArray())
+                        if (entry.ValueKind == JsonValueKind.Array && entry.GetArrayLength() > 1)
+                        {
+                            var id = entry[1].GetString();
+                            if (string.Equals(id, promptId))
+                            {
+                                inFlight = true;
+                                break;
+                            }
+                        }
+                }
+                if (inFlight) break;
+            }
+        }
+        catch (Exception ex) { _log.LogDebug(ex, "queue probe failed for {Id}", promptId); }
+
+        return JsonSerializer.Serialize(new
+        {
+            id = promptId,
+            status = inFlight ? "running" : "queued",
+            progress = 0,
+        });
+    }
+
+    /// <summary>
+    /// <summary>
     /// Streams the rendered MP4 from ComfyUI's /view endpoint. Caller is
     /// responsible for streaming to blob and disposing the response.
     /// </summary>
@@ -584,8 +665,9 @@ public sealed class WanClient
     /// ComfyUI's core /upload/image endpoint stores any uploaded file into input/ (the field is
     /// historically named "image"); the returned name is what the workflow's loader references.
     /// </summary>
-    private async Task<string> UploadVideoAsync(Stream video, string filename, CancellationToken ct)
+    private async Task<string> UploadVideoAsync(Stream video, string filename, CancellationToken ct, string? baseUrl = null)
     {
+        baseUrl ??= _baseUrl;
         var http = _hf.CreateClient();
         http.Timeout = TimeSpan.FromMinutes(3);
         using var content = new MultipartFormDataContent();
@@ -595,7 +677,7 @@ public sealed class WanClient
         content.Add(new StringContent("true"), "overwrite");
         content.Add(new StringContent("input"), "type");
 
-        using var req = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/upload/image") { Content = content };
+        using var req = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/upload/image") { Content = content };
         if (!string.IsNullOrEmpty(_authKey)) req.Headers.Add("X-Wan-Auth", _authKey);
 
         using var resp = await http.SendAsync(req, ct);

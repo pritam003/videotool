@@ -1491,7 +1491,7 @@ app.MapGet("/api/animate-status/{id}", async (string id, WanClient wan, IConfigu
     if (!enabled) return Results.StatusCode(501);
     try
     {
-        var statusJson = await wan.GetStatusJsonAsync(id, ct);
+        var statusJson = await wan.GetAnimateStatusJsonAsync(id, ct);
         using var doc = System.Text.Json.JsonDocument.Parse(statusJson);
         var root = doc.RootElement;
         var status = root.GetProperty("status").GetString() ?? "running";
