@@ -1436,10 +1436,10 @@ app.MapPost("/api/animate-submit", async (HttpRequest http, WanClient wan, IConf
     if (videoFile is null && string.IsNullOrWhiteSpace(videoUrl))
         return Results.BadRequest(new { error = "either a video file or videoUrl is required" });
     var (W, H) = ParseSize(form["size"].ToString());
-    // Cap Wan-Animate resolution to prevent OOM on the A100 (memory-intensive with multiple frames)
-    W = Math.Min(W, 768);
-    H = Math.Min(H, 512);
-    var seconds = int.TryParse(form["seconds"].ToString(), out var s) ? Math.Clamp(s, 1, 60) : 5;
+    // Cap Wan-Animate resolution + duration to prevent OOM on the A100 (requires conservative limits due to high memory overhead)
+    W = Math.Min(W, 640);
+    H = Math.Min(H, 360);
+    var seconds = int.TryParse(form["seconds"].ToString(), out var s) ? Math.Clamp(s, 1, 3) : 3;  // Max 3 seconds (48 frames @ 16fps)
     var prompt = form["prompt"].ToString();
     var imgExt = string.IsNullOrEmpty(Path.GetExtension(imageFile!.FileName)) ? ".png" : Path.GetExtension(imageFile.FileName);
     try
