@@ -140,6 +140,14 @@ public sealed class WanClient
             .Replace("__HEIGHT__", h.ToString(inv))
             .Replace("__FRAMES__", frames.ToString(inv))
             .Replace("__SEED__", seed.ToString(inv));
+        // Evict any models left resident from prior jobs (FLUX portraits / Wan T2V+I2V) so the
+        // 14GB animate model + 832x480 video latents get the full A100. Without this, an animate
+        // job that lands after another workload OOMs intermittently at KSampler (the same job
+        // succeeds on a freshly-warmed container). Best-effort; ComfyUI processes /free on its
+        // idle loop, so give it a moment before enqueuing.
+        try { await FreeMemoryAsync(ct, _animateUrl); await Task.Delay(2500, ct); }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex) { _log.LogDebug(ex, "pre-animate FreeMemory failed (continuing)"); }
         return await PostGraphAsync(workflow, ct, _animateUrl);
     }
 
@@ -302,11 +310,12 @@ public sealed class WanClient
     /// larger video models load, otherwise both resident at once OOMs the 80 GB A100.
     /// ComfyUI processes the flag on its idle loop, so allow ~1-2s before enqueuing work.
     /// </summary>
-    public async Task FreeMemoryAsync(CancellationToken ct)
+    public async Task FreeMemoryAsync(CancellationToken ct, string? baseUrl = null)
     {
+        baseUrl ??= _baseUrl;
         var http = _hf.CreateClient();
         http.Timeout = TimeSpan.FromSeconds(30);
-        using var req = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/free")
+        using var req = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/free")
         {
             Content = new StringContent("{\"unload_models\":true,\"free_memory\":true}", Encoding.UTF8, "application/json")
         };
