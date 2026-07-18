@@ -131,9 +131,16 @@
     }
   },
   "9": {
-    "class_type": "VAEDecode",
-    "_meta": { "title": "VAE Decode" },
-    "inputs": { "samples": ["44", 0], "vae": ["8", 0] }
+    "class_type": "VAEDecodeTiled",
+    "_meta": { "title": "VAE Decode (tiled — caps VRAM during video decode)" },
+    "inputs": {
+      "samples": ["44", 0],
+      "vae": ["8", 0],
+      "tile_size": 256,
+      "overlap": 64,
+      "temporal_size": 32,
+      "temporal_overlap": 8
+    }
   },
   "11": {
     "class_type": "VHS_VideoCombine",
